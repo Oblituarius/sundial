@@ -4,6 +4,7 @@ mod app;
 mod catalog;
 mod class_items;
 mod dummy_items;
+mod export;
 mod game_settings;
 mod storage;
 

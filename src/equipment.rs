@@ -1,4 +1,5 @@
 use crate::catalog;
+use crate::export::{self, ExportFormat};
 
 use super::*;
 
@@ -58,6 +59,69 @@ impl SundialApp {
         plugs[socket_index] = hash.map(format_hash).map_or(Value::Null, Value::String);
         self.dirty = true;
         self.set_status(format!("Updated {slot} socket {}", socket_index + 1), false);
+    }
+
+    fn dispatch_plug_export(
+        &mut self,
+        character_index: usize,
+        slot: &str,
+        format: ExportFormat,
+    ) {
+        let bucket = SLOTS
+            .iter()
+            .find(|(name, _, _)| *name == slot)
+            .map(|(_, _, b)| *b)
+            .unwrap_or(0);
+
+        let def_hash = self
+            .document
+            .pointer("/state/characters")
+            .and_then(Value::as_array)
+            .and_then(|chars| chars.get(character_index))
+            .and_then(|ch| ch.pointer(&format!("/equipment/{slot}/definition_hash")))
+            .and_then(parse_unsigned_value);
+
+        let Some(hash) = def_hash else {
+            self.set_status(format!("No item equipped in {slot}"), true);
+            return;
+        };
+
+        let Some(item) = self.manifest.get_for_bucket(hash, bucket).cloned() else {
+            self.set_status(
+                format!("Item 0x{hash:08X} not found in catalog for {slot}"),
+                true,
+            );
+            return;
+        };
+
+        let plugs_value = self
+            .document
+            .pointer("/state/characters")
+            .and_then(Value::as_array)
+            .and_then(|chars| chars.get(character_index))
+            .and_then(|ch| ch.pointer(&format!("/equipment/{slot}/plugs")))
+            .cloned();
+        let (current_plugs, _) = displayed_plugs(plugs_value.as_ref(), &item.default_plugs);
+
+        let sockets =
+            build_socket_rows(&self.manifest, &item, &current_plugs, self.allow_unsafe_plugs);
+
+        let id = character_id(&self.document, character_index);
+        let label = equipment_slot_label(slot).to_owned();
+        let total_options: usize = sockets.iter().map(|s| s.options.len()).sum();
+
+        match export::write_socket_export(&id, slot, &label, &sockets, format) {
+            Ok(path) => self.set_status(
+                format!(
+                    "Exported {} sockets ({} options) to {}",
+                    sockets.len(),
+                    total_options,
+                    path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+                ),
+                false,
+            ),
+            Err(err) => self.set_status(format!("Could not export plugs: {err}"), true),
+        }
     }
 
     pub(super) fn draw_character_fields(&mut self, ui: &mut egui::Ui, index: usize) {
@@ -695,6 +759,53 @@ impl SundialApp {
                                         self.plug_searches.insert(plug_search_key, plug_query);
                                     }
                                 }
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    let export_button = ui.add(
+                                        egui::Button::new("Export plugs…")
+                                            .small()
+                                            .fill(egui::Color32::from_rgb(60, 90, 130)),
+                                    );
+                                    let export_popup_id = ui.make_persistent_id(format!(
+                                        "export-plugs:{character_index}:{slot}"
+                                    ));
+                                    if export_button.clicked() {
+                                        ui.memory_mut(|m| m.toggle_popup(export_popup_id));
+                                    }
+                                    egui::popup::popup_below_widget(
+                                        ui,
+                                        export_popup_id,
+                                        &export_button,
+                                        egui::PopupCloseBehavior::CloseOnClickOutside,
+                                        |ui| {
+                                            ui.set_min_width(180.0);
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "Save {} plugs as…",
+                                                    current_plugs.len()
+                                                ))
+                                                .weak(),
+                                            );
+                                            ui.separator();
+                                            if ui.button("Save as CSV").clicked() {
+                                                self.dispatch_plug_export(
+                                                    character_index,
+                                                    slot,
+                                                    ExportFormat::Csv,
+                                                );
+                                                ui.memory_mut(egui::Memory::close_popup);
+                                            }
+                                            if ui.button("Save as JSON").clicked() {
+                                                self.dispatch_plug_export(
+                                                    character_index,
+                                                    slot,
+                                                    ExportFormat::Json,
+                                                );
+                                                ui.memory_mut(egui::Memory::close_popup);
+                                            }
+                                        },
+                                    );
+                                });
                             });
                         }
                     }
@@ -932,6 +1043,84 @@ pub(super) fn equipment_slot_label(slot: &str) -> &str {
         .unwrap_or(slot)
 }
 
+fn plug_name_only(manifest: &catalog::Catalog, hash: u64) -> Option<String> {
+    let label = manifest.plug_label(hash);
+    label.rfind("  (0x").map_or_else(|| Some(label.clone()), |idx| Some(label[..idx].to_string()))
+}
+
+/// Builds all dropdown options for every socket on `item`, mirroring exactly
+/// what the plug picker shows. Each entry records whether it is the currently
+/// selected plug.
+pub(super) fn build_socket_rows(
+    manifest: &catalog::Catalog,
+    item: &catalog::ItemDef,
+    current_plugs: &[Value],
+    allow_unsafe_plugs: bool,
+) -> Vec<export::SocketExport> {
+    let socket_count = item.sockets.len().max(current_plugs.len());
+    let mut rows = Vec::with_capacity(socket_count);
+    for socket_index in 0..socket_count {
+        let current_hash = current_plugs
+            .get(socket_index)
+            .and_then(parse_unsigned_value);
+
+        let allowed: Vec<u64> = item
+            .sockets
+            .get(socket_index)
+            .map(|socket| {
+                if allow_unsafe_plugs {
+                    manifest.socket_type_options(socket.socket_type).to_vec()
+                } else {
+                    manifest.socket_options(socket).to_vec()
+                }
+            })
+            .unwrap_or_default();
+
+        let mut options: Vec<export::PlugOption> = Vec::new();
+
+        // If the current plug is not in the allowed list (custom/current plug),
+        // prepend it so it still appears in the export.
+        if let Some(ch) = current_hash {
+            if !allowed.contains(&ch) {
+                options.push(export::PlugOption {
+                    plug_hash: format_hash(ch),
+                    plug_name: plug_name_only(manifest, ch),
+                    is_selected: true,
+                });
+            }
+        }
+
+        for &hash in &allowed {
+            options.push(export::PlugOption {
+                plug_hash: format_hash(hash),
+                plug_name: plug_name_only(manifest, hash),
+                is_selected: Some(hash) == current_hash,
+            });
+        }
+
+        rows.push(export::SocketExport {
+            socket_index,
+            options,
+        });
+    }
+    rows
+}
+
+pub(super) fn character_id(document: &Value, character_index: usize) -> String {
+    let character = document
+        .pointer("/state/characters")
+        .and_then(Value::as_array)
+        .and_then(|chars| chars.get(character_index));
+    if let Some(ch) = character {
+        if let Some(soid) = ch.get("soid").and_then(parse_unsigned_value) {
+            return format!("{soid:016X}");
+        }
+        if let Some(class) = ch.get("class").and_then(Value::as_u64) {
+            return format!("class{class}");
+        }
+    }
+    format!("char{character_index}")
+}
 pub(super) fn next_instance_soid(document: &Value) -> Option<u64> {
     let mut used = HashSet::new();
     if let Some(characters) = document
