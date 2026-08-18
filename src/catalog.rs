@@ -3,18 +3,52 @@ use std::{
     fs,
     io::Read,
     path::{Path, PathBuf},
-    time::UNIX_EPOCH,
+    sync::{Arc, Mutex},
 };
 
 use serde::{Deserialize, Serialize};
 use tiger_pkg::{DestinyVersion, GameVersion, PackageManager, TagHash};
 
-use crate::class_items;
+use crate::{
+    class_items,
+    hash::{format_hash, parse_hash},
+    unnamed_plugs,
+};
 
-const CACHE_SCHEMA: u32 = 31;
+mod icons;
+mod package;
+
+use icons::IconRuntime;
+#[cfg(test)]
+use package::u64_at;
+pub use package::validate_install;
+use package::{array_at, i32_at, i64_at, install_fingerprint, relative_offset, u16_at, u32_at};
+
+const CACHE_SCHEMA: u32 = 39;
 const SUNDIAL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const ORDINARY_SOCKET_CLASS: u32 = 0x8080_77C4;
+const INVESTMENT_STAT_CLASS: u32 = 0x8080_3033;
+const STAT_STRING_MAP_CLASS: u32 = 0x8080_5CC9;
 const NO_PLUG_SOURCE: u32 = 0x811C_9DC5;
+const INVESTMENT_STAT_DESCRIPTOR: usize = 0x2C0;
+const INVESTMENT_STAT_ROW_SIZE: usize = 40;
+const STAT_STRING_MAP_INDEX: usize = 59;
+const STAT_STRING_ROW_SIZE: usize = 36;
+const INVENTORY_BUCKET_TABLE_SLOT: usize = 17;
+const INVENTORY_BUCKET_COUNT_OFFSET: usize = 140;
+const INVENTORY_BUCKET_FIRST_DESCRIPTOR: usize = 144;
+const INVENTORY_BUCKET_DESCRIPTOR_SIZE: usize = 36;
+const INVENTORY_BUCKET_FIRST_SLOT_OFFSET: usize = 4;
+const INVENTORY_BUCKET_SLOT_COUNT_OFFSET: usize = 8;
+const INVENTORY_BUCKET_SCOPE_OFFSET: usize = 24;
+const INVENTORY_MAX_STACK_SIZE_OFFSET: usize = 180;
+const INVENTORY_BUCKET_ID_OFFSET: usize = 184;
+const INVENTORY_INSTANCED_OFFSET: usize = 187;
+const ITEM_ICON_INDEX_OFFSET: usize = 0x80;
+const ITEM_DESCRIPTION_OFFSET: usize = 0x98;
+const ITEM_ICON_TABLE_SLOT: usize = 75;
+const ITEM_ICON_TABLE_ROW_SIZE: usize = 24;
+const ITEM_ICON_CONTAINER_OFFSET: usize = 16;
 
 #[derive(Clone, Copy, Debug)]
 pub struct CatalogProgress {
@@ -23,12 +57,29 @@ pub struct CatalogProgress {
     pub total: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CatalogStats {
+    pub items: usize,
+    pub plugs: usize,
+    pub icons: usize,
+    pub descriptions: usize,
+}
+
 impl CatalogProgress {
     const fn stage(message: &'static str) -> Self {
         Self {
             message,
             completed: 0,
             total: 0,
+        }
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    pub fn fraction(self) -> f32 {
+        if self.total == 0 {
+            0.0
+        } else {
+            self.completed as f32 / self.total as f32
         }
     }
 }
@@ -44,6 +95,225 @@ pub struct ItemDef {
     pub sockets: Vec<SocketDef>,
     #[serde(default)]
     pub abilities: AbilityOptions,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CatalystSocket {
+    pub socket_index: usize,
+    pub unacquired_plug: u64,
+    pub in_progress_plug: u64,
+    pub completed_plug: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CatalystState {
+    Unacquired,
+    InProgress,
+    Completed,
+}
+
+impl CatalystState {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Unacquired => "not acquired",
+            Self::InProgress => "in progress",
+            Self::Completed => "completed",
+        }
+    }
+}
+
+impl CatalystSocket {
+    pub const fn authored_state(self, state: CatalystState) -> (u64, bool) {
+        match state {
+            CatalystState::Unacquired => (self.unacquired_plug, false),
+            CatalystState::InProgress => (self.in_progress_plug, false),
+            CatalystState::Completed => (self.completed_plug, true),
+        }
+    }
+
+    pub fn state_for_selected_plug(self, plug: Option<u64>) -> Option<CatalystState> {
+        if plug == Some(self.unacquired_plug) {
+            Some(CatalystState::Unacquired)
+        } else if self.completed_plug != self.in_progress_plug && plug == Some(self.completed_plug)
+        {
+            Some(CatalystState::Completed)
+        } else if self.completed_plug != self.in_progress_plug
+            && plug == Some(self.in_progress_plug)
+        {
+            Some(CatalystState::InProgress)
+        } else {
+            None
+        }
+    }
+}
+
+/// Native inventory array selected by an installed bucket descriptor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InventoryScope {
+    #[default]
+    Unknown,
+    Character,
+    Profile,
+    SmallProfile,
+}
+
+impl InventoryScope {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "Unknown",
+            Self::Character => "Character",
+            Self::Profile => "Profile",
+            Self::SmallProfile => "Small profile",
+        }
+    }
+
+    /// Fixed capacity of the native array selected by this scope.
+    pub const fn array_capacity(self) -> Option<u16> {
+        match self {
+            Self::Unknown => None,
+            Self::Character => Some(350),
+            Self::Profile => Some(701),
+            Self::SmallProfile => Some(6),
+        }
+    }
+}
+
+/// Quantity policy declared by the installed item definition.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ItemStackability {
+    #[default]
+    Unknown,
+    Stackable,
+    Instanced,
+}
+
+impl ItemStackability {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "Unknown",
+            Self::Stackable => "Stackable",
+            Self::Instanced => "Instanced",
+        }
+    }
+}
+
+/// Installed item and bucket fields needed to place an authored inventory row safely.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InventoryMetadata {
+    pub scope: InventoryScope,
+    pub native_bucket_id: u8,
+    pub stackability: ItemStackability,
+    pub max_stack_size: Option<u32>,
+    /// Number of rows owned by this bucket, not the capacity of the whole scope array.
+    pub bucket_capacity: Option<u16>,
+}
+
+impl Default for InventoryMetadata {
+    fn default() -> Self {
+        Self {
+            scope: InventoryScope::Unknown,
+            native_bucket_id: u8::MAX,
+            stackability: ItemStackability::Unknown,
+            max_stack_size: None,
+            bucket_capacity: None,
+        }
+    }
+}
+
+impl InventoryMetadata {
+    /// Maximum number of settings-authored rows that can occupy this native bucket.
+    ///
+    /// Character callers count both present equipment and unequipped inventory against
+    /// this value. Empty equipment slots therefore leave their row available, matching
+    /// Sunrise's runtime placement order.
+    pub const fn authored_row_capacity(self) -> Option<u16> {
+        match (self.scope, self.bucket_capacity) {
+            (InventoryScope::Unknown, _) | (_, None) => None,
+            (_, Some(capacity)) => Some(capacity),
+        }
+    }
+
+    pub const fn is_profile_items_candidate(self) -> bool {
+        matches!(self.scope, InventoryScope::Profile)
+            && matches!(self.stackability, ItemStackability::Stackable)
+            && matches!(self.max_stack_size, Some(size) if size > 0)
+            && matches!(self.authored_row_capacity(), Some(size) if size > 0)
+    }
+
+    pub const fn is_character_inventory_candidate(self) -> bool {
+        matches!(self.scope, InventoryScope::Character)
+            && !matches!(self.stackability, ItemStackability::Unknown)
+            && matches!(self.max_stack_size, Some(size) if size > 0)
+            && matches!(self.authored_row_capacity(), Some(size) if size > 0)
+    }
+
+    /// Human-facing name for the installed Shadowkeep bucket represented by this metadata.
+    ///
+    /// The package descriptor exposes a compact native id rather than a localized display name,
+    /// so stable names for the targeted build live beside the descriptor interpretation. Unknown
+    /// ids retain their scope and identity instead of being merged into one misleading group.
+    pub fn bucket_label(self) -> String {
+        inventory_bucket_name(self.scope, self.native_bucket_id).map_or_else(
+            || match self.scope {
+                InventoryScope::Unknown => "Unknown bucket".to_owned(),
+                scope => format!("{} bucket {}", scope.label(), self.native_bucket_id),
+            },
+            str::to_owned,
+        )
+    }
+}
+
+const fn inventory_bucket_name(scope: InventoryScope, bucket: u8) -> Option<&'static str> {
+    // Equipment names follow the installed native-slot mapping. Profile and other non-equipment
+    // buckets have no general installed name join; the friendly names below are stable semantics
+    // for this targeted Shadowkeep build, with numeric fallback for every unknown ID.
+    match (scope, bucket) {
+        (InventoryScope::Character, 0) => Some("Kinetic weapons"),
+        (InventoryScope::Character, 1) => Some("Energy weapons"),
+        (InventoryScope::Character, 2) => Some("Power weapons"),
+        (InventoryScope::Character, 3) => Some("Helmets"),
+        (InventoryScope::Character, 4) => Some("Gauntlets"),
+        (InventoryScope::Character, 5) => Some("Chest armor"),
+        (InventoryScope::Character, 6) => Some("Leg armor"),
+        (InventoryScope::Character, 7) => Some("Class items"),
+        (InventoryScope::Character, 8) => Some("Ghost shells"),
+        (InventoryScope::Character, 9) => Some("Vehicles"),
+        (InventoryScope::Character, 10) => Some("Ships"),
+        (InventoryScope::Character, 12) => Some("Emote collection"),
+        (InventoryScope::Character, 16) => Some("Subclasses"),
+        (InventoryScope::Character, 17) => Some("Clan banners"),
+        (InventoryScope::Character, 27) => Some("Emblems"),
+        (InventoryScope::Character, 31) => Some("Engrams"),
+        (InventoryScope::Character, 33) => Some("Quest steps"),
+        (InventoryScope::Character, 37) => Some("General inventory"),
+        (InventoryScope::Character, 40) => Some("Quests and bounties"),
+        (InventoryScope::Character, 41) => Some("Emotes"),
+        (InventoryScope::Character, 47) => Some("Finishers"),
+        (InventoryScope::Character, 49) => Some("Seasonal artifacts"),
+        (InventoryScope::Profile, 13) => Some("Modifications"),
+        (InventoryScope::Profile, 14) => Some("Shaders"),
+        (InventoryScope::Profile, 15) => Some("Consumables"),
+        (InventoryScope::Profile, 21) => Some("Glimmer"),
+        (InventoryScope::Profile, 22) => Some("Legendary Shards"),
+        (InventoryScope::Profile, 23) => Some("Silver"),
+        (InventoryScope::Profile, 24) => Some("Bright Dust"),
+        (InventoryScope::Profile, 42) => Some("General profile items"),
+        _ => None,
+    }
+}
+
+/// A displayable inventory definition, including profile-only definitions that are not equipment.
+#[derive(Clone, Copy, Debug)]
+pub struct InventoryDefinition<'a> {
+    pub hash: u64,
+    pub name: &'a str,
+    pub type_name: &'a str,
+    pub metadata: &'a InventoryMetadata,
+    /// Present when the definition is also part of the existing equipment catalog.
+    pub item: Option<&'a ItemDef>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -84,9 +354,26 @@ struct ParsedAbilityEntry {
     group: u8,
 }
 
+struct ScannedCatalog {
+    items: Vec<ItemDef>,
+    names: HashMap<u64, String>,
+    type_names: HashMap<u64, String>,
+    descriptions: HashMap<u64, String>,
+    icon_containers: HashMap<u64, u32>,
+    inventory_metadata: HashMap<u64, InventoryMetadata>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InventoryBucketDescriptor {
+    scope: InventoryScope,
+    capacity: u16,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SocketDef {
     pub socket_type: u16,
+    #[serde(default)]
+    pub label: String,
     #[serde(default)]
     pub pool: u32,
     #[serde(default)]
@@ -101,38 +388,69 @@ struct CatalogCache {
     fingerprint: String,
     items: Vec<ItemDef>,
     names: HashMap<u64, String>,
+    type_names: HashMap<u64, String>,
+    #[serde(default)]
+    descriptions: HashMap<u64, String>,
+    #[serde(default)]
+    icon_containers: HashMap<u64, u32>,
+    #[serde(default)]
+    inventory_metadata: HashMap<u64, InventoryMetadata>,
     plug_pools: Vec<Vec<u64>>,
+}
+
+struct CatalogContents {
+    items: Vec<ItemDef>,
+    names: HashMap<u64, String>,
+    type_names: HashMap<u64, String>,
+    descriptions: HashMap<u64, String>,
+    icon_containers: HashMap<u64, u32>,
+    inventory_metadata: HashMap<u64, InventoryMetadata>,
+    plug_pools: Vec<Vec<u64>>,
+}
+
+impl CatalogCache {
+    fn into_contents(self) -> CatalogContents {
+        CatalogContents {
+            items: self.items,
+            names: self.names,
+            type_names: self.type_names,
+            descriptions: self.descriptions,
+            icon_containers: self.icon_containers,
+            inventory_metadata: self.inventory_metadata,
+            plug_pools: self.plug_pools,
+        }
+    }
 }
 
 pub struct Catalog {
-    pub items: Vec<ItemDef>,
+    pub items: Vec<Arc<ItemDef>>,
     pub names: HashMap<u64, String>,
+    type_names: HashMap<u64, String>,
+    descriptions: HashMap<u64, String>,
+    icon_containers: HashMap<u64, u32>,
     pub cache_path: PathBuf,
     pub loaded_from_cache: bool,
+    install_path: PathBuf,
+    icon_runtime: Mutex<IconRuntime>,
+    inventory_metadata: HashMap<u64, InventoryMetadata>,
+    inventory_hashes: Vec<u64>,
+    item_indices: HashMap<u64, usize>,
     plug_pools: Vec<Vec<u64>>,
     socket_type_options: HashMap<u16, Vec<u64>>,
+    all_plug_options: Vec<u64>,
 }
 
-impl ItemDef {
-    pub fn label(&self) -> String {
-        if self.type_name.is_empty() {
-            format!("{}  ({})", self.name, format_hash(self.hash))
+impl SocketDef {
+    pub fn display_label(&self, index: usize) -> String {
+        if self.label.is_empty() {
+            format!("Socket {}", index + 1)
         } else {
-            format!(
-                "{} — {}  ({})",
-                self.name,
-                self.type_name,
-                format_hash(self.hash)
-            )
+            format!("{}. {}", index + 1, self.label)
         }
     }
 }
 
 impl Catalog {
-    pub fn load_or_scan(install: &Path, cache_path: PathBuf, force: bool) -> Result<Self, String> {
-        Self::load_or_scan_with_progress(install, cache_path, force, |_| {})
-    }
-
     pub fn load_or_scan_with_progress(
         install: &Path,
         cache_path: PathBuf,
@@ -155,25 +473,43 @@ impl Catalog {
                             total: 1,
                         });
                         return Ok(Self::finish(
-                            cache.items,
-                            cache.names,
-                            cache.plug_pools,
+                            cache.into_contents(),
                             cache_path,
+                            install.to_path_buf(),
                             true,
                         ));
                     }
                 }
             }
         }
-        let (mut items, names) = scan_packages(install, &mut report)?;
+        let ScannedCatalog {
+            mut items,
+            mut names,
+            type_names,
+            descriptions,
+            icon_containers,
+            inventory_metadata,
+        } = scan_packages(install, &mut report)?;
         report(CatalogProgress::stage("Optimizing the local catalog…"));
+        let mut type_names = type_names;
+        unnamed_plugs::apply_to_catalog(&mut names, &mut type_names);
         let plug_pools = intern_socket_pools(&mut items, &names)?;
+        let type_names = plug_pools
+            .iter()
+            .flatten()
+            .chain(inventory_metadata.keys())
+            .filter_map(|hash| type_names.get(hash).cloned().map(|name| (*hash, name)))
+            .collect();
         let cache = CatalogCache {
             schema: CACHE_SCHEMA,
             sundial_version: SUNDIAL_VERSION.into(),
             fingerprint,
             items,
             names,
+            type_names,
+            descriptions,
+            icon_containers,
+            inventory_metadata,
             plug_pools,
         };
         if let Some(parent) = cache_path.parent() {
@@ -191,21 +527,31 @@ impl Catalog {
             total: 1,
         });
         Ok(Self::finish(
-            cache.items,
-            cache.names,
-            cache.plug_pools,
+            cache.into_contents(),
             cache_path,
+            install.to_path_buf(),
             false,
         ))
     }
 
     fn finish(
-        mut items: Vec<ItemDef>,
-        names: HashMap<u64, String>,
-        plug_pools: Vec<Vec<u64>>,
+        contents: CatalogContents,
         cache_path: PathBuf,
+        install_path: PathBuf,
         loaded_from_cache: bool,
     ) -> Self {
+        let CatalogContents {
+            mut items,
+            names,
+            type_names,
+            descriptions,
+            icon_containers,
+            inventory_metadata,
+            mut plug_pools,
+        } = contents;
+        for pool in &mut plug_pools {
+            sort_plug_options(pool, &names);
+        }
         let mut socket_type_options = HashMap::<u16, Vec<u64>>::new();
         for item in &items {
             for socket in &item.sockets {
@@ -218,30 +564,147 @@ impl Catalog {
             }
         }
         for options in socket_type_options.values_mut() {
-            options.sort_unstable();
-            options.dedup();
-            options.sort_by_key(|hash| {
+            sort_plug_options(options, &names);
+        }
+        let mut all_plug_options = plug_pools.iter().flatten().copied().collect();
+        sort_plug_options(&mut all_plug_options, &names);
+        items.sort_by_key(|item| item.name.to_lowercase());
+        let mut inventory_hashes = inventory_metadata
+            .keys()
+            .filter(|hash| names.contains_key(hash))
+            .copied()
+            .collect::<Vec<_>>();
+        inventory_hashes.sort_by_cached_key(|hash| {
+            (
                 names
                     .get(hash)
-                    .map(|name| name.to_lowercase())
-                    .unwrap_or_default()
-            });
-        }
-        items.sort_by_key(|item| item.name.to_lowercase());
+                    .map_or_else(String::new, |name| name.to_lowercase()),
+                *hash,
+            )
+        });
+        let item_indices = items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| (item.hash, index))
+            .collect();
         Self {
-            items,
+            items: items.into_iter().map(Arc::new).collect(),
             names,
+            type_names,
+            descriptions,
+            icon_containers,
             cache_path,
             loaded_from_cache,
+            install_path,
+            icon_runtime: Mutex::new(IconRuntime::default()),
+            inventory_metadata,
+            inventory_hashes,
+            item_indices,
             plug_pools,
             socket_type_options,
+            all_plug_options,
         }
     }
 
     pub fn get_for_bucket(&self, hash: u64, bucket: u64) -> Option<&ItemDef> {
-        self.items
+        self.item(hash).filter(|item| item.bucket_hash == bucket)
+    }
+
+    pub fn item_handle_for_bucket(&self, hash: u64, bucket: u64) -> Option<Arc<ItemDef>> {
+        self.item_handle(hash)
+            .filter(|item| item.bucket_hash == bucket)
+    }
+
+    /// Finds an existing equipment definition without requiring its bucket hash.
+    pub fn item(&self, hash: u64) -> Option<&ItemDef> {
+        self.item_indices
+            .get(&hash)
+            .and_then(|index| self.items.get(*index))
+            .map(Arc::as_ref)
+    }
+
+    pub fn item_handle(&self, hash: u64) -> Option<Arc<ItemDef>> {
+        self.item_indices
+            .get(&hash)
+            .and_then(|index| self.items.get(*index))
+            .cloned()
+    }
+
+    pub fn inventory_metadata(&self, hash: u64) -> Option<&InventoryMetadata> {
+        self.inventory_metadata.get(&hash)
+    }
+
+    /// Resolves both equipment definitions and profile-only inventory definitions.
+    pub fn inventory_definition(&self, hash: u64) -> Option<InventoryDefinition<'_>> {
+        let metadata = self.inventory_metadata(hash)?;
+        let item = self.item(hash);
+        let name = self
+            .names
+            .get(&hash)
+            .map(String::as_str)
+            .or_else(|| item.map(|definition| definition.name.as_str()))?;
+        let type_name = self
+            .type_names
+            .get(&hash)
+            .map(String::as_str)
+            .or_else(|| item.map(|definition| definition.type_name.as_str()))
+            .unwrap_or_default();
+        Some(InventoryDefinition {
+            hash,
+            name,
+            type_name,
+            metadata,
+            item,
+        })
+    }
+
+    /// Returns deterministic, safe profile-item matches.
+    ///
+    /// Callers apply their display limit after document-specific capacity filters. Duplicate
+    /// definitions remain valid because Sunrise can store overflow quantities in another stack.
+    pub fn profile_item_candidates(
+        &self,
+        text: &str,
+    ) -> impl Iterator<Item = InventoryDefinition<'_>> + '_ {
+        let needle = text.trim().to_lowercase();
+        self.inventory_hashes
             .iter()
-            .find(|item| item.hash == hash && item.bucket_hash == bucket)
+            .filter_map(|hash| self.inventory_definition(*hash))
+            .filter(move |definition| {
+                definition.metadata.is_profile_items_candidate()
+                    && !crate::dummy_items::contains(definition.hash)
+                    && inventory_definition_matches(
+                        *definition,
+                        self.description(definition.hash),
+                        &needle,
+                    )
+            })
+    }
+
+    /// Returns deterministic, equippable character-inventory matches.
+    ///
+    /// Callers apply their display limit after document-specific bucket-capacity filters.
+    pub fn character_inventory_candidates(
+        &self,
+        text: &str,
+        class_type: u64,
+        show_dummy_items: bool,
+    ) -> impl Iterator<Item = InventoryDefinition<'_>> + '_ {
+        let needle = text.trim().to_lowercase();
+        self.inventory_hashes
+            .iter()
+            .filter_map(|hash| self.inventory_definition(*hash))
+            .filter(move |definition| {
+                definition.item.is_some_and(|item| {
+                    (item.class_type == 3 || item.class_type == class_type)
+                        && (show_dummy_items || !crate::dummy_items::contains(item.hash))
+                }) && definition.metadata.is_character_inventory_candidate()
+                    && inventory_definition_matches(
+                        *definition,
+                        self.description(definition.hash),
+                        &needle,
+                    )
+            })
     }
 
     pub fn search(
@@ -261,9 +724,12 @@ impl Catalog {
                 compatible(item, bucket, class_type, show_dummy_items)
                     && (item.name.to_lowercase().contains(&needle)
                         || item.type_name.to_lowercase().contains(&needle)
+                        || self.description(item.hash).is_some_and(|description| {
+                            description.to_lowercase().contains(&needle)
+                        })
                         || format_hash(item.hash).to_lowercase().contains(&needle))
             })
-            .take(40)
+            .map(Arc::as_ref)
             .collect()
     }
 
@@ -271,12 +737,59 @@ impl Catalog {
         self.items
             .iter()
             .filter(|item| compatible(item, bucket, class_type, show_dummy_items))
+            .map(Arc::as_ref)
             .collect()
     }
 
-    pub fn plug_label(&self, hash: u64) -> String {
+    pub fn plug_label(&self, hash: u64, include_hash: bool) -> String {
         let name = self.names.get(&hash).map_or("Unknown plug", String::as_str);
-        format!("{name}  ({})", format_hash(hash))
+        format_plug_label(name, hash, include_hash)
+    }
+
+    pub fn plug_type_name(&self, hash: u64) -> Option<&str> {
+        self.type_names.get(&hash).map(String::as_str)
+    }
+
+    pub fn display_name(&self, hash: u64) -> Option<&str> {
+        self.names
+            .get(&hash)
+            .map(String::as_str)
+            .or_else(|| self.item(hash).map(|item| item.name.as_str()))
+    }
+
+    pub fn stats(&self) -> CatalogStats {
+        CatalogStats {
+            items: self.items.len(),
+            plugs: self.all_plug_options.len(),
+            icons: self.icon_containers.len(),
+            descriptions: self.descriptions.len(),
+        }
+    }
+
+    pub fn description(&self, hash: u64) -> Option<&str> {
+        self.descriptions.get(&hash).map(String::as_str)
+    }
+
+    /// Loads an installed package icon on demand and keeps only displayed icons on the GPU.
+    pub fn icon_texture(
+        &self,
+        context: &eframe::egui::Context,
+        hash: u64,
+    ) -> Option<eframe::egui::TextureHandle> {
+        let &container = self.icon_containers.get(&hash)?;
+        let mut runtime = self
+            .icon_runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        runtime.texture(context, &self.install_path, hash, container)
+    }
+
+    pub fn icon_diagnostic(&self, hash: u64) -> Option<String> {
+        let runtime = self
+            .icon_runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        runtime.diagnostic(hash)
     }
 
     pub fn socket_options(&self, socket: &SocketDef) -> &[u64] {
@@ -286,12 +799,107 @@ impl Catalog {
             .unwrap_or_default()
     }
 
+    /// Resolves the installed exotic-catalyst lifecycle for one item.
+    ///
+    /// Shadowkeep-era definitions use either a legacy three-plug lifecycle
+    /// (unacquired, objective progress, completion marker) or the later empty/active
+    /// pair where the item-state Masterwork bit distinguishes progress from completion.
+    /// Ambiguous socket pools are deliberately left as ordinary plug editors.
+    pub fn catalyst_socket(&self, item: &ItemDef) -> Option<CatalystSocket> {
+        item.sockets
+            .iter()
+            .enumerate()
+            .find_map(|(socket_index, socket)| {
+                let options = self.socket_options(socket);
+                let default = item
+                    .default_plugs
+                    .get(socket_index)
+                    .and_then(Option::as_deref)
+                    .and_then(parse_hash)?;
+
+                if options.len() == 2
+                    && default == crate::catalyst_plugs::EMPTY_CATALYST_SOCKET
+                    && options.contains(&crate::catalyst_plugs::EMPTY_CATALYST_SOCKET)
+                {
+                    let active = options
+                        .iter()
+                        .copied()
+                        .find(|hash| *hash != crate::catalyst_plugs::EMPTY_CATALYST_SOCKET)?;
+                    return Some(CatalystSocket {
+                        socket_index,
+                        unacquired_plug: default,
+                        in_progress_plug: active,
+                        completed_plug: active,
+                    });
+                }
+
+                if options.len() != 3 || !options.contains(&default) {
+                    return None;
+                }
+                let mut completion = options
+                    .iter()
+                    .copied()
+                    .filter(|hash| crate::catalyst_plugs::is_legacy_completion(*hash));
+                let completed_plug = completion.next()?;
+                if completion.next().is_some() || completed_plug == default {
+                    return None;
+                }
+                let mut progress = options
+                    .iter()
+                    .copied()
+                    .filter(|hash| *hash != default && *hash != completed_plug);
+                let in_progress_plug = progress.next()?;
+                if progress.next().is_some() {
+                    return None;
+                }
+                Some(CatalystSocket {
+                    socket_index,
+                    unacquired_plug: default,
+                    in_progress_plug,
+                    completed_plug,
+                })
+            })
+    }
+
     pub fn socket_type_options(&self, socket_type: u16) -> &[u64] {
         self.socket_type_options
             .get(&socket_type)
             .map(Vec::as_slice)
             .unwrap_or_default()
     }
+
+    pub fn all_plug_options(&self) -> &[u64] {
+        &self.all_plug_options
+    }
+}
+
+fn inventory_definition_matches(
+    definition: InventoryDefinition<'_>,
+    description: Option<&str>,
+    needle: &str,
+) -> bool {
+    needle.is_empty()
+        || definition.name.to_lowercase().contains(needle)
+        || definition.type_name.to_lowercase().contains(needle)
+        || description.is_some_and(|description| description.to_lowercase().contains(needle))
+        || format_hash(definition.hash).to_lowercase().contains(needle)
+}
+
+fn format_plug_label(name: &str, hash: u64, include_hash: bool) -> String {
+    if include_hash {
+        format!("{name}  ({})", format_hash(hash))
+    } else {
+        name.to_owned()
+    }
+}
+
+fn sort_plug_options(options: &mut Vec<u64>, names: &HashMap<u64, String>) {
+    options.sort_unstable();
+    options.dedup();
+    options.sort_by_cached_key(|hash| {
+        let name = names.get(hash).map_or("", String::as_str).trim();
+        (name.is_empty(), name.to_lowercase(), *hash)
+    });
 }
 
 pub fn cache_is_current(path: &Path) -> bool {
@@ -349,53 +957,10 @@ fn compatible(item: &ItemDef, bucket: u64, class_type: u64, show_dummy_items: bo
         && (show_dummy_items || !crate::dummy_items::contains(item.hash))
 }
 
-pub fn validate_install(install: &Path) -> Result<(), String> {
-    if install.join("destiny2.exe").is_file()
-        && install.join("packages").is_dir()
-        && install.join("bin/x64/oo2core_3_win64.dll").is_file()
-    {
-        Ok(())
-    } else {
-        Err("Not a Shadowkeep install: expected destiny2.exe, packages, and bin\\x64\\oo2core_3_win64.dll".into())
-    }
-}
-
-fn install_fingerprint(install: &Path) -> Result<String, String> {
-    let mut entries = Vec::new();
-    for entry in fs::read_dir(install.join("packages"))
-        .map_err(|e| format!("Could not read packages: {e}"))?
-    {
-        let entry = entry.map_err(|e| format!("Could not inspect packages: {e}"))?;
-        let path = entry.path();
-        if path
-            .extension()
-            .and_then(|s| s.to_str())
-            .is_some_and(|s| s.eq_ignore_ascii_case("pkg"))
-        {
-            let meta = entry
-                .metadata()
-                .map_err(|e| format!("Could not inspect {}: {e}", path.display()))?;
-            let modified = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map_or(0, |d| d.as_secs());
-            entries.push(format!(
-                "{}:{}:{}",
-                entry.file_name().to_string_lossy(),
-                meta.len(),
-                modified
-            ));
-        }
-    }
-    entries.sort();
-    Ok(entries.join("|"))
-}
-
 fn scan_packages(
     install: &Path,
     report: &mut dyn FnMut(CatalogProgress),
-) -> Result<(Vec<ItemDef>, HashMap<u64, String>), String> {
+) -> Result<ScannedCatalog, String> {
     report(CatalogProgress::stage(
         "Opening the installed game packages…",
     ));
@@ -428,9 +993,16 @@ fn scan_packages(
     let mut localized_cache = HashMap::<u32, HashMap<u32, String>>::new();
     report(CatalogProgress::stage("Reading subclass ability names…"));
     let ability_displays = scan_ability_displays(&manager, &localized_tags, &mut localized_cache);
+    let stat_names = scan_stat_names(
+        &manager,
+        &globals_data,
+        &localized_tags,
+        &mut localized_cache,
+    );
     let root = manager
         .read_tag(TagHash(u32_at(&globals_data, 16)?))
         .map_err(|e| format!("Could not read investment root: {e}"))?;
+    let inventory_buckets = scan_inventory_bucket_descriptors(&manager, &root)?;
     let plug_set_table = manager
         .read_tag(TagHash(u32_at(&root, 8 + 51 * 16)?))
         .map_err(|e| format!("Could not read reusable plug sets: {e}"))?;
@@ -458,7 +1030,12 @@ fn scan_packages(
             ))
         })
         .collect();
+    let icon_containers_by_index = scan_item_icon_containers(&manager, &globals_data)?;
     let mut names = HashMap::new();
+    let mut type_names = HashMap::new();
+    let mut descriptions = HashMap::new();
+    let mut icon_containers = HashMap::new();
+    let mut inventory_metadata = HashMap::new();
     let mut items = Vec::new();
     let mut item_socket_lists = Vec::<(usize, u16)>::new();
     let mut plug_category_by_hash = HashMap::<u64, u32>::new();
@@ -484,6 +1061,9 @@ fn scan_packages(
         if item.len() < 188 {
             continue;
         }
+        if let Some(metadata) = item_inventory_metadata(&item, &inventory_buckets) {
+            inventory_metadata.insert(hash, metadata);
+        }
         let string_row = string_rows + index * 24;
         let string_tag = if u32_at(&string_map, string_row).ok().map(u64::from) == Some(hash) {
             TagHash(u32_at(&string_map, string_row + 16)?)
@@ -496,7 +1076,7 @@ fn scan_packages(
         let Ok(string_thing) = manager.read_tag(string_tag) else {
             continue;
         };
-        let name = resolve_string(
+        let mut name = resolve_string(
             &manager,
             &localized_tags,
             &mut localized_cache,
@@ -504,10 +1084,12 @@ fn scan_packages(
             0x84,
         )
         .unwrap_or_default();
-        if name.trim().is_empty() {
-            continue;
+        let mut derived_masterwork_name = false;
+        if let Some(label) = masterwork_label(&item, &stat_names, &name) {
+            name = label;
+            derived_masterwork_name = true;
         }
-        let type_name = resolve_string(
+        let mut type_name = resolve_string(
             &manager,
             &localized_tags,
             &mut localized_cache,
@@ -515,7 +1097,40 @@ fn scan_packages(
             0x90,
         )
         .unwrap_or_default();
-        names.entry(hash).or_insert_with(|| name.clone());
+        if let Some(description) = resolve_string(
+            &manager,
+            &localized_tags,
+            &mut localized_cache,
+            &string_thing,
+            ITEM_DESCRIPTION_OFFSET,
+        )
+        .filter(|description| !description.trim().is_empty())
+        {
+            descriptions.insert(hash, description);
+        }
+        if let Ok(icon_index) = u16_at(&string_thing, ITEM_ICON_INDEX_OFFSET)
+            && icon_index != u16::MAX
+            && let Some(Some(container)) = icon_containers_by_index.get(icon_index as usize)
+        {
+            icon_containers.insert(hash, *container);
+        }
+        if name.trim().is_empty() {
+            let Some((derived_name, derived_type_name)) =
+                stat_allocation_labels(&item, &stat_names)
+            else {
+                continue;
+            };
+            name = derived_name;
+            derived_type_name.clone_into(&mut type_name);
+        }
+        if !type_name.trim().is_empty() {
+            type_names.entry(hash).or_insert_with(|| type_name.clone());
+        }
+        if derived_masterwork_name {
+            names.insert(hash, name.clone());
+        } else {
+            names.entry(hash).or_insert_with(|| name.clone());
+        }
         if let Ok(category) = u32_at(&item, 392) {
             if category != 0 && category != u32::MAX {
                 plug_category_by_hash.insert(hash, category);
@@ -561,6 +1176,7 @@ fn scan_packages(
                             allowed.dedup();
                             sockets.push(SocketDef {
                                 socket_type,
+                                label: String::new(),
                                 pool: 0,
                                 allowed,
                             });
@@ -610,7 +1226,39 @@ fn scan_packages(
         total: count,
     });
     report(CatalogProgress::stage("Building socket choices…"));
-    for item in &mut items {
+    build_socket_choices(
+        &mut items,
+        &plug_category_by_hash,
+        &plug_category_items,
+        &names,
+        &mut type_names,
+    );
+    report(CatalogProgress::stage("Building subclass choices…"));
+    build_subclass_choices(
+        &manager,
+        &root,
+        &ability_displays,
+        item_socket_lists,
+        &mut items,
+    )?;
+    Ok(ScannedCatalog {
+        items,
+        names,
+        type_names,
+        descriptions,
+        icon_containers,
+        inventory_metadata,
+    })
+}
+
+fn build_socket_choices(
+    items: &mut [ItemDef],
+    plug_category_by_hash: &HashMap<u64, u32>,
+    plug_category_items: &HashMap<u32, Vec<u64>>,
+    names: &HashMap<u64, String>,
+    type_names: &mut HashMap<u64, String>,
+) {
+    for item in items.iter_mut() {
         for (socket_index, socket) in item.sockets.iter_mut().enumerate() {
             let mut seeds = socket.allowed.clone();
             if let Some(Some(default)) = item.default_plugs.get(socket_index) {
@@ -633,8 +1281,9 @@ fn scan_packages(
             socket.allowed.dedup();
         }
     }
+    infer_socket_plug_types(items, names, type_names);
     let tracker_plugs = [2_285_418_970, 2_302_094_943, 38_912_240];
-    for item in &mut items {
+    for item in items.iter_mut() {
         for socket in &mut item.sockets {
             // Kill/Crucible tracker sockets use a small synthetic plug set
             // keyed by socket type rather than a package plug-set row.
@@ -645,10 +1294,34 @@ fn scan_packages(
             }
         }
     }
+    for item in items.iter_mut() {
+        for (socket_index, socket) in item.sockets.iter_mut().enumerate() {
+            let default = item
+                .default_plugs
+                .get(socket_index)
+                .and_then(Option::as_deref)
+                .and_then(parse_hash);
+            socket.label = infer_socket_label(
+                socket.socket_type,
+                default,
+                &socket.allowed,
+                names,
+                type_names,
+            );
+        }
+    }
+}
+
+fn build_subclass_choices(
+    manager: &PackageManager,
+    root: &[u8],
+    ability_displays: &HashMap<u16, AbilityDisplayData>,
+    item_socket_lists: Vec<(usize, u16)>,
+    items: &mut [ItemDef],
+) -> Result<(), String> {
     let list_table = manager
-        .read_tag(TagHash(u32_at(&root, 8 + 97 * 16)?))
+        .read_tag(TagHash(u32_at(root, 8 + 97 * 16)?))
         .map_err(|e| format!("Could not read subclass ability table: {e}"))?;
-    report(CatalogProgress::stage("Building subclass choices…"));
     let (list_count, list_rows, _) = array_at(&list_table, 8)?;
     for (item_index, list_index) in item_socket_lists {
         let Some(item) = items.get_mut(item_index) else {
@@ -676,7 +1349,281 @@ fn scan_packages(
             }
         }
     }
-    Ok((items, names))
+    Ok(())
+}
+
+fn scan_item_icon_containers(
+    manager: &PackageManager,
+    globals: &[u8],
+) -> Result<Vec<Option<u32>>, String> {
+    let slot = 16 + ITEM_ICON_TABLE_SLOT * 16;
+    let table_tag = TagHash(u32_at(globals, slot)?);
+    let table = manager
+        .read_tag(table_tag)
+        .map_err(|e| format!("Could not read item icon table: {e}"))?;
+    let (count, rows, _) = array_at(&table, 8)?;
+    (0..count)
+        .map(|index| {
+            let row = rows
+                .checked_add(
+                    index
+                        .checked_mul(ITEM_ICON_TABLE_ROW_SIZE)
+                        .ok_or("Item icon table offset overflowed")?,
+                )
+                .ok_or("Item icon table offset overflowed")?;
+            let tag = u32_at(&table, row + ITEM_ICON_CONTAINER_OFFSET)?;
+            Ok((tag != u32::MAX && TagHash(tag).is_valid()).then_some(tag))
+        })
+        .collect()
+}
+
+fn scan_inventory_bucket_descriptors(
+    manager: &PackageManager,
+    root: &[u8],
+) -> Result<HashMap<u8, InventoryBucketDescriptor>, String> {
+    let slot = 8 + INVENTORY_BUCKET_TABLE_SLOT * 16;
+    let table_tag = TagHash(u32_at(root, slot)?);
+    let table = manager
+        .read_tag(table_tag)
+        .map_err(|e| format!("Could not read inventory bucket table: {e}"))?;
+    parse_inventory_bucket_descriptors(&table)
+}
+
+fn parse_inventory_bucket_descriptors(
+    table: &[u8],
+) -> Result<HashMap<u8, InventoryBucketDescriptor>, String> {
+    if table.len() < INVENTORY_BUCKET_FIRST_DESCRIPTOR {
+        return Err("The inventory bucket table is truncated".into());
+    }
+    let count = i32_at(table, INVENTORY_BUCKET_COUNT_OFFSET)?;
+    let count = usize::try_from(count)
+        .ok()
+        .filter(|count| (1..=u8::MAX as usize).contains(count))
+        .ok_or("The inventory bucket table has an invalid descriptor count")?;
+    let rows_size = count
+        .checked_mul(INVENTORY_BUCKET_DESCRIPTOR_SIZE)
+        .ok_or("The inventory bucket table size overflowed")?;
+    let end = INVENTORY_BUCKET_FIRST_DESCRIPTOR
+        .checked_add(rows_size)
+        .ok_or("The inventory bucket table extent overflowed")?;
+    if end > table.len() {
+        return Err("The inventory bucket descriptors are truncated".into());
+    }
+
+    let mut descriptors = HashMap::with_capacity(count);
+    for index in 0..count {
+        let base = INVENTORY_BUCKET_FIRST_DESCRIPTOR + index * INVENTORY_BUCKET_DESCRIPTOR_SIZE;
+        let bucket_id = table[base];
+        if bucket_id == u8::MAX {
+            return Err("The inventory bucket table contains an unavailable bucket id".into());
+        }
+        let scope = match table[base + INVENTORY_BUCKET_SCOPE_OFFSET] {
+            0 => InventoryScope::Character,
+            1 => InventoryScope::Profile,
+            2 => InventoryScope::SmallProfile,
+            value => {
+                return Err(format!(
+                    "The inventory bucket table contains unknown scope {value}"
+                ));
+            }
+        };
+        let first_slot = i32_at(table, base + INVENTORY_BUCKET_FIRST_SLOT_OFFSET)?;
+        let capacity = i32_at(table, base + INVENTORY_BUCKET_SLOT_COUNT_OFFSET)?;
+        let first_slot = u16::try_from(first_slot)
+            .map_err(|_| "An inventory bucket has an invalid first slot")?;
+        let capacity = u16::try_from(capacity)
+            .ok()
+            .filter(|capacity| *capacity > 0)
+            .ok_or("An inventory bucket has an invalid capacity")?;
+        let array_capacity = scope
+            .array_capacity()
+            .ok_or("An inventory bucket has no native array capacity")?;
+        if first_slot > array_capacity || capacity > array_capacity - first_slot {
+            return Err("An inventory bucket range exceeds its native array".into());
+        }
+        if descriptors
+            .insert(bucket_id, InventoryBucketDescriptor { scope, capacity })
+            .is_some()
+        {
+            return Err(format!(
+                "The inventory bucket table repeats bucket {bucket_id}"
+            ));
+        }
+    }
+    Ok(descriptors)
+}
+
+fn item_inventory_metadata(
+    item: &[u8],
+    descriptors: &HashMap<u8, InventoryBucketDescriptor>,
+) -> Option<InventoryMetadata> {
+    let native_bucket_id = *item.get(INVENTORY_BUCKET_ID_OFFSET)?;
+    let descriptor = descriptors.get(&native_bucket_id)?;
+    let max_stack_size = i32_at(item, INVENTORY_MAX_STACK_SIZE_OFFSET)
+        .ok()
+        .and_then(|size| u32::try_from(size).ok())
+        .filter(|size| *size > 0);
+    let stackability = if *item.get(INVENTORY_INSTANCED_OFFSET)? == 0 {
+        ItemStackability::Stackable
+    } else {
+        ItemStackability::Instanced
+    };
+    Some(InventoryMetadata {
+        scope: descriptor.scope,
+        native_bucket_id,
+        stackability,
+        max_stack_size,
+        bucket_capacity: Some(descriptor.capacity),
+    })
+}
+
+fn infer_socket_label(
+    socket_type: u16,
+    default: Option<u64>,
+    allowed: &[u64],
+    names: &HashMap<u64, String>,
+    type_names: &HashMap<u64, String>,
+) -> String {
+    if let Some(label) = verified_socket_label(socket_type) {
+        return label.into();
+    }
+
+    if let Some(label) = default.and_then(|hash| socket_label_for_plug(hash, names, type_names)) {
+        return label;
+    }
+
+    let mut counts = HashMap::<String, usize>::new();
+    for &hash in allowed {
+        if let Some(label) = socket_label_for_plug(hash, names, type_names) {
+            *counts.entry(label).or_default() += 1;
+        }
+    }
+    if let Some((label, count)) =
+        counts
+            .iter()
+            .max_by(|(left_label, left_count), (right_label, right_count)| {
+                left_count
+                    .cmp(right_count)
+                    .then_with(|| right_label.cmp(left_label))
+            })
+        && count.saturating_mul(2) >= counts.values().sum()
+    {
+        return label.clone();
+    }
+
+    String::new()
+}
+
+fn verified_socket_label(socket_type: u16) -> Option<&'static str> {
+    match socket_type {
+        29..=43 => Some("Armor Masterwork"),
+        // Shadowkeep's public manifest categorizes these as GHOST SHELL PERKS;
+        // individual perk definitions use the overly generic type "Intrinsic".
+        51 => Some("Ghost Perk"),
+        62 => Some("Sparrow Perk"),
+        483 => Some("Weapon Masterwork"),
+        518 => Some("Kill Tracker"),
+        520 => Some("Armor Tier"),
+        676 => Some("Stat Allocation"),
+        678 | 679 => Some("Armor Energy Upgrade"),
+        760 | 761 => Some("Top Stat Allocation"),
+        762 | 763 => Some("Bottom Stat Allocation"),
+        _ => None,
+    }
+}
+
+fn inferred_plug_type_for_socket(socket_type: u16) -> Option<&'static str> {
+    match socket_type {
+        29..=43 => Some("Armor Masterwork"),
+        51 => Some("Ghost Perk"),
+        520 => Some("Armor Tier"),
+        678 | 679 => Some("Armor Energy"),
+        760 | 761 => Some("Top Stat Allocation"),
+        762 | 763 => Some("Bottom Stat Allocation"),
+        _ => None,
+    }
+}
+
+fn infer_socket_plug_types(
+    items: &[ItemDef],
+    names: &HashMap<u64, String>,
+    type_names: &mut HashMap<u64, String>,
+) {
+    for item in items {
+        for (socket_index, socket) in item.sockets.iter().enumerate() {
+            let Some(type_name) = inferred_plug_type_for_socket(socket.socket_type) else {
+                continue;
+            };
+            let default = item
+                .default_plugs
+                .get(socket_index)
+                .and_then(Option::as_deref)
+                .and_then(parse_hash);
+            for hash in socket.allowed.iter().copied().chain(default) {
+                if socket.socket_type == 51 {
+                    // "Intrinsic" is not useful here and is inconsistent with the
+                    // manifest's Ghost Shell Perks socket category.
+                    type_names.insert(hash, type_name.into());
+                } else {
+                    type_names.entry(hash).or_insert_with(|| type_name.into());
+                }
+            }
+        }
+    }
+
+    for (&hash, name) in names {
+        if name.trim().eq_ignore_ascii_case("Empty Mod Socket") {
+            type_names.entry(hash).or_insert_with(|| "Armor Mod".into());
+        }
+    }
+}
+
+fn socket_label_for_plug(
+    hash: u64,
+    names: &HashMap<u64, String>,
+    type_names: &HashMap<u64, String>,
+) -> Option<String> {
+    let name = names.get(&hash).map_or("", String::as_str).trim();
+    let lower_name = name.to_ascii_lowercase();
+    if lower_name == "default shader" {
+        return Some("Shader".into());
+    }
+    if lower_name.contains("ornament") {
+        return Some("Ornament".into());
+    }
+    if lower_name == "no projection" {
+        return Some("Ghost Projection".into());
+    }
+    if lower_name == "default effect" {
+        return Some("Transmat Effect".into());
+    }
+    if lower_name.contains("tracker") {
+        return Some("Kill Tracker".into());
+    }
+    if lower_name.contains("catalyst") {
+        return Some("Catalyst".into());
+    }
+    if lower_name.starts_with("tier ") && lower_name.ends_with(" weapon")
+        || lower_name.starts_with("masterwork:")
+    {
+        return Some("Weapon Masterwork".into());
+    }
+    if lower_name.starts_with("tier ") && lower_name.ends_with(" armor") {
+        return Some("Armor Tier".into());
+    }
+    if matches!(lower_name.as_str(), "upgrade armor" | "change energy type") {
+        return Some("Armor Energy Upgrade".into());
+    }
+
+    let type_name = type_names.get(&hash).map_or("", String::as_str).trim();
+    if type_name.is_empty() || type_name == "Restore Defaults" {
+        return None;
+    }
+    if type_name.contains("Ornament") {
+        Some("Ornament".into())
+    } else {
+        Some(type_name.into())
+    }
 }
 
 fn parse_abilities(list: &[u8], display: &AbilityDisplayData, list_index: u16) -> AbilityOptions {
@@ -983,6 +1930,104 @@ fn resolve_localized_hash(
     None
 }
 
+fn scan_stat_names(
+    manager: &PackageManager,
+    globals: &[u8],
+    localized_tags: &[TagHash],
+    localized_cache: &mut HashMap<u32, HashMap<u32, String>>,
+) -> Vec<String> {
+    let tag_offset = 16 + STAT_STRING_MAP_INDEX * 16;
+    let Ok(tag) = u32_at(globals, tag_offset) else {
+        return Vec::new();
+    };
+    let Ok(table) = manager.read_tag(TagHash(tag)) else {
+        return Vec::new();
+    };
+    let Ok((count, rows, class)) = array_at(&table, 8) else {
+        return Vec::new();
+    };
+    if class != STAT_STRING_MAP_CLASS || count > 256 {
+        return Vec::new();
+    }
+    (0..count)
+        .map(|index| {
+            resolve_string(
+                manager,
+                localized_tags,
+                localized_cache,
+                &table,
+                rows + index * STAT_STRING_ROW_SIZE + 4,
+            )
+            .unwrap_or_default()
+        })
+        .collect()
+}
+
+fn stat_allocation_labels(item: &[u8], stat_names: &[String]) -> Option<(String, &'static str)> {
+    let (count, rows, class) = array_at(item, INVESTMENT_STAT_DESCRIPTOR).ok()?;
+    if class != INVESTMENT_STAT_CLASS || count != 3 {
+        return None;
+    }
+
+    let mut stats = [(0_usize, 0_u32); 3];
+    for (row_index, stat) in stats.iter_mut().enumerate() {
+        let row = rows.checked_add(row_index.checked_mul(INVESTMENT_STAT_ROW_SIZE)?)?;
+        *stat = (
+            usize::from(u16_at(item, row).ok()?),
+            u32_at(item, row + 4).ok()?,
+        );
+    }
+
+    let (expected_indexes, type_name) = if stats.iter().all(|(index, _)| (3..=5).contains(index)) {
+        ([3, 4, 5], "Top Stat Allocation")
+    } else if stats.iter().all(|(index, _)| (6..=8).contains(index)) {
+        ([6, 7, 8], "Bottom Stat Allocation")
+    } else {
+        return None;
+    };
+
+    let mut parts = Vec::with_capacity(3);
+    for expected_index in expected_indexes {
+        let value = stats
+            .iter()
+            .find_map(|(index, value)| (*index == expected_index).then_some(*value))?;
+        if value == 0 || value > 100 {
+            return None;
+        }
+        let stat_name = stat_names.get(expected_index)?.trim();
+        if stat_name.is_empty() {
+            return None;
+        }
+        parts.push(format!("{value} {stat_name}"));
+    }
+
+    Some((parts.join(" / "), type_name))
+}
+
+fn masterwork_label(item: &[u8], stat_names: &[String], current_name: &str) -> Option<String> {
+    let is_full_masterwork = current_name == "Masterwork";
+    let is_item_tier = current_name.starts_with("Tier ")
+        && (current_name.ends_with(" Weapon") || current_name.ends_with(" Armor"));
+    if !is_full_masterwork && !is_item_tier {
+        return None;
+    }
+
+    let (count, rows, class) = array_at(item, INVESTMENT_STAT_DESCRIPTOR).ok()?;
+    if class != INVESTMENT_STAT_CLASS || !(1..=4).contains(&count) {
+        return None;
+    }
+    let primary_stat = usize::from(u16_at(item, rows).ok()?);
+    let name = stat_names.get(primary_stat)?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(if is_full_masterwork {
+        format!("Masterwork: {name}")
+    } else {
+        format!("{current_name}: {name}")
+    })
+}
+
 fn resolve_string(
     manager: &PackageManager,
     tags: &[TagHash],
@@ -1073,67 +2118,6 @@ fn decode_strings(manager: &PackageManager, tag: TagHash) -> Result<Vec<(u32, St
     Ok(result)
 }
 
-fn array_at(data: &[u8], descriptor: usize) -> Result<(usize, usize, u32), String> {
-    let count_raw = u64_at(data, descriptor)?;
-    let count = usize::try_from(count_raw).map_err(|_| "Package array is too large")?;
-    let pointer = descriptor
-        .checked_add(8)
-        .ok_or("Package array pointer overflowed")?;
-    let header = relative_offset(descriptor, 8, i64_at(data, pointer)?)?;
-    if u64_at(data, header)? != count_raw {
-        return Err("Package array count mismatch".into());
-    }
-    let rows = header
-        .checked_add(16)
-        .ok_or("Package array row offset overflowed")?;
-    let class_offset = header
-        .checked_add(8)
-        .ok_or("Package array class offset overflowed")?;
-    Ok((count, rows, u32_at(data, class_offset)?))
-}
-
-fn u16_at(data: &[u8], offset: usize) -> Result<u16, String> {
-    Ok(u16::from_le_bytes(bytes_at(data, offset)?))
-}
-fn u32_at(data: &[u8], offset: usize) -> Result<u32, String> {
-    Ok(u32::from_le_bytes(bytes_at(data, offset)?))
-}
-fn u64_at(data: &[u8], offset: usize) -> Result<u64, String> {
-    Ok(u64::from_le_bytes(bytes_at(data, offset)?))
-}
-fn i64_at(data: &[u8], offset: usize) -> Result<i64, String> {
-    Ok(i64::from_le_bytes(bytes_at(data, offset)?))
-}
-
-fn bytes_at<const N: usize>(data: &[u8], offset: usize) -> Result<[u8; N], String> {
-    let end = offset
-        .checked_add(N)
-        .ok_or_else(|| format!("Package offset overflowed at {offset}"))?;
-    data.get(offset..end)
-        .ok_or_else(|| format!("Package data ended at {offset}"))?
-        .try_into()
-        .map_err(|_| format!("Invalid {N}-byte package value"))
-}
-
-fn relative_offset(base: usize, bias: usize, relative: i64) -> Result<usize, String> {
-    let origin = base
-        .checked_add(bias)
-        .ok_or("Package relative pointer overflowed")?;
-    if relative >= 0 {
-        let relative =
-            usize::try_from(relative).map_err(|_| "Package relative pointer is too large")?;
-        origin
-            .checked_add(relative)
-            .ok_or_else(|| "Package relative pointer overflowed".into())
-    } else {
-        let magnitude = usize::try_from(relative.unsigned_abs())
-            .map_err(|_| "Package relative pointer is too small")?;
-        origin
-            .checked_sub(magnitude)
-            .ok_or_else(|| "Package relative pointer points before the data".into())
-    }
-}
-
 const fn bucket_hash(bucket: u8) -> Option<u64> {
     Some(match bucket {
         0 => 1_498_876_634,
@@ -1152,26 +2136,23 @@ const fn bucket_hash(bucket: u8) -> Option<u64> {
         27 => 4_274_335_291,
         41 => 2_401_704_334,
         47 => 3_683_254_069,
+        49 => 0x59CA_1EA2,
         _ => return None,
     })
-}
-
-fn format_hash(hash: u64) -> String {
-    format!("0x{hash:08X}")
-}
-fn parse_hash(text: &str) -> Option<u64> {
-    u64::from_str_radix(
-        text.trim()
-            .trim_start_matches("0x")
-            .trim_start_matches("0X"),
-        16,
-    )
-    .ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plug_labels_only_include_hashes_when_requested() {
+        assert_eq!(format_plug_label("Rampage", 0x12AB, false), "Rampage");
+        assert_eq!(
+            format_plug_label("Rampage", 0x12AB, true),
+            "Rampage  (0x000012AB)"
+        );
+    }
 
     #[test]
     fn super_choices_include_gunslinger_and_dawnblade_alternates() {
@@ -1273,6 +2254,561 @@ mod tests {
             "{{\"schema\":{},\"sundial_version\":\"{SUNDIAL_VERSION}\"}}",
             CACHE_SCHEMA - 1
         )));
+    }
+
+    #[test]
+    fn inventory_bucket_descriptors_validate_scope_capacity_and_identity() {
+        let mut table = vec![0_u8; INVENTORY_BUCKET_FIRST_DESCRIPTOR + 2 * 36];
+        table[INVENTORY_BUCKET_COUNT_OFFSET..INVENTORY_BUCKET_COUNT_OFFSET + 4]
+            .copy_from_slice(&2_i32.to_le_bytes());
+        for (index, bucket, first, count, scope) in
+            [(0, 5_u8, 10_i32, 12_i32, 0_u8), (1, 9, 20, 3, 1)]
+        {
+            let base = INVENTORY_BUCKET_FIRST_DESCRIPTOR + index * 36;
+            table[base] = bucket;
+            table[base + INVENTORY_BUCKET_FIRST_SLOT_OFFSET
+                ..base + INVENTORY_BUCKET_FIRST_SLOT_OFFSET + 4]
+                .copy_from_slice(&first.to_le_bytes());
+            table[base + INVENTORY_BUCKET_SLOT_COUNT_OFFSET
+                ..base + INVENTORY_BUCKET_SLOT_COUNT_OFFSET + 4]
+                .copy_from_slice(&count.to_le_bytes());
+            table[base + INVENTORY_BUCKET_SCOPE_OFFSET] = scope;
+        }
+
+        let descriptors = parse_inventory_bucket_descriptors(&table).unwrap();
+        assert_eq!(
+            descriptors[&5],
+            InventoryBucketDescriptor {
+                scope: InventoryScope::Character,
+                capacity: 12
+            }
+        );
+        assert_eq!(descriptors[&9].scope, InventoryScope::Profile);
+
+        let second = INVENTORY_BUCKET_FIRST_DESCRIPTOR + 36;
+        table[second] = 5;
+        assert!(parse_inventory_bucket_descriptors(&table).is_err());
+        table[second] = 9;
+        table[second + INVENTORY_BUCKET_FIRST_SLOT_OFFSET
+            ..second + INVENTORY_BUCKET_FIRST_SLOT_OFFSET + 4]
+            .copy_from_slice(&700_i32.to_le_bytes());
+        assert!(parse_inventory_bucket_descriptors(&table).is_err());
+    }
+
+    #[test]
+    fn inventory_metadata_uses_native_item_quantity_fields() {
+        let descriptors = HashMap::from([(
+            42,
+            InventoryBucketDescriptor {
+                scope: InventoryScope::Profile,
+                capacity: 7,
+            },
+        )]);
+        let mut item = vec![0_u8; INVENTORY_INSTANCED_OFFSET + 1];
+        item[INVENTORY_MAX_STACK_SIZE_OFFSET..INVENTORY_MAX_STACK_SIZE_OFFSET + 4]
+            .copy_from_slice(&999_i32.to_le_bytes());
+        item[INVENTORY_BUCKET_ID_OFFSET] = 42;
+
+        let metadata = item_inventory_metadata(&item, &descriptors).unwrap();
+        assert_eq!(metadata.scope.label(), "Profile");
+        assert_eq!(metadata.scope.array_capacity(), Some(701));
+        assert_eq!(metadata.native_bucket_id, 42);
+        assert_eq!(metadata.stackability.label(), "Stackable");
+        assert_eq!(metadata.max_stack_size, Some(999));
+        assert_eq!(metadata.bucket_capacity, Some(7));
+        assert_eq!(metadata.authored_row_capacity(), Some(7));
+        assert!(metadata.is_profile_items_candidate());
+
+        item[INVENTORY_INSTANCED_OFFSET] = 1;
+        assert!(
+            !item_inventory_metadata(&item, &descriptors)
+                .unwrap()
+                .is_profile_items_candidate()
+        );
+    }
+
+    #[test]
+    fn inventory_apis_resolve_profile_only_items_and_keep_character_items_safe() {
+        let character = ItemDef {
+            hash: 30,
+            name: "Character item".into(),
+            type_name: "Helmet".into(),
+            bucket_hash: 3_448_274_439,
+            class_type: 3,
+            default_plugs: Vec::new(),
+            sockets: Vec::new(),
+            abilities: AbilityOptions::default(),
+        };
+        let names = HashMap::from([
+            (20, "Zeta material".into()),
+            (10, "Alpha material".into()),
+            (30, character.name.clone()),
+        ]);
+        let type_names = HashMap::from([
+            (10, "Currency".into()),
+            (20, "Material".into()),
+            (30, character.type_name.clone()),
+        ]);
+        let profile = |bucket| InventoryMetadata {
+            scope: InventoryScope::Profile,
+            native_bucket_id: bucket,
+            stackability: ItemStackability::Stackable,
+            max_stack_size: Some(999),
+            bucket_capacity: Some(10),
+        };
+        let inventory_metadata = HashMap::from([
+            (10, profile(1)),
+            (20, profile(2)),
+            (
+                30,
+                InventoryMetadata {
+                    scope: InventoryScope::Character,
+                    native_bucket_id: 3,
+                    stackability: ItemStackability::Instanced,
+                    max_stack_size: Some(1),
+                    bucket_capacity: Some(20),
+                },
+            ),
+        ]);
+        let catalog = Catalog::finish(
+            CatalogContents {
+                items: vec![character],
+                names,
+                type_names,
+                descriptions: HashMap::new(),
+                icon_containers: HashMap::new(),
+                inventory_metadata,
+                plug_pools: vec![Vec::new()],
+            },
+            PathBuf::new(),
+            PathBuf::new(),
+            false,
+        );
+
+        assert_eq!(catalog.item(30).unwrap().name, "Character item");
+        assert!(catalog.item(10).is_none());
+        let profile_only = catalog.inventory_definition(10).unwrap();
+        assert_eq!(profile_only.name, "Alpha material");
+        assert_eq!(profile_only.type_name, "Currency");
+        assert!(profile_only.item.is_none());
+        assert_eq!(
+            catalog
+                .profile_item_candidates("")
+                .map(|definition| definition.hash)
+                .collect::<Vec<_>>(),
+            vec![10, 20]
+        );
+        assert_eq!(catalog.profile_item_candidates("material").count(), 2);
+        assert_eq!(
+            catalog
+                .character_inventory_candidates("", 0, false)
+                .next()
+                .unwrap()
+                .hash,
+            30
+        );
+        assert_eq!(
+            catalog
+                .inventory_metadata(30)
+                .unwrap()
+                .authored_row_capacity(),
+            Some(20)
+        );
+    }
+
+    #[test]
+    fn equipment_browse_and_search_return_every_compatible_item() {
+        let bucket = 1_498_876_634;
+        let items = (0_u64..620)
+            .rev()
+            .map(|index| ItemDef {
+                hash: 10_000 + index,
+                name: format!("Matching item {index:04}"),
+                type_name: "Test weapon".into(),
+                bucket_hash: bucket,
+                class_type: 3,
+                default_plugs: Vec::new(),
+                sockets: Vec::new(),
+                abilities: AbilityOptions::default(),
+            })
+            .chain(std::iter::once(ItemDef {
+                hash: 99_999,
+                name: "Matching incompatible item".into(),
+                type_name: "Test weapon".into(),
+                bucket_hash: 0,
+                class_type: 3,
+                default_plugs: Vec::new(),
+                sockets: Vec::new(),
+                abilities: AbilityOptions::default(),
+            }))
+            .collect();
+        let catalog = Catalog::finish(
+            CatalogContents {
+                items,
+                names: HashMap::new(),
+                type_names: HashMap::new(),
+                descriptions: HashMap::from([(10_042, "A description-only match".to_owned())]),
+                icon_containers: HashMap::new(),
+                inventory_metadata: HashMap::new(),
+                plug_pools: Vec::new(),
+            },
+            PathBuf::new(),
+            PathBuf::new(),
+            false,
+        );
+
+        let browsed = catalog.browse(bucket, 0, true);
+        assert_eq!(browsed.len(), 620);
+        assert_eq!(browsed.first().unwrap().name, "Matching item 0000");
+        assert_eq!(browsed.last().unwrap().name, "Matching item 0619");
+
+        let searched = catalog.search("matching", bucket, 0, true);
+        assert_eq!(searched.len(), 620);
+        assert_eq!(searched.first().unwrap().name, "Matching item 0000");
+        assert_eq!(searched.last().unwrap().name, "Matching item 0619");
+        assert_eq!(catalog.search("description-only", bucket, 0, true).len(), 1);
+    }
+
+    #[test]
+    fn catalyst_lifecycles_resolve_legacy_and_empty_socket_formats() {
+        let legacy = ItemDef {
+            hash: 1,
+            name: "Legacy exotic".into(),
+            type_name: "Exotic weapon".into(),
+            bucket_hash: 0,
+            class_type: 3,
+            default_plugs: vec![Some(format_hash(10))],
+            sockets: vec![SocketDef {
+                pool: 0,
+                ..SocketDef::default()
+            }],
+            abilities: AbilityOptions::default(),
+        };
+        let current = ItemDef {
+            hash: 2,
+            name: "Current exotic".into(),
+            type_name: "Exotic weapon".into(),
+            bucket_hash: 0,
+            class_type: 3,
+            default_plugs: vec![Some(format_hash(
+                crate::catalyst_plugs::EMPTY_CATALYST_SOCKET,
+            ))],
+            sockets: vec![SocketDef {
+                pool: 1,
+                ..SocketDef::default()
+            }],
+            abilities: AbilityOptions::default(),
+        };
+        let catalog = Catalog::finish(
+            CatalogContents {
+                items: vec![legacy, current],
+                names: HashMap::new(),
+                type_names: HashMap::new(),
+                descriptions: HashMap::new(),
+                icon_containers: HashMap::new(),
+                inventory_metadata: HashMap::new(),
+                plug_pools: vec![
+                    vec![10, 20, 354_293_076],
+                    vec![crate::catalyst_plugs::EMPTY_CATALYST_SOCKET, 30],
+                ],
+            },
+            PathBuf::new(),
+            PathBuf::new(),
+            false,
+        );
+
+        let legacy = catalog.catalyst_socket(catalog.item(1).unwrap()).unwrap();
+        assert_eq!(legacy.unacquired_plug, 10);
+        assert_eq!(legacy.in_progress_plug, 20);
+        assert_eq!(legacy.completed_plug, 354_293_076);
+        assert_eq!(
+            legacy.state_for_selected_plug(Some(legacy.completed_plug)),
+            Some(CatalystState::Completed)
+        );
+
+        let current = catalog.catalyst_socket(catalog.item(2).unwrap()).unwrap();
+        assert_eq!(current.in_progress_plug, 30);
+        assert_eq!(current.completed_plug, 30);
+        assert_eq!(current.state_for_selected_plug(Some(30)), None);
+    }
+
+    #[test]
+    fn inventory_bucket_labels_cover_known_and_unknown_native_ids() {
+        let metadata = |scope, native_bucket_id| InventoryMetadata {
+            scope,
+            native_bucket_id,
+            ..InventoryMetadata::default()
+        };
+        assert_eq!(
+            metadata(InventoryScope::Profile, 14).bucket_label(),
+            "Shaders"
+        );
+        assert_eq!(
+            metadata(InventoryScope::Character, 0).bucket_label(),
+            "Kinetic weapons"
+        );
+        assert_eq!(
+            metadata(InventoryScope::Profile, 99).bucket_label(),
+            "Profile bucket 99"
+        );
+        assert_eq!(
+            InventoryMetadata::default().bucket_label(),
+            "Unknown bucket"
+        );
+        assert_eq!(bucket_hash(49), Some(0x59CA_1EA2));
+    }
+
+    #[test]
+    fn older_cache_shape_defaults_inventory_metadata() {
+        let cache: CatalogCache = serde_json::from_str(&format!(
+            "{{\"schema\":{CACHE_SCHEMA},\"sundial_version\":\"{SUNDIAL_VERSION}\",\"fingerprint\":\"test\",\"items\":[],\"names\":{{}},\"type_names\":{{}},\"plug_pools\":[]}}"
+        ))
+        .unwrap();
+        assert!(cache.inventory_metadata.is_empty());
+        assert!(cache.descriptions.is_empty());
+        assert!(cache.icon_containers.is_empty());
+    }
+
+    #[test]
+    fn really_unsafe_options_include_every_discovered_plug_once() {
+        let names = HashMap::from([
+            (1, "Zeta".to_owned()),
+            (2, "Alpha".to_owned()),
+            (3, "Beta".to_owned()),
+        ]);
+        let catalog = Catalog::finish(
+            CatalogContents {
+                items: Vec::new(),
+                names,
+                type_names: HashMap::new(),
+                descriptions: HashMap::new(),
+                icon_containers: HashMap::new(),
+                inventory_metadata: HashMap::new(),
+                plug_pools: vec![Vec::new(), vec![4, 3, 1], vec![2, 3]],
+            },
+            PathBuf::new(),
+            PathBuf::new(),
+            false,
+        );
+
+        assert_eq!(catalog.all_plug_options(), &[2, 3, 1, 4]);
+        assert_eq!(catalog.plug_pools[1], [3, 1, 4]);
+    }
+
+    #[test]
+    fn socket_labels_use_plug_semantics_and_keep_safe_fallbacks() {
+        let names = HashMap::from([
+            (1, "Default Shader".to_owned()),
+            (2, "Celestial Nighthawk Ornament".to_owned()),
+            (3, "Telesto Catalyst".to_owned()),
+        ]);
+        let type_names = HashMap::from([
+            (1, "Restore Defaults".to_owned()),
+            (2, "Hunter Universal Ornament".to_owned()),
+        ]);
+
+        assert_eq!(
+            infer_socket_label(180, Some(1), &[1], &names, &type_names),
+            "Shader"
+        );
+        assert_eq!(
+            infer_socket_label(384, None, &[2], &names, &type_names),
+            "Ornament"
+        );
+        assert_eq!(
+            infer_socket_label(443, Some(3), &[3], &names, &type_names),
+            "Catalyst"
+        );
+        assert_eq!(
+            infer_socket_label(65535, None, &[], &names, &type_names),
+            ""
+        );
+        assert_eq!(
+            infer_socket_label(
+                62,
+                None,
+                &[4],
+                &names,
+                &HashMap::from([(4, "Ghost Module".into())])
+            ),
+            "Sparrow Perk"
+        );
+        assert_eq!(
+            infer_socket_label(29, None, &[], &names, &type_names),
+            "Armor Masterwork"
+        );
+        assert_eq!(
+            infer_socket_label(51, None, &[], &names, &type_names),
+            "Ghost Perk"
+        );
+        assert_eq!(
+            infer_socket_label(520, None, &[], &names, &type_names),
+            "Armor Tier"
+        );
+        assert_eq!(
+            infer_socket_label(676, None, &[], &names, &type_names),
+            "Stat Allocation"
+        );
+        assert_eq!(
+            infer_socket_label(678, None, &[], &names, &type_names),
+            "Armor Energy Upgrade"
+        );
+        assert_eq!(
+            infer_socket_label(760, None, &[], &names, &type_names),
+            "Top Stat Allocation"
+        );
+        assert_eq!(
+            infer_socket_label(763, None, &[], &names, &type_names),
+            "Bottom Stat Allocation"
+        );
+        assert_eq!(
+            socket_label_for_plug(
+                4,
+                &HashMap::from([(4, "Upgrade Armor".into())]),
+                &HashMap::new()
+            )
+            .as_deref(),
+            Some("Armor Energy Upgrade")
+        );
+    }
+
+    #[test]
+    fn unnamed_armor_stat_plugs_use_their_local_investment_values() {
+        let mut item = vec![0_u8; 0x300 + INVESTMENT_STAT_ROW_SIZE * 3];
+        let count = 3_u64;
+        item[INVESTMENT_STAT_DESCRIPTOR..INVESTMENT_STAT_DESCRIPTOR + 8]
+            .copy_from_slice(&count.to_le_bytes());
+        item[INVESTMENT_STAT_DESCRIPTOR + 8..INVESTMENT_STAT_DESCRIPTOR + 16]
+            .copy_from_slice(&(0x28_i64).to_le_bytes());
+        item[0x2F0..0x2F8].copy_from_slice(&count.to_le_bytes());
+        item[0x2F8..0x2FC].copy_from_slice(&INVESTMENT_STAT_CLASS.to_le_bytes());
+
+        for (row, stat_index, value) in [(0, 5_u16, 7_u32), (1, 3, 13), (2, 4, 1)] {
+            let offset = 0x300 + row * INVESTMENT_STAT_ROW_SIZE;
+            item[offset..offset + 2].copy_from_slice(&stat_index.to_le_bytes());
+            item[offset + 4..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        let stat_names = vec![
+            String::new(),
+            String::new(),
+            String::new(),
+            "Mobility".into(),
+            "Resilience".into(),
+            "Recovery".into(),
+        ];
+
+        assert_eq!(
+            stat_allocation_labels(&item, &stat_names),
+            Some((
+                "13 Mobility / 1 Resilience / 7 Recovery".into(),
+                "Top Stat Allocation"
+            ))
+        );
+    }
+
+    #[test]
+    fn armor_socket_types_fill_only_missing_plug_types() {
+        let items = vec![ItemDef {
+            hash: 10,
+            name: "Test armor".into(),
+            type_name: "Helmet".into(),
+            bucket_hash: 3_448_274_439,
+            class_type: 3,
+            default_plugs: vec![Some("0x00000001".into())],
+            sockets: vec![SocketDef {
+                socket_type: 520,
+                allowed: vec![2],
+                ..SocketDef::default()
+            }],
+            abilities: AbilityOptions::default(),
+        }];
+        let names = HashMap::from([(3, "Empty Mod Socket".into())]);
+        let mut type_names = HashMap::from([(2, "Specific local type".into())]);
+
+        infer_socket_plug_types(&items, &names, &mut type_names);
+
+        assert_eq!(type_names[&1], "Armor Tier");
+        assert_eq!(type_names[&2], "Specific local type");
+        assert_eq!(type_names[&3], "Armor Mod");
+    }
+
+    #[test]
+    fn ghost_perk_socket_replaces_the_generic_intrinsic_type() {
+        let items = vec![ItemDef {
+            hash: 10,
+            name: "Test Ghost".into(),
+            type_name: "Ghost Shell".into(),
+            bucket_hash: 4_023_194_814,
+            class_type: 3,
+            default_plugs: vec![Some("0x00000001".into())],
+            sockets: vec![SocketDef {
+                socket_type: 51,
+                allowed: vec![2],
+                ..SocketDef::default()
+            }],
+            abilities: AbilityOptions::default(),
+        }];
+        let mut type_names =
+            HashMap::from([(1, "Intrinsic".to_owned()), (2, "Intrinsic".to_owned())]);
+
+        infer_socket_plug_types(&items, &HashMap::new(), &mut type_names);
+
+        assert_eq!(type_names[&1], "Ghost Perk");
+        assert_eq!(type_names[&2], "Ghost Perk");
+    }
+
+    #[test]
+    fn socket_display_labels_preserve_the_native_position() {
+        let named = SocketDef {
+            label: "Barrel".into(),
+            ..SocketDef::default()
+        };
+        let unnamed = SocketDef::default();
+
+        assert_eq!(named.display_label(1), "2. Barrel");
+        assert_eq!(unnamed.display_label(1), "Socket 2");
+    }
+
+    #[test]
+    fn masterwork_labels_use_the_primary_local_stat_name() {
+        const ROW_SIZE: usize = 48;
+        let mut item = vec![0_u8; 0x300 + ROW_SIZE * 2];
+        let count = 2_u64;
+        item[INVESTMENT_STAT_DESCRIPTOR..INVESTMENT_STAT_DESCRIPTOR + 8]
+            .copy_from_slice(&count.to_le_bytes());
+        item[INVESTMENT_STAT_DESCRIPTOR + 8..INVESTMENT_STAT_DESCRIPTOR + 16]
+            .copy_from_slice(&(0x28_i64).to_le_bytes());
+        item[0x2F0..0x2F8].copy_from_slice(&count.to_le_bytes());
+        item[0x2F8..0x2FC].copy_from_slice(&INVESTMENT_STAT_CLASS.to_le_bytes());
+        item[0x300..0x302].copy_from_slice(&2_u16.to_le_bytes());
+        item[0x300 + ROW_SIZE..0x302 + ROW_SIZE].copy_from_slice(&1_u16.to_le_bytes());
+        let stat_names = vec![String::new(), "Impact".into(), "Charge Time".into()];
+
+        assert_eq!(
+            masterwork_label(&item, &stat_names, "Masterwork").as_deref(),
+            Some("Masterwork: Charge Time")
+        );
+        assert_eq!(
+            masterwork_label(&item, &stat_names, "Tier 7 Weapon").as_deref(),
+            Some("Tier 7 Weapon: Charge Time")
+        );
+        let armor_stat_names = vec![
+            String::new(),
+            "Heroic Resistance".into(),
+            "Arc Damage Resistance".into(),
+        ];
+        assert_eq!(
+            masterwork_label(&item, &armor_stat_names, "Tier 4 Armor").as_deref(),
+            Some("Tier 4 Armor: Arc Damage Resistance")
+        );
+        assert_eq!(
+            masterwork_label(&item, &stat_names, "Masterwork Weapon"),
+            None
+        );
+        assert_eq!(
+            masterwork_label(&item, &stat_names[..2], "Masterwork"),
+            None
+        );
     }
 
     #[test]

@@ -1,33 +1,37 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 
-use crate::catalog;
+use crate::{
+    catalog::{self, AbilityChoice},
+    hash::format_hash,
+    test_support::TestDirectory,
+};
 
 use super::*;
+use super::{
+    equipment::{
+        collect_class_armor_defaults, default_ability_values, default_subclass_name,
+        displayed_plugs, equip_definition, materialize_authored_plugs, native_plug_default,
+        restore_class_armor, selected_attunement_index, set_weapon_slot_empty,
+    },
+    inventory::{
+        EQUIPMENT_FLAGS_SCHEMA_VERSION, InventoryItemAction, InventoryItemLocation,
+        apply_inventory_item_action,
+    },
+    item_editor::{NativePlugDefault, picker_list_height},
+    settings::{
+        character_ability_issue, create_adjacent_backup, encode_settings, load_json,
+        normalize_sunrise_version, repair_known_ability_pairs, resolve_settings_path,
+        save_json_with_backup_root, settings_path_for_install, settings_size_limit_for_schema,
+        validate_characters, verify_source_unchanged,
+    },
+};
 
-static NEXT_TEST_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
-
-struct TestDirectory(PathBuf);
-
-impl TestDirectory {
-    fn new() -> Self {
-        let path = env::temp_dir().join(format!(
-            "sundial-save-test-{}-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-            NEXT_TEST_DIRECTORY_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).unwrap();
-        Self(path)
-    }
-}
-
-impl Drop for TestDirectory {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
+#[test]
+fn pending_edit_guard_covers_document_and_json_editor_changes() {
+    assert!(!has_pending_edits(false, false));
+    assert!(has_pending_edits(true, false));
+    assert!(has_pending_edits(false, true));
+    assert!(has_pending_edits(true, true));
 }
 
 #[test]
@@ -42,17 +46,15 @@ fn check_mode_rejects_documents_that_the_gui_loads_with_a_warning() {
 }
 
 #[test]
-fn hashes_are_strict_hex_and_normalized() {
-    assert_eq!(parse_hash("0xE516CF40"), Some(0xE516_CF40));
-    assert_eq!(parse_hash("0Xe516cf40"), Some(0xE516_CF40));
-    assert_eq!(format_hash(0x123), "0x00000123");
-    assert_eq!(parse_hash("E516CF40"), None);
-    assert_eq!(parse_hash("0xnope"), None);
-    assert_eq!(parse_unsigned_value(&Value::from(42)), Some(42));
-    assert_eq!(
-        parse_unsigned_value(&Value::String("0x0000002A".into())),
-        Some(42)
-    );
+fn sunrise_versions_are_normalized_for_display() {
+    assert_eq!(normalize_sunrise_version("0.3.2.0"), Some("0.3.2".into()));
+    assert_eq!(normalize_sunrise_version("0.3.1.0"), Some("0.3.1".into()));
+    assert_eq!(normalize_sunrise_version("0.2.1.0"), Some("0.2.1".into()));
+    assert_eq!(normalize_sunrise_version("0.2.0.0"), Some("0.2".into()));
+    assert_eq!(normalize_sunrise_version("0.1.0.0"), Some("0.1".into()));
+    assert_eq!(normalize_sunrise_version(" 1.4.2 "), Some("1.4.2".into()));
+    assert_eq!(normalize_sunrise_version("0"), None);
+    assert_eq!(normalize_sunrise_version("not-a-version"), None);
 }
 
 #[test]
@@ -70,12 +72,43 @@ fn sunrise_native_plugs_are_displayed_and_materialized_on_edit() {
             .clone()
     );
 
+    let authored_defaults = Value::Array(displayed.clone());
+    let (_, native_defaults) = displayed_plugs(Some(&authored_defaults), &defaults);
+    assert!(native_defaults);
+
+    let authored_override = serde_json::json!(["0x0000002A", "0x0000002C", "0x0000002B"]);
+    let (_, native_defaults) = displayed_plugs(Some(&authored_override), &defaults);
+    assert!(!native_defaults);
+
     let authored = materialize_authored_plugs(&mut plugs, &defaults).unwrap();
     authored[1] = Value::String("0x0000002C".into());
     assert_eq!(
         plugs,
         serde_json::json!(["0x0000002A", "0x0000002C", "0x0000002B"])
     );
+}
+
+#[test]
+fn long_picker_lists_get_a_real_scroll_viewport() {
+    assert_eq!(picker_list_height(500, 24.0, 320.0, 420.0), 420.0);
+    assert_eq!(picker_list_height(14, 24.0, 320.0, 420.0), 336.0);
+    assert_eq!(picker_list_height(2, 24.0, 320.0, 420.0), 48.0);
+}
+
+#[test]
+fn native_socket_defaults_distinguish_explicit_empty_from_unusable_values() {
+    let defaults = vec![Some("0x0000002A".into()), None, Some("invalid".into())];
+
+    assert_eq!(
+        native_plug_default(&defaults, 0),
+        Some(NativePlugDefault::Plug(42))
+    );
+    assert_eq!(
+        native_plug_default(&defaults, 1),
+        Some(NativePlugDefault::Empty)
+    );
+    assert_eq!(native_plug_default(&defaults, 2), None);
+    assert_eq!(native_plug_default(&defaults, 3), None);
 }
 
 #[test]
@@ -129,6 +162,83 @@ fn weapon_slots_can_be_emptied_and_equipped_again() {
         }))
     );
     assert_eq!(validate_characters(&document), Ok(()));
+}
+
+fn document_with_equipped_and_stored_items() -> Value {
+    serde_json::json!({
+        "version": 6,
+        "state": {
+            "characters": [{
+                "soid": "0x9EAA300200100100",
+                "equipment": {
+                    "kinetic": {
+                        "instance_soid": "0x4000000000000001",
+                        "definition_hash": "0x0000002A",
+                        "level": 106,
+                        "quantity": 1,
+                        "plugs": null,
+                        "equipment_only": { "keep": true }
+                    }
+                },
+                "inventory": [{
+                    "instance_soid": "0x4000000000000002",
+                    "definition_hash": "0x0000003A",
+                    "level": 106,
+                    "quantity": 1,
+                    "plugs": null,
+                    "stored_only": { "keep": true }
+                }]
+            }]
+        }
+    })
+}
+
+#[test]
+fn equipped_edits_do_not_mutate_stored_inventory() {
+    let mut document = document_with_equipped_and_stored_items();
+    let inventory_before = document
+        .pointer("/state/characters/0/inventory")
+        .unwrap()
+        .clone();
+
+    equip_definition(&mut document, 0, "kinetic", 0x2B, &[]).unwrap();
+
+    assert_eq!(
+        document.pointer("/state/characters/0/inventory"),
+        Some(&inventory_before)
+    );
+    assert_eq!(
+        document.pointer("/state/characters/0/equipment/kinetic/definition_hash"),
+        Some(&Value::String("0x0000002B".into()))
+    );
+}
+
+#[test]
+fn stored_edits_do_not_mutate_equipment() {
+    let mut document = document_with_equipped_and_stored_items();
+    let equipment_before = document
+        .pointer("/state/characters/0/equipment")
+        .unwrap()
+        .clone();
+
+    apply_inventory_item_action(
+        &mut document,
+        InventoryItemLocation {
+            character_index: 0,
+            item_index: 0,
+        },
+        InventoryItemAction::SetDefinitionHash(0x3B),
+    )
+    .unwrap();
+
+    assert_eq!(
+        document.pointer("/state/characters/0/equipment"),
+        Some(&equipment_before)
+    );
+    assert_eq!(
+        document.pointer("/state/characters/0/inventory/0/definition_hash"),
+        Some(&Value::String("0x0000003B".into()))
+    );
 }
 
 #[test]
@@ -304,6 +414,7 @@ fn character_with_abilities(
 #[test]
 fn character_validation_keeps_sunrise_limits() {
     let mut document = serde_json::json!({
+        "version": 6,
         "state": {
             "characters": [{
                 "soid": "0x1",
@@ -325,6 +436,107 @@ fn character_validation_keeps_sunrise_limits() {
         "plugs": [null, null, null, null, null, null, null, null, null, null, null, null, null]
     });
     assert!(validate_characters(&document).is_err());
+
+    document
+        .pointer_mut("/state/characters/0/equipment/kinetic/plugs")
+        .unwrap()
+        .clone_from(&serde_json::json!([]));
+    document
+        .pointer_mut("/state/characters/0/equipment/kinetic")
+        .unwrap()["flags"] = Value::String("0x3".into());
+    assert_eq!(validate_characters(&document), Ok(()));
+    document
+        .pointer_mut("/state/characters/0/equipment/kinetic/flags")
+        .unwrap()
+        .clone_from(&Value::String("0x4".into()));
+    assert_eq!(validate_characters(&document), Ok(()));
+    document
+        .pointer_mut("/state/characters/0/equipment/kinetic/flags")
+        .unwrap()
+        .clone_from(&Value::String("0x8".into()));
+    assert!(validate_characters(&document).is_err());
+}
+
+#[test]
+fn equipped_flags_follow_the_schema_four_introduction() {
+    for version in 2..=6 {
+        let document = serde_json::json!({
+            "version": version,
+            "state": {
+                "characters": [{
+                    "soid": "0x1",
+                    "equipment": {
+                        "kinetic": {
+                            "instance_soid": "0x2",
+                            "definition_hash": "0x2A",
+                            "level": 106,
+                            "quantity": 1,
+                            "plugs": null,
+                            "flags": 3
+                        }
+                    }
+                }]
+            }
+        });
+        let result = validate_characters(&document);
+        if version < EQUIPMENT_FLAGS_SCHEMA_VERSION {
+            assert!(
+                result.is_err(),
+                "schema {version} unexpectedly accepted flags"
+            );
+        } else {
+            assert_eq!(result, Ok(()), "schema {version} rejected valid flags");
+        }
+    }
+}
+
+#[test]
+fn character_validation_checks_presence_gated_sunrise_scalars() {
+    let valid = serde_json::json!({
+        "state": {
+            "characters": [{
+                "soid": "0x1",
+                "accepted": true,
+                "preview_available": false,
+                "appearance_value": -12.5,
+                "last_orbited_destination": "0xFFFFFFFF",
+                "content_bypass": true,
+                "future_character_data": {"preserved": true}
+            }]
+        }
+    });
+    let before = valid.clone();
+    assert_eq!(validate_characters(&valid), Ok(()));
+    assert_eq!(valid, before);
+
+    for (key, invalid) in [
+        ("accepted", Value::from(1)),
+        ("preview_available", Value::Null),
+        ("content_bypass", Value::String("true".into())),
+        ("appearance_value", Value::String("1.0".into())),
+        ("appearance_value", Value::from(f64::from(f32::MAX) * 2.0)),
+        (
+            "last_orbited_destination",
+            Value::from(u64::from(u32::MAX) + 1),
+        ),
+    ] {
+        let mut candidate = valid.clone();
+        candidate
+            .pointer_mut("/state/characters/0")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert(key.into(), invalid);
+        assert!(
+            validate_characters(&candidate).is_err(),
+            "{key} unexpectedly validated"
+        );
+    }
+
+    let optional_members_absent = serde_json::json!({
+        "state": {"characters": [{"soid": 1, "future_character_data": true}]}
+    });
+    assert_eq!(validate_characters(&optional_members_absent), Ok(()));
 }
 
 #[test]
@@ -340,8 +552,63 @@ fn settings_paths_are_derived_from_install() {
 }
 
 #[test]
+fn preferences_round_trip_editor_defaults() {
+    let preferences = Preferences {
+        install: Some(PathBuf::from(r"F:\Destiny2\Shadowkeep")),
+        settings_layout: Some(SettingsLayout::BinX64.preference_value().to_owned()),
+        really_unsafe_warning_acknowledged: true,
+        default_plug_selection_mode: PlugSelectionMode::MatchingSocketType,
+        show_safety_warnings: false,
+        color_theme: ColorTheme::Light,
+        always_open_json_editor_in_second_window: true,
+        show_plug_hashes: true,
+        item_card_width: ItemCardWidth::Wide,
+    };
+
+    let encoded = serde_json::to_vec(&preferences).unwrap();
+    let decoded: Preferences = serde_json::from_slice(&encoded).unwrap();
+    let selection = decoded.install_selection().unwrap();
+
+    assert_eq!(
+        selection.install_path,
+        PathBuf::from(r"F:\Destiny2\Shadowkeep")
+    );
+    assert!(selection.preferred_layout == Some(SettingsLayout::BinX64));
+    assert!(decoded.really_unsafe_warning_acknowledged);
+    assert_eq!(
+        decoded.default_plug_selection_mode,
+        PlugSelectionMode::MatchingSocketType
+    );
+    assert!(!decoded.show_safety_warnings);
+    assert_eq!(decoded.color_theme, ColorTheme::Light);
+    assert!(decoded.always_open_json_editor_in_second_window);
+    assert!(decoded.show_plug_hashes);
+    assert_eq!(decoded.item_card_width, ItemCardWidth::Wide);
+}
+
+#[test]
+fn legacy_preferences_default_to_supported_plugs_with_warnings() {
+    let decoded: Preferences = serde_json::from_value(serde_json::json!({
+        "install": null,
+        "settings_layout": null,
+        "really_unsafe_warning_acknowledged": false
+    }))
+    .unwrap();
+
+    assert_eq!(
+        decoded.default_plug_selection_mode,
+        PlugSelectionMode::Supported
+    );
+    assert!(decoded.show_safety_warnings);
+    assert_eq!(decoded.color_theme, ColorTheme::Dark);
+    assert!(!decoded.always_open_json_editor_in_second_window);
+    assert!(!decoded.show_plug_hashes);
+    assert_eq!(decoded.item_card_width, ItemCardWidth::Standard);
+}
+
+#[test]
 fn settings_resolution_uses_the_only_existing_file_and_never_creates_one() {
-    let directory = TestDirectory::new();
+    let directory = TestDirectory::new("save");
     assert!(matches!(
         resolve_settings_path(&directory.0, None),
         SettingsPathResolution::Missing
@@ -360,7 +627,7 @@ fn settings_resolution_uses_the_only_existing_file_and_never_creates_one() {
 
 #[test]
 fn settings_resolution_requires_a_choice_when_both_files_exist() {
-    let directory = TestDirectory::new();
+    let directory = TestDirectory::new("save");
     let root = settings_path_for_install(&directory.0, SettingsLayout::Root);
     let bin_x64 = settings_path_for_install(&directory.0, SettingsLayout::BinX64);
     fs::create_dir_all(root.parent().unwrap()).unwrap();
@@ -385,7 +652,7 @@ fn settings_resolution_requires_a_choice_when_both_files_exist() {
 
 #[test]
 fn loading_a_missing_selected_settings_file_never_creates_it() {
-    let directory = TestDirectory::new();
+    let directory = TestDirectory::new("save");
     let settings = settings_path_for_install(&directory.0, SettingsLayout::BinX64);
 
     let error = load_json(&settings).unwrap_err();
@@ -486,44 +753,147 @@ fn distinctive_super_selection_wins_when_old_attunements_are_mixed() {
 }
 
 #[test]
-fn settings_encoder_keeps_arrays_compact_and_round_trips() {
+fn settings_encoder_matches_sunrise_array_formatting() {
     let document = serde_json::json!({
-        "outer": {
-            "values": [1, 2, 3],
-            "records": [{"name": "one"}, {"name": "two"}]
+        "server": {
+            "entitlements": [
+                {"name": "1085660", "owned": "handle"},
+                {"name": "STEAM_PAID_TIER", "owned": "application"}
+            ]
+        },
+        "state": {
+            "investment": {"pairs": [[1, 2], [3, 4]]},
+            "unlocks": {"flags": [1, 2, 3]},
+            "account": {
+                "profile_items": [{"definition_hash": "0x1", "quantity": 1}],
+                "settings": {"key_bindings": {
+                    "fire": {"primary": "left mouse button", "secondary": null}
+                }}
+            },
+            "characters": [{
+                "equipment": {
+                    "ghost": {"plugs": ["one", null, "three", "four"]},
+                    "helmet": {"plugs": [
+                        "0x11111111", "0x22222222", "0x33333333", "0x44444444",
+                        "0x55555555", "0x66666666"
+                    ]}
+                }
+            }]
         }
     });
     let encoded = encode_settings(&document).unwrap();
-    assert!(encoded.contains("\"values\": [1,2,3]"));
-    assert!(encoded.contains("\"records\": [{\"name\":\"one\"},{\"name\":\"two\"}]"));
+    assert!(encoded.contains("\"pairs\": [[1,2], [3,4]]"));
+    assert!(encoded.contains("\"flags\": [1,2,3]"));
+    assert!(encoded.contains("\"plugs\": [\"one\", null, \"three\", \"four\"]"));
+    assert!(encoded.contains(
+        "\"helmet\": {\r\n            \"plugs\": [\r\n              \"0x11111111\",\r\n              \"0x22222222\","
+    ));
+    assert!(encoded.contains(
+        "\"entitlements\": [\r\n      { \"name\": \"1085660\", \"owned\": \"handle\" },"
+    ));
+    assert!(
+        encoded.contains("\"fire\": { \"primary\": \"left mouse button\", \"secondary\": null }")
+    );
+    assert!(encoded.contains(
+        "\"profile_items\": [\r\n      {\r\n      \"definition_hash\": \"0x1\",\r\n      \"quantity\": 1\r\n      }\r\n      ]"
+    ));
+    assert_eq!(serde_json::from_str::<Value>(&encoded).unwrap(), document);
+}
+
+#[test]
+fn settings_encoder_uses_standard_profile_item_indentation_from_schema_four() {
+    let document = serde_json::json!({
+        "version": 6,
+        "state": {
+            "account": {
+                "profile_items": [{"definition_hash": "0x1", "quantity": 1}]
+            }
+        }
+    });
+
+    let encoded = encode_settings(&document).unwrap();
+    assert!(encoded.contains(
+        "\"profile_items\": [\r\n        {\r\n          \"definition_hash\": \"0x1\",\r\n          \"quantity\": 1\r\n        }\r\n      ]"
+    ));
     assert_eq!(serde_json::from_str::<Value>(&encoded).unwrap(), document);
 }
 
 #[test]
 fn settings_saves_are_verified_and_each_keeps_its_own_backup() {
-    let directory = TestDirectory::new();
+    let directory = TestDirectory::new("save");
     let settings = directory.0.join("settings.json");
     let backups = directory.0.join("backups");
     fs::write(&settings, b"{\"version\":0}\n").unwrap();
 
     let first_document = serde_json::json!({"version": 1, "values": [1, 2, 3]});
-    let first_backup = save_json_with_backup_root(&settings, &first_document, &backups).unwrap();
+    let first_result = save_json_with_backup_root(&settings, &first_document, &backups).unwrap();
     let second_document = serde_json::json!({"version": 2, "values": [4, 5, 6]});
-    let second_backup = save_json_with_backup_root(&settings, &second_document, &backups).unwrap();
+    let second_result = save_json_with_backup_root(&settings, &second_document, &backups).unwrap();
 
-    assert_ne!(first_backup, second_backup);
+    assert_ne!(first_result.backup, second_result.backup);
+    assert!(
+        first_result
+            .backup
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("settings-v0-")
+    );
+    assert!(
+        second_result
+            .backup
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("settings-v1-")
+    );
+    assert!(!first_result.compacted);
+    assert!(!second_result.exceeds_size_limit);
     assert_eq!(load_json(&settings).unwrap(), second_document);
     assert_eq!(
-        load_json(&first_backup).unwrap(),
+        load_json(&first_result.backup).unwrap(),
         serde_json::json!({"version": 0})
     );
-    assert_eq!(load_json(&second_backup).unwrap(), first_document);
+    assert_eq!(load_json(&second_result.backup).unwrap(), first_document);
     assert!(fs::read_to_string(&settings).unwrap().ends_with('\n'));
 }
 
 #[test]
+fn timestamped_backup_names_describe_the_source_schema() {
+    let directory = TestDirectory::new("save");
+    let settings = directory.0.join("settings.json");
+    let backups = directory.0.join("backups");
+
+    for (source, expected_prefix) in [
+        (serde_json::json!({"version": 2}), "settings-v2-"),
+        (serde_json::json!({"version": 3}), "settings-v3-"),
+        (serde_json::json!({"version": 6}), "settings-v6-"),
+        (serde_json::json!({"value": true}), "settings-v0-"),
+    ] {
+        fs::write(&settings, serde_json::to_vec(&source).unwrap()).unwrap();
+        let result = save_json_with_backup_root(&settings, &source, &backups).unwrap();
+        let file_name = result.backup.file_name().unwrap().to_string_lossy();
+        let timestamp = file_name
+            .strip_prefix(expected_prefix)
+            .and_then(|name| name.strip_suffix(".json"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} did not match {expected_prefix}<timestamp>.json",
+                    result.backup.display()
+                )
+            });
+        assert!(
+            !timestamp.is_empty() && timestamp.bytes().all(|byte| byte.is_ascii_digit()),
+            "{} did not contain a numeric timestamp",
+            result.backup.display()
+        );
+        assert_eq!(load_json(&result.backup).unwrap(), source);
+    }
+}
+
+#[test]
 fn unexpected_settings_get_an_exact_adjacent_backup_without_losing_an_older_one() {
-    let directory = TestDirectory::new();
+    let directory = TestDirectory::new("save");
     let settings = directory.0.join("settings.json");
     let original = b"{\"unexpected\":1}\n";
     let newer = b"{\"unexpected\":2}\n";
@@ -552,7 +922,7 @@ fn unexpected_settings_get_an_exact_adjacent_backup_without_losing_an_older_one(
 
 #[test]
 fn external_settings_changes_are_detected_before_saving() {
-    let directory = TestDirectory::new();
+    let directory = TestDirectory::new("save");
     let settings = directory.0.join("settings.json");
     let loaded = serde_json::json!({"state": {"characters": [1, 2, 3]}});
     let newer = serde_json::json!({"state": {"characters": [1, 2, 3], "new": true}});
@@ -567,17 +937,83 @@ fn external_settings_changes_are_detected_before_saving() {
 }
 
 #[test]
-fn oversized_settings_are_rejected_before_a_backup_or_write() {
-    let directory = TestDirectory::new();
+fn readable_settings_over_the_limit_fall_back_to_compact_json() {
+    let directory = TestDirectory::new("save");
     let settings = directory.0.join("settings.json");
     let backups = directory.0.join("backups");
     let original = b"{\"version\":0}\n";
     fs::write(&settings, original).unwrap();
-    let document = Value::String("x".repeat(MAX_SETTINGS_BYTES));
+    let document = serde_json::json!({"values": vec![0; 12_000]});
 
-    assert!(save_json_with_backup_root(&settings, &document, &backups).is_err());
-    assert_eq!(fs::read(&settings).unwrap(), original);
-    assert!(!backups.exists());
+    let result = save_json_with_backup_root(&settings, &document, &backups).unwrap();
+    let size_limit = settings_size_limit_for_schema(None);
+    assert!(result.compacted);
+    assert!(!result.exceeds_size_limit);
+    assert_eq!(result.size_limit_bytes, size_limit);
+    assert!(result.encoded_bytes < size_limit);
+    assert_eq!(load_json(&settings).unwrap(), document);
+    assert_eq!(fs::read(&result.backup).unwrap(), original);
+    assert_eq!(fs::read_to_string(&settings).unwrap().lines().count(), 1);
+}
+
+#[test]
+fn compact_settings_over_the_limit_are_saved_with_a_warning_result() {
+    let directory = TestDirectory::new("save");
+    let settings = directory.0.join("settings.json");
+    let backups = directory.0.join("backups");
+    let original = b"{\"version\":0}\n";
+    fs::write(&settings, original).unwrap();
+    let size_limit = settings_size_limit_for_schema(None);
+    let document = Value::String("x".repeat(size_limit));
+
+    let result = save_json_with_backup_root(&settings, &document, &backups).unwrap();
+    assert!(result.compacted);
+    assert!(result.exceeds_size_limit);
+    assert_eq!(result.size_limit_bytes, size_limit);
+    assert!(result.encoded_bytes > size_limit);
+    assert_eq!(load_json(&settings).unwrap(), document);
+    assert_eq!(fs::read(&result.backup).unwrap(), original);
+}
+
+#[test]
+fn settings_at_exactly_64_kib_do_not_trigger_compaction() {
+    let directory = TestDirectory::new("save");
+    let settings = directory.0.join("settings.json");
+    let backups = directory.0.join("backups");
+    fs::write(&settings, b"{}\n").unwrap();
+    let size_limit = settings_size_limit_for_schema(None);
+    // Two JSON quotes plus the trailing CRLF account for the four non-payload bytes.
+    let document = Value::String("x".repeat(size_limit - 4));
+
+    let result = save_json_with_backup_root(&settings, &document, &backups).unwrap();
+    assert_eq!(result.encoded_bytes, size_limit);
+    assert!(!result.compacted);
+    assert!(!result.exceeds_size_limit);
+}
+
+#[test]
+fn settings_size_limits_follow_sunrise_schema_history() {
+    const KIB: usize = 1024;
+    assert_eq!(settings_size_limit_for_schema(None), 64 * KIB);
+    for schema in 0..=3 {
+        assert_eq!(settings_size_limit_for_schema(Some(schema)), 64 * KIB);
+    }
+    for schema in 4..=5 {
+        assert_eq!(settings_size_limit_for_schema(Some(schema)), 128 * KIB);
+    }
+    assert_eq!(settings_size_limit_for_schema(Some(6)), 1024 * KIB);
+    assert_eq!(settings_size_limit_for_schema(Some(7)), 1024 * KIB);
+}
+
+#[test]
+fn schema_six_keeps_readable_json_above_the_legacy_limit() {
+    let document = serde_json::json!({"version": 6, "values": vec![0; 12_000]});
+    let prepared = prepare_settings(&document).unwrap();
+
+    assert!(prepared.encoded_bytes > 64 * 1024);
+    assert_eq!(prepared.size_limit_bytes, 1024 * 1024);
+    assert!(!prepared.compacted);
+    assert!(!prepared.exceeds_size_limit);
 }
 
 #[test]

@@ -46,7 +46,7 @@ struct BindingPickerState {
     modifier: BindingModifier,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
 pub(super) enum Tab {
     Player,
     Controls,
@@ -57,20 +57,18 @@ pub(super) enum Tab {
     KeyBindings,
 }
 
-// Retained for testing a possible Project Sunrise PR; this may never become a supported feature.
-const FIELD_OF_VIEW_EDITING_AVAILABLE: bool = false;
+pub(crate) const MIN_SUPPORTED_SCHEMA: u64 = 2;
+pub(crate) const MAX_SUPPORTED_SCHEMA: u64 = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SettingsSchema {
-    Version2,
-    Version3,
-}
+struct SettingsSchema(u64);
 
 impl SettingsSchema {
     fn from_document(document: &Value) -> Result<Self, String> {
         match schema_version(document) {
-            Some(2) => Ok(Self::Version2),
-            Some(3) => Ok(Self::Version3),
+            Some(version) if (MIN_SUPPORTED_SCHEMA..=MAX_SUPPORTED_SCHEMA).contains(&version) => {
+                Ok(Self(version))
+            }
             Some(version) => Err(format!(
                 "Project Sunrise settings schema version {version} has not been tested with this Sundial release"
             )),
@@ -79,10 +77,15 @@ impl SettingsSchema {
     }
 
     const fn key_binding_format(self) -> KeyBindingFormat {
-        match self {
-            Self::Version2 => KeyBindingFormat::Numeric,
-            Self::Version3 => KeyBindingFormat::Named,
+        if self.0 == 2 {
+            KeyBindingFormat::Numeric
+        } else {
+            KeyBindingFormat::Named
         }
+    }
+
+    const fn named_key_bindings_editable(self) -> bool {
+        matches!(self.key_binding_format(), KeyBindingFormat::Named)
     }
 }
 
@@ -91,11 +94,22 @@ pub(super) fn schema_version(document: &Value) -> Option<u64> {
 }
 
 pub(super) fn future_schema_version(document: &Value) -> Option<u64> {
-    schema_version(document).filter(|version| *version > 3)
+    schema_version(document).filter(|version| *version > MAX_SUPPORTED_SCHEMA)
 }
 
 fn key_bindings_editable(document: &Value) -> bool {
-    schema_version(document) == Some(3)
+    SettingsSchema::from_document(document).is_ok_and(SettingsSchema::named_key_bindings_editable)
+}
+
+const VERTICAL_SYNC_INTERVAL_KEY: &str = "vertical_sync_interval";
+const FIELD_OF_VIEW_KEY: &str = "field_of_view";
+const KEY_BINDING_SOURCE_KEY: &str = "key_binding_source";
+
+// Compatibility gate: these preferences come from an experimental Sunrise change. Sundial must
+// not add them to an existing file unless that file already contains them; a released schema can
+// move their visibility and requiredness into `SettingsSchema`.
+fn show_experimental_preference(values: &Map<String, Value>, key: &str) -> bool {
+    values.contains_key(key)
 }
 
 const BUTTON_LAYOUTS: &[(u64, &str)] = &[
@@ -106,6 +120,19 @@ const BUTTON_LAYOUTS: &[(u64, &str)] = &[
     (5, "Jumper"),
     (6, "Cold Shoulder"),
     (9, "Custom"),
+];
+
+const VERTICAL_SYNC_INTERVALS: &[(u64, &str)] = &[
+    (0, "Off"),
+    (1, "Every refresh"),
+    (2, "Every 2 refreshes"),
+    (3, "Every 3 refreshes"),
+    (4, "Every 4 refreshes"),
+];
+
+const KEY_BINDING_SOURCES: &[(&str, &str)] = &[
+    ("computer", "Computer (local)"),
+    ("account", "Account (replicated)"),
 ];
 
 const STICK_LAYOUTS: &[(u64, &str)] = &[
@@ -149,6 +176,30 @@ const BACKGROUND_OPACITY: &[(u64, &str)] = &[
     (4, "Highest"),
 ];
 const RETICLE_LOCATIONS: &[(u64, &str)] = &[(0, "PC Default"), (1, "Console Default")];
+const RETICLE_COLORS: &[(u64, &str)] = &[
+    (0, "Default"),
+    (1, "Red"),
+    (2, "Green"),
+    (3, "Yellow"),
+    (4, "Blue"),
+    (5, "Purple"),
+    (6, "Cyan"),
+];
+const GAME_LANGUAGES: &[(&str, &str)] = &[
+    ("english", "English"),
+    ("french", "French"),
+    ("german", "German"),
+    ("italian", "Italian"),
+    ("japanese", "Japanese"),
+    ("brazilian", "Portuguese (Brazil)"),
+    ("spanish", "Spanish (Spain)"),
+    ("russian", "Russian"),
+    ("polish", "Polish"),
+    ("schinese", "Chinese (Simplified)"),
+    ("tchinese", "Chinese (Traditional)"),
+    ("latam", "Spanish (Latin America)"),
+    ("koreana", "Korean"),
+];
 const TEXT_CHAT_MODES: &[(u64, &str)] = &[
     (0, "Off"),
     (1, "On (No Notifications)"),
@@ -253,7 +304,7 @@ pub(super) fn draw_page(
         ui.selectable_value(tab, Tab::Social, "Social");
         ui.selectable_value(tab, Tab::KeyBindings, "Key bindings")
             .on_hover_text(if bindings_editable {
-                "Edit named key bindings used by Sunrise schema 3."
+                "Edit named key bindings used by supported Sunrise schemas."
             } else {
                 "Key bindings are shown read-only for this settings schema."
             });
@@ -261,6 +312,7 @@ pub(super) fn draw_page(
     ui.separator();
 
     egui::ScrollArea::vertical()
+        .id_salt(("game_settings_scroll", *tab))
         .show(ui, |ui| match *tab {
             Tab::Player => draw_player(ui, document),
             Tab::Controls => draw_account_settings(ui, document, draw_controls),
@@ -285,7 +337,7 @@ fn draw_account_settings(
         .and_then(Value::as_object_mut)
     else {
         ui.colored_label(
-            egui::Color32::LIGHT_RED,
+            ui.visuals().error_fg_color,
             "This settings.json has no state.account.settings object.",
         );
         return false;
@@ -295,38 +347,62 @@ fn draw_account_settings(
 
 fn draw_player(ui: &mut egui::Ui, document: &mut Value) -> bool {
     ui.heading("Player");
-    ui.label("Change the player name shown by Project Sunrise in Destiny 2.");
+    ui.label("Change the player identity and language Project Sunrise reports to Destiny 2.");
     ui.add_space(8.0);
+    ui.strong("Player name");
 
-    let Some(value) = document.pointer("/steam/user/persona_name") else {
-        ui.colored_label(
-            egui::Color32::LIGHT_RED,
-            "This settings.json has no steam.user.persona_name field.",
-        );
-        return false;
-    };
-    let Some(current) = value.as_str() else {
-        ui.colored_label(
-            egui::Color32::LIGHT_RED,
-            "steam.user.persona_name must be text.",
-        );
-        return false;
-    };
-
-    let mut edited = current.to_owned();
-    let response = ui.add(
-        egui::TextEdit::singleline(&mut edited)
-            .desired_width(360.0)
-            .char_limit(63),
-    );
-    ui.label(egui::RichText::new(format!("{}/63", edited.len())).weak());
-    ui.label("Use 1–63 printable ASCII characters. Changes take effect after fully restarting Destiny 2.");
-
-    if !response.changed() {
-        return false;
+    let mut changed = false;
+    match document.pointer("/steam/user/persona_name") {
+        Some(value) => {
+            if let Some(current) = value.as_str() {
+                let mut edited = current.to_owned();
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut edited)
+                        .desired_width(360.0)
+                        .char_limit(63),
+                );
+                ui.label(egui::RichText::new(format!("{}/63", edited.len())).weak());
+                ui.label("Use 1–63 printable ASCII characters. Changes take effect after fully restarting Destiny 2.");
+                if response.changed() {
+                    changed |= set_player_name(document, &edited);
+                }
+            } else {
+                ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    "steam.user.persona_name must be text.",
+                );
+            }
+        }
+        None => {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                "This settings.json has no steam.user.persona_name field.",
+            );
+        }
     }
 
-    set_player_name(document, &edited)
+    if document.pointer("/steam/language").is_some() {
+        ui.add_space(14.0);
+        ui.separator();
+        ui.add_space(8.0);
+        ui.strong("Game language");
+        ui.label("Controls the language Sunrise reports to Destiny 2 through Steam. Changes take effect after fully restarting Destiny 2.");
+        ui.add_space(4.0);
+        if let Some(steam) = document
+            .pointer_mut("/steam")
+            .and_then(Value::as_object_mut)
+        {
+            changed |= egui::Grid::new("game_language_grid")
+                .num_columns(2)
+                .spacing([18.0, 9.0])
+                .show(ui, |ui| {
+                    string_choice(ui, steam, "language", "Language", GAME_LANGUAGES)
+                })
+                .inner;
+        }
+    }
+
+    changed
 }
 
 fn valid_player_name(name: &str) -> Option<&str> {
@@ -357,7 +433,7 @@ fn group_mut<'a>(
 
 fn missing_group(ui: &mut egui::Ui, name: &str) {
     ui.colored_label(
-        egui::Color32::LIGHT_RED,
+        ui.visuals().error_fg_color,
         format!("The {name} settings group is missing or malformed."),
     );
 }
@@ -530,8 +606,17 @@ fn draw_display(ui: &mut egui::Ui, settings: &mut Map<String, Value>) -> bool {
             changed |= integer_slider(ui, values, "brightness", "Brightness", 0, 6);
             changed |= boolean(ui, values, "show_fps", "Show FPS");
             changed |= choice(ui, values, "hdr_mode", "HDR mode", HDR_MODES);
-            if FIELD_OF_VIEW_EDITING_AVAILABLE && values.contains_key("field_of_view") {
-                changed |= integer_slider(ui, values, "field_of_view", "Field of view", 55, 105);
+            if show_experimental_preference(values, VERTICAL_SYNC_INTERVAL_KEY) {
+                changed |= choice(
+                    ui,
+                    values,
+                    VERTICAL_SYNC_INTERVAL_KEY,
+                    "Vertical sync",
+                    VERTICAL_SYNC_INTERVALS,
+                );
+            }
+            if show_experimental_preference(values, FIELD_OF_VIEW_KEY) {
+                changed |= integer_slider(ui, values, FIELD_OF_VIEW_KEY, "Field of view", 55, 105);
             }
             fixed(ui, values, "calibration_primary", "Renderer calibration");
             fixed(
@@ -590,7 +675,7 @@ fn draw_interface(ui: &mut egui::Ui, settings: &mut Map<String, Value>) -> bool 
                 "Reticle location",
                 RETICLE_LOCATIONS,
             );
-            changed |= integer_slider(ui, values, "reticle_color", "Reticle color", 0, 6);
+            changed |= choice(ui, values, "reticle_color", "Reticle color", RETICLE_COLORS);
             changed |= integer_slider(ui, values, "text_size", "Text size", 0, 4);
             changed |= integer_slider(ui, values, "text_color", "Text color", 0, 3);
             changed |= integer_slider(
@@ -703,21 +788,39 @@ fn draw_key_bindings(
     state: &mut KeyBindingUiState,
     editable: bool,
 ) -> bool {
+    let mut changed = false;
+    ui.heading("Key bindings (Experimental)");
+    if editable {
+        ui.label("Choose a primary and secondary input for each action. Changes apply after Destiny 2 is fully restarted.");
+    } else {
+        ui.label(
+            "This settings schema does not use editable named bindings. These values are read-only.",
+        );
+    }
+    ui.add_space(8.0);
+    if show_experimental_preference(settings, KEY_BINDING_SOURCE_KEY) {
+        egui::Grid::new("game_key_binding_source_grid")
+            .num_columns(2)
+            .spacing([18.0, 9.0])
+            .striped(true)
+            .show(ui, |ui| {
+                changed |= string_choice(
+                    ui,
+                    settings,
+                    KEY_BINDING_SOURCE_KEY,
+                    "Binding source",
+                    KEY_BINDING_SOURCES,
+                );
+            });
+        ui.add_space(8.0);
+    }
     let Some(bindings) = settings
         .get_mut("key_bindings")
         .and_then(Value::as_object_mut)
     else {
         missing_group(ui, "key bindings");
-        return false;
+        return changed;
     };
-    ui.heading("Key bindings");
-    if editable {
-        ui.label("Choose a primary and secondary input for each action. Changes apply after Destiny 2 is fully restarted.");
-    } else {
-        ui.label(
-            "Guided editing is available for Sunrise schema 3. These bindings are shown read-only.",
-        );
-    }
     ui.add_space(6.0);
     ui.add(
         egui::TextEdit::singleline(&mut state.action_search)
@@ -726,7 +829,6 @@ fn draw_key_bindings(
     );
     ui.add_space(8.0);
     let needle = state.action_search.trim().to_lowercase();
-    let mut changed = false;
     egui::Grid::new("game_key_bindings_grid")
         .num_columns(3)
         .spacing([18.0, 8.0])
@@ -747,8 +849,8 @@ fn draw_key_bindings(
                 visible += 1;
                 ui.label(label);
                 let Some(binding) = bindings.get_mut(key).and_then(Value::as_object_mut) else {
-                    ui.colored_label(egui::Color32::LIGHT_RED, "Missing");
-                    ui.colored_label(egui::Color32::LIGHT_RED, "Missing");
+                    ui.colored_label(ui.visuals().error_fg_color, "Missing");
+                    ui.colored_label(ui.visuals().error_fg_color, "Missing");
                     ui.end_row();
                     continue;
                 };
@@ -779,7 +881,7 @@ fn binding_picker(
     value: Option<&mut Value>,
 ) -> bool {
     let Some(value) = value else {
-        ui.colored_label(egui::Color32::LIGHT_RED, "Missing");
+        ui.colored_label(ui.visuals().error_fg_color, "Missing");
         return false;
     };
 
@@ -787,7 +889,7 @@ fn binding_picker(
     let label = if valid {
         egui::RichText::new(label)
     } else {
-        egui::RichText::new(label).color(egui::Color32::LIGHT_RED)
+        egui::RichText::new(label).color(ui.visuals().error_fg_color)
     };
     let popup_id = ui.make_persistent_id(("key-binding-picker", action, half));
     let button = ui.add_sized(
@@ -893,10 +995,10 @@ fn boolean(ui: &mut egui::Ui, values: &mut Map<String, Value>, key: &str, label:
                 changed = true;
             }
         } else {
-            ui.colored_label(egui::Color32::LIGHT_RED, "Invalid value");
+            ui.colored_label(ui.visuals().error_fg_color, "Invalid value");
         }
     } else {
-        ui.colored_label(egui::Color32::LIGHT_RED, "Missing");
+        ui.colored_label(ui.visuals().error_fg_color, "Missing");
     }
     ui.end_row();
     changed
@@ -931,10 +1033,52 @@ fn choice(
                 *value = Value::from(current);
             }
         } else {
-            ui.colored_label(egui::Color32::LIGHT_RED, "Invalid value");
+            ui.colored_label(ui.visuals().error_fg_color, "Invalid value");
         }
     } else {
-        ui.colored_label(egui::Color32::LIGHT_RED, "Missing");
+        ui.colored_label(ui.visuals().error_fg_color, "Missing");
+    }
+    ui.end_row();
+    changed
+}
+
+fn string_choice(
+    ui: &mut egui::Ui,
+    values: &mut Map<String, Value>,
+    key: &str,
+    label: &str,
+    choices: &[(&str, &str)],
+) -> bool {
+    ui.label(label);
+    let mut changed = false;
+    if let Some(value) = values.get_mut(key) {
+        if let Some(current) = value.as_str() {
+            let mut current = current.to_owned();
+            let selected = choices
+                .iter()
+                .find(|(candidate, _)| *candidate == current)
+                .map_or("Invalid value", |(_, name)| *name);
+            egui::ComboBox::from_id_salt(("game_setting", key))
+                .selected_text(selected)
+                .width(210.0)
+                .show_ui(ui, |ui| {
+                    for &(candidate, name) in choices {
+                        if ui
+                            .selectable_value(&mut current, candidate.to_owned(), name)
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                    }
+                });
+            if changed {
+                *value = Value::String(current);
+            }
+        } else {
+            ui.colored_label(ui.visuals().error_fg_color, "Invalid value");
+        }
+    } else {
+        ui.colored_label(ui.visuals().error_fg_color, "Missing");
     }
     ui.end_row();
     changed
@@ -960,10 +1104,10 @@ fn integer_slider(
                 changed = true;
             }
         } else {
-            ui.colored_label(egui::Color32::LIGHT_RED, "Invalid value");
+            ui.colored_label(ui.visuals().error_fg_color, "Invalid value");
         }
     } else {
-        ui.colored_label(egui::Color32::LIGHT_RED, "Missing");
+        ui.colored_label(ui.visuals().error_fg_color, "Missing");
     }
     ui.end_row();
     changed
@@ -994,10 +1138,10 @@ fn offset_slider(
                 changed = true;
             }
         } else {
-            ui.colored_label(egui::Color32::LIGHT_RED, "Invalid value");
+            ui.colored_label(ui.visuals().error_fg_color, "Invalid value");
         }
     } else {
-        ui.colored_label(egui::Color32::LIGHT_RED, "Missing");
+        ui.colored_label(ui.visuals().error_fg_color, "Missing");
     }
     ui.end_row();
     changed
@@ -1030,10 +1174,10 @@ fn float_slider(
                 }
             }
         } else {
-            ui.colored_label(egui::Color32::LIGHT_RED, "Invalid value");
+            ui.colored_label(ui.visuals().error_fg_color, "Invalid value");
         }
     } else {
-        ui.colored_label(egui::Color32::LIGHT_RED, "Missing");
+        ui.colored_label(ui.visuals().error_fg_color, "Missing");
     }
     ui.end_row();
     changed
@@ -1045,14 +1189,14 @@ fn fixed(ui: &mut egui::Ui, values: &Map<String, Value>, key: &str, label: &str)
         ui.add_enabled(false, egui::Label::new(value.to_string()))
             .on_hover_text("Project Sunrise requires this exact value.");
     } else {
-        ui.colored_label(egui::Color32::LIGHT_RED, "Missing");
+        ui.colored_label(ui.visuals().error_fg_color, "Missing");
     }
     ui.end_row();
 }
 
 fn binding_label(ui: &mut egui::Ui, value: Option<&Value>) {
     let Some(value) = value else {
-        ui.colored_label(egui::Color32::LIGHT_RED, "Missing");
+        ui.colored_label(ui.visuals().error_fg_color, "Missing");
         return;
     };
     if value.is_null() {
@@ -1062,12 +1206,13 @@ fn binding_label(ui: &mut egui::Ui, value: Option<&Value>) {
     } else if let Some(name) = value.as_str() {
         ui.add_enabled(false, egui::Label::new(name));
     } else {
-        ui.colored_label(egui::Color32::LIGHT_RED, "Invalid value");
+        ui.colored_label(ui.visuals().error_fg_color, "Invalid value");
     }
 }
 
 pub(super) fn validate(document: &Value) -> Result<(), String> {
     let schema = SettingsSchema::from_document(document)?;
+    validate_game_language(document)?;
     let settings = document
         .pointer("/state/account/settings")
         .and_then(Value::as_object)
@@ -1111,9 +1256,8 @@ pub(super) fn validate(document: &Value) -> Result<(), String> {
     range(display, "brightness", 0, 6)?;
     bool_fields(display, "display", &["show_fps"])?;
     range(display, "hdr_mode", 0, 1)?;
-    if FIELD_OF_VIEW_EDITING_AVAILABLE {
-        optional_range(display, "field_of_view", 55, 105)?;
-    }
+    optional_range(display, VERTICAL_SYNC_INTERVAL_KEY, 0, 4)?;
+    optional_range(display, FIELD_OF_VIEW_KEY, 55, 105)?;
     exact_float(display, "calibration_primary", 10_000.0)?;
     exact_float(display, "calibration_alpha", 0.0)?;
 
@@ -1152,7 +1296,23 @@ pub(super) fn validate(document: &Value) -> Result<(), String> {
     range(social, "clan_chat_join_mode", 0, 1)?;
     range(social, "chat_auto_hide_mode", 0, 1)?;
 
+    optional_string_member(settings, KEY_BINDING_SOURCE_KEY, &["account", "computer"])?;
     validate_key_bindings(settings, schema)
+}
+
+fn validate_game_language(document: &Value) -> Result<(), String> {
+    let Some(value) = document.pointer("/steam/language") else {
+        return Ok(());
+    };
+    if value.as_str().is_some_and(|token| {
+        GAME_LANGUAGES
+            .iter()
+            .any(|(candidate, _)| *candidate == token)
+    }) {
+        Ok(())
+    } else {
+        Err("steam.language must be one of Sunrise's supported language tokens".to_owned())
+    }
 }
 
 fn validate_key_bindings(
@@ -1210,6 +1370,21 @@ fn optional_range(
         range(values, key, minimum, maximum)
     } else {
         Ok(())
+    }
+}
+
+fn optional_string_member(
+    values: &Map<String, Value>,
+    key: &str,
+    allowed: &[&str],
+) -> Result<(), String> {
+    let Some(value) = values.get(key) else {
+        return Ok(());
+    };
+    if value.as_str().is_some_and(|value| allowed.contains(&value)) {
+        Ok(())
+    } else {
+        Err(format!("Game setting {key} has an unsupported value"))
     }
 }
 
@@ -1284,8 +1459,8 @@ fn bool_fields(
     Ok(())
 }
 
-// These are the decoded input names accepted by Sunrise schemas 3 (Project
-// Sunrise 0.2 and 0.2.1). Sunrise's raw table contains both its backslash name
+// These are the decoded input names accepted by Sunrise schemas 3 through 6. Sunrise's raw table
+// contains both its backslash name
 // and its JSON-escaped spelling; serde represents the usable value as one
 // decoded backslash, leaving 120 logical choices here. Matching is ASCII
 // case-insensitive, just like Sunrise.
@@ -1562,7 +1737,7 @@ fn input_code(
             u16::MAX
         )),
         KeyBindingFormat::Named => Err(format!(
-            "Key binding {label} {half} must be unassigned, a recognized key name, or one modifier plus a key for Sunrise 0.2"
+            "Key binding {label} {half} must be unassigned, a recognized key name, or one modifier plus a key for Sunrise schemas 3 through 6"
         )),
     }
 }
@@ -1570,6 +1745,92 @@ fn input_code(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn valid_game_settings_document(version: u64) -> Value {
+        let key_bindings = ACTIONS
+            .iter()
+            .map(|(key, _)| {
+                (
+                    (*key).to_owned(),
+                    serde_json::json!({"primary": null, "secondary": null}),
+                )
+            })
+            .collect::<Map<_, _>>();
+        let mut document = serde_json::json!({
+            "version": version,
+            "state": {"account": {"settings": {
+                "controls": {
+                    "button_layout": 0,
+                    "movement_mode": 0,
+                    "controller_look_sensitivity": 2,
+                    "controller_invert_vertical": false,
+                    "controller_auto_look_centering": false,
+                    "controller_vibration": true,
+                    "controller_swap_shoulders": false,
+                    "controller_invert_horizontal": false,
+                    "mouse_look_sensitivity": 15,
+                    "mouse_invert_vertical": false,
+                    "mouse_invert_horizontal": false,
+                    "unidentified_toggle": false,
+                    "mouse_aim_smoothing": false,
+                    "ads_sensitivity_modifier": 1.0,
+                    "double_press_delay": 0
+                },
+                "audio": {
+                    "voice_output_mode": 1,
+                    "team_voice_channel": 0,
+                    "reserved_mode": 0,
+                    "migration_version": 8,
+                    "chat_volume": 2,
+                    "mute_when_unfocused": false,
+                    "sound_effects_volume": 3,
+                    "dialogue_volume": 2,
+                    "music_volume": 2
+                },
+                "display": {
+                    "brightness": 3,
+                    "show_fps": false,
+                    "hdr_mode": 0,
+                    "calibration_primary": 10000.0,
+                    "calibration_alpha": 0.0
+                },
+                "interface": {
+                    "subtitles_mode": 0,
+                    "colorblind_mode": 0,
+                    "helmet_mode": 1,
+                    "hud_opacity": 3,
+                    "display_hints": true,
+                    "background_opacity": 2,
+                    "reticle_location": 0,
+                    "reticle_color": 0,
+                    "text_size": 0,
+                    "text_color": 0,
+                    "text_background_style": 0,
+                    "text_background_opacity": 0,
+                    "reserved_text_mode": 0,
+                    "subtitle_options_entry": 0
+                },
+                "social": {
+                    "prefer_good_connection": false,
+                    "text_chat_mode": 3,
+                    "show_real_names": true,
+                    "clan_invite_notifications": true,
+                    "profanity_filter": false,
+                    "voice_chat_enabled": true,
+                    "whisper_chat_mode": 0,
+                    "team_chat_join_mode": 0,
+                    "local_chat_join_mode": 0,
+                    "clan_chat_join_mode": 1,
+                    "chat_auto_hide_mode": 1
+                },
+                "key_bindings": {}
+            }}}
+        });
+        *document
+            .pointer_mut("/state/account/settings/key_bindings")
+            .unwrap() = Value::Object(key_bindings);
+        document
+    }
 
     #[test]
     fn float_validation_matches_sunrise_float_storage() {
@@ -1591,6 +1852,26 @@ mod tests {
         assert_eq!(valid_player_name(&"x".repeat(64)), None);
         assert_eq!(valid_player_name("Guardian\n"), None);
         assert_eq!(valid_player_name("Guardián"), None);
+    }
+
+    #[test]
+    fn game_language_validation_matches_sunrise_tokens() {
+        for &(token, _) in GAME_LANGUAGES {
+            let document = serde_json::json!({"steam": {"language": token}});
+            assert_eq!(validate_game_language(&document), Ok(()), "{token}");
+        }
+
+        assert_eq!(
+            validate_game_language(&serde_json::json!({"steam": {}})),
+            Ok(())
+        );
+        assert!(
+            validate_game_language(&serde_json::json!({
+                "steam": {"language": "unsupported"}
+            }))
+            .is_err()
+        );
+        assert!(validate_game_language(&serde_json::json!({"steam": {"language": 1}})).is_err());
     }
 
     #[test]
@@ -1617,11 +1898,15 @@ mod tests {
     #[test]
     fn key_binding_forms_follow_sunrise_schema_versions() {
         assert_eq!(
-            SettingsSchema::Version2.key_binding_format(),
+            SettingsSchema(2).key_binding_format(),
             KeyBindingFormat::Numeric
         );
         assert_eq!(
-            SettingsSchema::Version3.key_binding_format(),
+            SettingsSchema(3).key_binding_format(),
+            KeyBindingFormat::Named
+        );
+        assert_eq!(
+            SettingsSchema(6).key_binding_format(),
             KeyBindingFormat::Named
         );
 
@@ -1703,10 +1988,14 @@ mod tests {
     }
 
     #[test]
-    fn key_binding_editing_is_schema_3_only() {
+    fn named_key_binding_editing_follows_schema_capabilities() {
         assert!(!key_bindings_editable(&serde_json::json!({"version": 2})));
-        assert!(key_bindings_editable(&serde_json::json!({"version": 3})));
-        assert!(!key_bindings_editable(&serde_json::json!({"version": 4})));
+        for version in 3..=6 {
+            assert!(key_bindings_editable(
+                &serde_json::json!({"version": version})
+            ));
+        }
+        assert!(!key_bindings_editable(&serde_json::json!({"version": 7})));
         assert!(!key_bindings_editable(&serde_json::json!({})));
     }
 
@@ -1776,22 +2065,85 @@ mod tests {
             None
         );
         assert_eq!(
-            future_schema_version(&serde_json::json!({"version": 4})),
-            Some(4)
+            future_schema_version(&serde_json::json!({"version": 6})),
+            None
+        );
+        assert_eq!(
+            future_schema_version(&serde_json::json!({"version": 7})),
+            Some(7)
         );
     }
 
     #[test]
-    fn future_field_of_view_validation_accepts_stock_and_supported_values() {
+    fn experimental_preferences_are_optional_but_validated_when_present() {
         let stock = Map::new();
         assert_eq!(optional_range(&stock, "field_of_view", 55, 105), Ok(()));
+        assert_eq!(
+            optional_range(&stock, "vertical_sync_interval", 0, 4),
+            Ok(())
+        );
+        assert_eq!(
+            optional_string_member(&stock, "key_binding_source", &["account", "computer"]),
+            Ok(())
+        );
 
-        let patched = serde_json::json!({"field_of_view": 85});
+        let patched = serde_json::json!({
+            "field_of_view": 85,
+            "vertical_sync_interval": 1,
+            "key_binding_source": "computer"
+        });
         let patched = patched.as_object().unwrap();
         assert_eq!(optional_range(patched, "field_of_view", 55, 105), Ok(()));
+        assert_eq!(
+            optional_range(patched, "vertical_sync_interval", 0, 4),
+            Ok(())
+        );
+        assert_eq!(
+            optional_string_member(patched, "key_binding_source", &["account", "computer"]),
+            Ok(())
+        );
 
-        let invalid = serde_json::json!({"field_of_view": 106});
+        let invalid = serde_json::json!({
+            "field_of_view": 106,
+            "vertical_sync_interval": 5,
+            "key_binding_source": "cloud"
+        });
         let invalid = invalid.as_object().unwrap();
         assert!(optional_range(invalid, "field_of_view", 55, 105).is_err());
+        assert!(optional_range(invalid, "vertical_sync_interval", 0, 4).is_err());
+        assert!(
+            optional_string_member(invalid, "key_binding_source", &["account", "computer"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn schemas_two_through_six_share_one_validated_policy() {
+        for version in MIN_SUPPORTED_SCHEMA..=MAX_SUPPORTED_SCHEMA {
+            assert_eq!(validate(&valid_game_settings_document(version)), Ok(()));
+        }
+        assert!(validate(&valid_game_settings_document(1)).is_err());
+        assert!(validate(&valid_game_settings_document(7)).is_err());
+    }
+
+    #[test]
+    fn schema_six_accepts_presence_gated_preference_fields() {
+        let mut document = valid_game_settings_document(6);
+        let settings = document
+            .pointer_mut("/state/account/settings")
+            .and_then(Value::as_object_mut)
+            .unwrap();
+        settings.insert(
+            "key_binding_source".into(),
+            Value::String("computer".into()),
+        );
+        let display = settings
+            .get_mut("display")
+            .and_then(Value::as_object_mut)
+            .unwrap();
+        display.insert("vertical_sync_interval".into(), Value::from(1));
+        display.insert("field_of_view".into(), Value::from(105));
+
+        assert_eq!(validate(&document), Ok(()));
     }
 }
