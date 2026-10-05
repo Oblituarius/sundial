@@ -267,10 +267,10 @@ impl VariableDamageRecipe {
     pub fn all() -> Self {
         Self {
             elements: vec![
-                RecipeDamageType::Kinetic,
                 RecipeDamageType::Void,
                 RecipeDamageType::Arc,
                 RecipeDamageType::Solar,
+                RecipeDamageType::Kinetic,
             ],
         }
     }

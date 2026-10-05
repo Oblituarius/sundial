@@ -18,10 +18,10 @@ pub(crate) const FUNDAMENTALS_PLUG_HASH: u32 = 0x9C33_04DA;
 pub(crate) const TRAIT_SOCKET_TYPE: u16 = 92;
 /// The elements in the order the hold steps through them: selector 0, 1, 2, then 3.
 pub(crate) const SELECTOR_ORDER: [ModernDamageType; 4] = [
-    ModernDamageType::Kinetic,
     ModernDamageType::Void,
     ModernDamageType::Arc,
     ModernDamageType::Solar,
+    ModernDamageType::Kinetic,
 ];
 
 /// The stock finished-perk row on the plug that sets one element.
@@ -118,7 +118,9 @@ fn element_sandbox_perk(element: ModernDamageType) -> WeaponSandboxPerkRuntimeOv
             action_float_values: Vec::new(),
         },
         None => {
-            // Kinetic: use Arc's stock index as structural base, override with custom program
+            // Kinetic: use Borealis Arc stock index (461) as unique structural base,
+            // override with custom program that sets damage type to Kinetic.
+            // 461 is distinct from Hard Light's 462/463/464 to avoid duplicate rows.
             WeaponSandboxPerkRuntimeOverride {
                 program: Some(Program {
                     name: "Set Damage Type: Kinetic".to_owned(),
@@ -140,7 +142,7 @@ fn element_sandbox_perk(element: ModernDamageType) -> WeaponSandboxPerkRuntimeOv
                     additional_groups: Vec::new(),
                 }),
                 projectiles: Vec::new(),
-                source_perk_index: 462, // Arc stock index as base structure
+                source_perk_index: 461, // Borealis Arc — unique template row
                 activation: None,
                 runtime_values: Vec::new(),
                 action_float_values: Vec::new(),
@@ -409,6 +411,14 @@ mod tests {
         );
         assert_eq!(
             resting_element(&[ModernDamageType::Kinetic, ModernDamageType::Arc]),
+            Some(ModernDamageType::Arc)
+        );
+        assert_eq!(
+            resting_element(&[ModernDamageType::Kinetic, ModernDamageType::Void]),
+            Some(ModernDamageType::Void)
+        );
+        assert_eq!(
+            resting_element(&[ModernDamageType::Kinetic]),
             Some(ModernDamageType::Kinetic)
         );
         assert_eq!(resting_element(&[]), None);
