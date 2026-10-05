@@ -257,7 +257,7 @@ impl From<RecipeBehaviorFiring> for crate::weapon_behavior::BehaviorFiring {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VariableDamageRecipe {
-    /// Elements the hold can settle on: any two or all three of Arc, Solar and Void.
+    /// Elements the hold can settle on: any two or more of Kinetic, Arc, Solar and Void.
     pub elements: Vec<RecipeDamageType>,
 }
 
@@ -267,6 +267,7 @@ impl VariableDamageRecipe {
     pub fn all() -> Self {
         Self {
             elements: vec![
+                RecipeDamageType::Kinetic,
                 RecipeDamageType::Void,
                 RecipeDamageType::Arc,
                 RecipeDamageType::Solar,

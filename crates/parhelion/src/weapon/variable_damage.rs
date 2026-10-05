@@ -16,8 +16,9 @@ pub(crate) const HARD_LIGHT_ITEM_HASH: u32 = 0xF5DE_4480;
 pub(crate) const FUNDAMENTALS_PLUG_HASH: u32 = 0x9C33_04DA;
 /// The native socket type of weapon trait sockets, the lane the plug is pinned into.
 pub(crate) const TRAIT_SOCKET_TYPE: u16 = 92;
-/// The elements in the order the hold steps through them: selector 0, 1, then 2.
-pub(crate) const SELECTOR_ORDER: [ModernDamageType; 3] = [
+/// The elements in the order the hold steps through them: selector 0, 1, 2, then 3.
+pub(crate) const SELECTOR_ORDER: [ModernDamageType; 4] = [
+    ModernDamageType::Kinetic,
     ModernDamageType::Void,
     ModernDamageType::Arc,
     ModernDamageType::Solar,
@@ -62,14 +63,6 @@ pub(crate) fn ordered_elements(elements: &[ModernDamageType]) -> Vec<ModernDamag
 }
 
 pub(crate) fn validate_elements(elements: &[ModernDamageType]) -> AuthoringResult<()> {
-    if elements
-        .iter()
-        .any(|element| element_perk_index(*element).is_none())
-    {
-        return Err(invalid(
-            "This Fundamentals-based switcher cycles Arc, Solar and Void. Use a Perk Workbench Set Damage Type action to author Kinetic damage.",
-        ));
-    }
     let unique = ordered_elements(elements);
     if unique.len() != elements.len() {
         return Err(invalid("Variable damage lists an element twice."));
@@ -109,6 +102,51 @@ pub(super) fn expand_spec(
     let mut expanded = spec.clone();
     expanded.overrides = expand_overrides(&spec.overrides, &weapon_socket_types(definition)?)?;
     Ok(Some(expanded))
+}
+
+/// Builds the sandbox perk override for one element. Kinetic uses a custom program;
+/// other elements use their stock finished-perk rows.
+fn element_sandbox_perk(element: ModernDamageType) -> WeaponSandboxPerkRuntimeOverride {
+    use sundial::package_authoring::sandbox_perk::program::{Action, Program, Trigger};
+    match element_perk_index(element) {
+        Some(index) => WeaponSandboxPerkRuntimeOverride {
+            program: None,
+            projectiles: Vec::new(),
+            source_perk_index: index,
+            activation: None,
+            runtime_values: Vec::new(),
+            action_float_values: Vec::new(),
+        },
+        None => {
+            // Kinetic: use Arc's stock index as structural base, override with custom program
+            WeaponSandboxPerkRuntimeOverride {
+                program: Some(Program {
+                    name: "Set Damage Type: Kinetic".to_owned(),
+                    trigger: Trigger::Native,
+                    duration_ms: 0,
+                    cooldown_ms: 0,
+                    chance_permyriad: 0,
+                    actions: vec![Action::set_damage_type(0)], // mode 0 = Kinetic
+                    removal_key: None,
+                    native_trigger: None,
+                    native_removal: None,
+                    native: None,
+                    auxiliary: Vec::new(),
+                    policy: None,
+                    alternative_triggers: Vec::new(),
+                    alternative_removals: Vec::new(),
+                    native_rearm: None,
+                    alternative_rearms: Vec::new(),
+                    additional_groups: Vec::new(),
+                }),
+                projectiles: Vec::new(),
+                source_perk_index: 462, // Arc stock index as base structure
+                activation: None,
+                runtime_values: Vec::new(),
+                action_float_values: Vec::new(),
+            }
+        }
+    }
 }
 
 /// Pins The Fundamentals into the first trait socket and, for a subset of elements, adds a
@@ -197,7 +235,10 @@ pub(crate) fn expand_overrides(
         )));
     }
     let elements = ordered_elements(&variable.elements);
-    if elements.len() < SELECTOR_ORDER.len() {
+    // Stock plug has Arc/Solar/Void only. Need variant if Kinetic included or if subset of 4.
+    let needs_variant = elements.len() < SELECTOR_ORDER.len()
+        || elements.iter().any(|e| element_perk_index(*e).is_none());
+    if needs_variant {
         let labels = elements
             .iter()
             .map(|element| element_label(*element))
@@ -220,15 +261,7 @@ pub(crate) fn expand_overrides(
                 additional_sandbox_perks: Vec::new(),
                 sandbox_perks: elements
                     .iter()
-                    .map(|element| WeaponSandboxPerkRuntimeOverride {
-                        program: None,
-                        projectiles: Vec::new(),
-                        source_perk_index: element_perk_index(*element)
-                            .expect("validated elemental rows"),
-                        activation: None,
-                        runtime_values: Vec::new(),
-                        action_float_values: Vec::new(),
-                    })
+                    .map(|element| element_sandbox_perk(*element))
                     .collect(),
             });
     }
@@ -274,7 +307,8 @@ mod tests {
                 .enumerate()
                 .all(|(lane, column)| lane == 3 || column.is_none())
         );
-        assert!(expanded.socket_plug_variants.is_empty());
+        // All 4 elements including Kinetic needs variant since stock plug missing Kinetic
+        assert_eq!(expanded.socket_plug_variants.len(), 1);
     }
 
     #[test]
@@ -365,12 +399,17 @@ mod tests {
     fn element_sets_are_validated() {
         assert!(validate_elements(&SELECTOR_ORDER).is_ok());
         assert!(validate_elements(&[ModernDamageType::Arc, ModernDamageType::Void]).is_ok());
+        assert!(validate_elements(&[ModernDamageType::Kinetic, ModernDamageType::Arc]).is_ok());
+        assert!(validate_elements(&[ModernDamageType::Kinetic, ModernDamageType::Solar, ModernDamageType::Void]).is_ok());
         assert!(validate_elements(&[ModernDamageType::Arc]).is_err());
         assert!(validate_elements(&[ModernDamageType::Arc, ModernDamageType::Arc]).is_err());
-        assert!(validate_elements(&[ModernDamageType::Kinetic, ModernDamageType::Arc]).is_err());
         assert_eq!(
             resting_element(&[ModernDamageType::Solar, ModernDamageType::Arc]),
             Some(ModernDamageType::Arc)
+        );
+        assert_eq!(
+            resting_element(&[ModernDamageType::Kinetic, ModernDamageType::Arc]),
+            Some(ModernDamageType::Kinetic)
         );
         assert_eq!(resting_element(&[]), None);
     }
