@@ -1244,6 +1244,7 @@ struct ResolvedIconDonor {
 
 #[derive(Clone)]
 struct ResolvedRenderGearDonor {
+    item_hash: u32,
     definition: Vec<u8>,
 }
 

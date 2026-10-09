@@ -103,7 +103,7 @@ pub(super) fn resolve_render_gear_donor(
     let definition = read_tag(manager, definition_tag, "render-gear donor weapon")?;
     weapon_translation_topology(&definition)?;
     weapon_render_dye_rows(&definition)?;
-    Ok(ResolvedRenderGearDonor { definition })
+    Ok(ResolvedRenderGearDonor { item_hash: reference.item_hash, definition })
 }
 
 pub(super) fn resolve_presentation_donor(
