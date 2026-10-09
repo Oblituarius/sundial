@@ -107,7 +107,7 @@ pub(super) fn expand_spec(
 /// Builds the sandbox perk override for one element. Kinetic uses a custom program;
 /// other elements use their stock finished-perk rows.
 fn element_sandbox_perk(element: ModernDamageType) -> WeaponSandboxPerkRuntimeOverride {
-    use sundial::package_authoring::sandbox_perk::program::{Action, Program, Trigger};
+    use sundial::package_authoring::sandbox_perk::program::{Action, Program, Trigger, NativeNode};
     match element_perk_index(element) {
         Some(index) => WeaponSandboxPerkRuntimeOverride {
             program: None,
@@ -118,9 +118,11 @@ fn element_sandbox_perk(element: ModernDamageType) -> WeaponSandboxPerkRuntimeOv
             action_float_values: Vec::new(),
         },
         None => {
-            // Kinetic: use Borealis Arc stock index (461) as unique structural base,
-            // override with custom program that sets damage type to Kinetic.
-            // 461 is distinct from Hard Light's 462/463/464 to avoid duplicate rows.
+            // Kinetic: use Borealis Arc (index 461) as the structural base — distinct from Hard
+            // Light's Arc (462), Solar (463) and Void (464) so all four indices are unique when
+            // placed in one variant. Override the program to Set Damage Type 0 (Kinetic) with the
+            // same reload-hold trigger condition (18) the stock Fundamentals rows use.
+            let reload_trigger = NativeNode::condition(18).expect("Reload trigger condition 18 missing");
             WeaponSandboxPerkRuntimeOverride {
                 program: Some(Program {
                     name: "Set Damage Type: Kinetic".to_owned(),
@@ -128,9 +130,9 @@ fn element_sandbox_perk(element: ModernDamageType) -> WeaponSandboxPerkRuntimeOv
                     duration_ms: 0,
                     cooldown_ms: 0,
                     chance_permyriad: 0,
-                    actions: vec![Action::set_damage_type(0)], // mode 0 = Kinetic
+                    actions: vec![Action::set_damage_type(0)],
                     removal_key: None,
-                    native_trigger: None,
+                    native_trigger: Some(reload_trigger),
                     native_removal: None,
                     native: None,
                     auxiliary: Vec::new(),
@@ -142,7 +144,7 @@ fn element_sandbox_perk(element: ModernDamageType) -> WeaponSandboxPerkRuntimeOv
                     additional_groups: Vec::new(),
                 }),
                 projectiles: Vec::new(),
-                source_perk_index: 461, // Borealis Arc — unique template row
+                source_perk_index: 461,
                 activation: None,
                 runtime_values: Vec::new(),
                 action_float_values: Vec::new(),
@@ -192,14 +194,20 @@ pub(crate) fn expand_overrides(
     // The reload hold is carried by a behavior record in the weapon family's shared content
     // owner, not by the carrier's gear art. Request it by family so the compiler picks Hard
     // Light's record for rifles and Borealis's for snipers.
+    // Encode the element count in the behavior ID so patches() can set the state-machine
+    // cycling count to (element_count - 2). "element-switch" without a suffix defaults to 3
+    // (Arc/Solar/Void); "element-switch:N" carries an explicit count for N > 3.
+    let element_switch_id = format!(
+        "{}:{}",
+        crate::weapon_behavior::ELEMENT_SWITCH,
+        variable.elements.len()
+    );
     if !expanded
         .additional_behaviors
         .iter()
-        .any(|id| id == crate::weapon_behavior::ELEMENT_SWITCH)
+        .any(|id| crate::weapon_behavior::is_element_switch_id(id))
     {
-        expanded
-            .additional_behaviors
-            .push(crate::weapon_behavior::ELEMENT_SWITCH.to_owned());
+        expanded.additional_behaviors.push(element_switch_id);
     }
     if expanded.socket_columns.is_empty() {
         expanded.socket_columns = vec![None; socket_types.len()];
@@ -226,20 +234,25 @@ pub(crate) fn expand_overrides(
         .choices
         .retain(|choice| *choice != FUNDAMENTALS_PLUG_HASH);
     column.choices.insert(0, FUNDAMENTALS_PLUG_HASH);
-    if expanded
+    // If the recipe already provides a custom variant at this socket's choice 0, honour it and
+    // skip auto-generation. This is the intended path for a hand-authored 4-state perk (like one
+    // using a full native graph for each element) that replaces the auto-generated variant.
+    let user_has_variant = expanded
         .socket_plug_variants
         .iter()
-        .any(|variant| variant.socket_index == socket_index && variant.choice_index == 0)
-    {
-        return Err(invalid(format!(
-            "Variable damage owns socket {} (Trait), but the recipe also has a private plug variant there. Remove that variant or turn off variable damage.",
-            lane + 1
-        )));
-    }
+        .any(|variant| variant.socket_index == socket_index && variant.choice_index == 0);
     let elements = ordered_elements(&variable.elements);
-    // Stock plug has Arc/Solar/Void only. Need variant if Kinetic included or if subset of 4.
-    let needs_variant = elements.len() < SELECTOR_ORDER.len()
-        || elements.iter().any(|e| element_perk_index(*e).is_none());
+    // Stock plug has Arc/Solar/Void only. Need a private variant whenever Kinetic is included
+    // or the recipe uses a subset of the three stock elements. All chosen elements — including
+    // Kinetic's custom-program perk — go into one variant at choice_index 0, replacing the
+    // stock plug's effects. A second variant at a different choice would require a second plug
+    // hash in the socket column, colliding with any author-chosen choices already there.
+    let has_kinetic = elements.iter().any(|e| *e == ModernDamageType::Kinetic);
+    let stock_count = elements
+        .iter()
+        .filter(|e| element_perk_index(**e).is_some())
+        .count();
+    let needs_variant = !user_has_variant && (has_kinetic || stock_count < 3);
     if needs_variant {
         let labels = elements
             .iter()
@@ -309,8 +322,19 @@ mod tests {
                 .enumerate()
                 .all(|(lane, column)| lane == 3 || column.is_none())
         );
-        // All 4 elements including Kinetic needs variant since stock plug missing Kinetic
+        // All 4 elements: one variant at choice 0 containing all perks (Kinetic via custom program)
         assert_eq!(expanded.socket_plug_variants.len(), 1);
+        let variant = &expanded.socket_plug_variants[0];
+        assert_eq!((variant.socket_index, variant.choice_index), (3, 0));
+        assert_eq!(variant.source_plug_hash, FUNDAMENTALS_PLUG_HASH);
+        // Void=464, Arc=462, Solar=463, Kinetic=461 — all four must be distinct or
+        // set_weapon_base_sandbox_perks rejects the plug with a duplicate-row error.
+        assert_eq!(
+            variant.sandbox_perks.iter().map(|p| p.source_perk_index).collect::<Vec<_>>(),
+            [464, 462, 463, 461],
+        );
+        let kinetic = variant.sandbox_perks.iter().find(|p| p.source_perk_index == 461).unwrap();
+        assert!(kinetic.program.is_some());
     }
 
     #[test]
@@ -347,6 +371,22 @@ mod tests {
     }
 
     #[test]
+    fn element_count_is_encoded_in_the_behavior_id() {
+        // The behavior ID carries the element count so patches() can set the state-machine
+        // cycling count to (element_count - 2). 3 elements → "element-switch:3" (count=1),
+        // 4 elements → "element-switch:4" (count=2, enabling state 3 for Kinetic).
+        let expanded_3 = expand_overrides(
+            &overrides(&[ModernDamageType::Void, ModernDamageType::Arc, ModernDamageType::Solar]),
+            &SOCKET_TYPES,
+        )
+        .unwrap();
+        assert!(expanded_3.additional_behaviors.iter().any(|id| id == "element-switch:3"));
+
+        let expanded_4 = expand_overrides(&overrides(&SELECTOR_ORDER), &SOCKET_TYPES).unwrap();
+        assert!(expanded_4.additional_behaviors.iter().any(|id| id == "element-switch:4"));
+    }
+
+    #[test]
     fn existing_columns_keep_their_other_lanes() {
         let mut source = overrides(&SELECTOR_ORDER);
         source.socket_columns = vec![None; SOCKET_TYPES.len()];
@@ -371,16 +411,19 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_trait_socket_is_rejected() {
+    fn a_user_variant_at_choice_0_suppresses_auto_generation() {
+        // A recipe that provides its own variant at the trait socket's choice 0 is accepted:
+        // variable_damage honours it instead of generating its own, so the user can supply a
+        // hand-authored 4-state perk (e.g. with full native graphs for each element).
         let mut occupied = overrides(&SELECTOR_ORDER);
         occupied
             .socket_plug_variants
             .push(WeaponSocketPlugVariantOverride {
-                replace_effects: false,
+                replace_effects: true,
                 investment_stats: Vec::new(),
                 socket_index: 3,
                 choice_index: 0,
-                source_plug_hash: 0x1234_5678,
+                source_plug_hash: FUNDAMENTALS_PLUG_HASH,
                 name: None,
                 icon: None,
                 classification_donor_hash: None,
@@ -388,10 +431,15 @@ mod tests {
                 additional_sandbox_perks: Vec::new(),
                 sandbox_perks: Vec::new(),
             });
-        assert!(expand_overrides(&occupied, &SOCKET_TYPES).is_err());
+        let expanded = expand_overrides(&occupied, &SOCKET_TYPES).unwrap();
+        // The user's variant is the only one — no auto-generated variant was added.
+        assert_eq!(expanded.socket_plug_variants.len(), 1);
+        assert_eq!(expanded.socket_plug_variants[0].source_plug_hash, FUNDAMENTALS_PLUG_HASH);
 
+        // A weapon with no trait socket is still an error.
         assert!(expand_overrides(&overrides(&SELECTOR_ORDER), &[176, 65, 177]).is_err());
 
+        // A column list too short for the socket types is still an error.
         let mut narrow = overrides(&SELECTOR_ORDER);
         narrow.socket_columns = vec![None; 2];
         assert!(expand_overrides(&narrow, &SOCKET_TYPES).is_err());

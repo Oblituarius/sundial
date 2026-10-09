@@ -1175,9 +1175,26 @@ const SHARED_RECORDS: &[(&str, &str)] = &[
     ("divinity-graph", "symmetry"),
 ];
 
+/// Whether a behavior identifier refers to the element-switch record, with or without an
+/// element-count suffix. Accepts `"element-switch"` and `"element-switch:N"` for any N.
+#[must_use]
+pub fn is_element_switch_id(id: &str) -> bool {
+    id == ELEMENT_SWITCH || id.starts_with(&format!("{ELEMENT_SWITCH}:"))
+}
+
+/// Number of elements encoded in an element-switch behavior identifier.
+/// `"element-switch"` without a suffix defaults to 3 (Arc / Solar / Void).
+/// `"element-switch:N"` carries an explicit count set by the variable-damage expansion.
+fn element_switch_count(id: &str) -> usize {
+    id.strip_prefix(ELEMENT_SWITCH)
+        .and_then(|tail| tail.strip_prefix(':'))
+        .and_then(|n| n.parse::<usize>().ok())
+        .unwrap_or(3)
+}
+
 /// Turns a recipe identifier into a catalogue entry this weapon's family can actually reach.
 fn resolve_request(id: &str, owner_tag: u32) -> AuthoringResult<Option<&'static Behavior>> {
-    if id == ELEMENT_SWITCH {
+    if is_element_switch_id(id) {
         // A family without a record of its own gets one appended instead.
         return Ok(element_switch_for_owner(owner_tag));
     }
@@ -1509,6 +1526,7 @@ fn label_append(
             4,
             i64::try_from(rows).map_err(|_| invalid("Weapon label array count overflow"))?,
         )],
+        base_owner_override: None,
     }))
 }
 
@@ -1741,9 +1759,47 @@ fn slot_bytes(target: usize, slot: usize, count: i64) -> AuthoringResult<Vec<u8>
 /// When the pattern row selects another weapon's block, the base weapon's own firing graph,
 /// behavior record and labels go back into it first, so an appearance changes how the weapon
 /// looks and not how it fires. A requested behavior still replaces the half it brings.
+/// Resolve the behavior triple for a graft, falling back to an alternate content owner when the
+/// primary lacks one. Returns `(triple, resource_offset, base_owner_override)`.
+/// `base_owner_override` is `Some(fallback_owner_tag)` when the fallback was used; the caller
+/// should set that on `WeaponRuntimeResourceAppend` so the append step loads the right payload.
+fn resolve_behavior_triple(
+    manager: &PackageManager,
+    owner_content: &Content,
+    block: usize,
+    fallback_entity: Option<&[u8]>,
+) -> AuthoringResult<(usize, usize, Option<u32>)> {
+    if let Some(triple) = find_triple(&owner_content.owner, block)? {
+        return Ok((triple, owner_content.resource, None));
+    }
+    let Some(fb_entity) = fallback_entity else {
+        return Err(invalid(
+            "Weapon variant block has no behavior slots to graft onto. \
+             Add a render_gear_donor from a weapon that supports element switching \
+             (e.g. Borealis for a sniper rifle) to supply the behavior slot layout.",
+        ));
+    };
+    let fb_content = content(manager, fb_entity).map_err(|e| {
+        invalid(format!("Behavior fallback entity is unreadable: {e}"))
+    })?;
+    // Scan all blocks in the fallback's content owner for any with a triple.
+    let fb_triple = fb_content
+        .blocks
+        .iter()
+        .find_map(|&b| find_triple(&fb_content.owner, b).ok().flatten())
+        .ok_or_else(|| invalid(
+            "Neither the gameplay donor nor the render-gear donor has behavior-slot space. \
+             Use a render_gear_donor from a weapon that supports element switching.",
+        ))?;
+    Ok((fb_triple, fb_content.resource, Some(fb_content.owner_tag)))
+}
+
 pub(crate) fn patches(
     manager: &PackageManager,
     entity: &[u8],
+    // Entity from the render-gear donor used as a slot-layout fallback when the gameplay
+    // donor's content owner lacks the behavior triple structure.
+    behavior_fallback_entity: Option<&[u8]>,
     groups: ContentGroups,
     requested: &[String],
     speed_boost: f32,
@@ -1789,7 +1845,7 @@ pub(crate) fn patches(
     // twice put two edits over the same bytes and the overlap guard failed the whole build.
     let mut applied_records = Vec::new();
     let mut label_sources = Vec::new();
-    for entry in behaviors {
+    for (id, entry) in requested.iter().map(String::as_str).zip(behaviors) {
         // Every source weapon's own labels come along, whichever half of it is borrowed, because
         // its perk may key on them wherever the behavior itself lives. A source whose own block
         // cannot be reached, because it has no sandbox-pattern runtime row of its own, carries no
@@ -1830,7 +1886,21 @@ pub(crate) fn patches(
                 ));
             }
             applied_records.push((owner_tag, group));
-            let triple = first_triple(&content.owner, block)?;
+            // For element-switch records the slot-pointer count encodes the highest reachable
+            // selector index as (element_count - 2). The stock count=1 (= 3 elements: 0,1,2)
+            // is correct for Arc / Solar / Void. Kinetic as a fourth element needs count=2
+            // so the state machine cycles through 0,1,2,3.
+            let state_count = if is_element_switch_id(id) {
+                (element_switch_count(id).saturating_sub(2)) as i64
+            } else {
+                1
+            };
+            // Resolve the triple that carries the behavior slots. When the gameplay donor's
+            // content owner lacks one (e.g. Eye of Sol has no element-switch infrastructure),
+            // fall back to the render-gear donor's owner for the slot layout and record the
+            // override so the build step loads the right payload base.
+            let (triple, graft_resource, base_owner_override) =
+                resolve_behavior_triple(manager, &content, block, behavior_fallback_entity)?;
             let source_owner = (owner_tag != content.owner_tag)
                 .then(|| {
                     manager
@@ -1841,13 +1911,13 @@ pub(crate) fn patches(
             if let Some(source) = &source_owner {
                 let record = extract_record(source, group, include_behavior)?;
                 let mut slots = vec![(
-                    slot_offset(triple + SLOT_STRIDE, content.resource)?,
+                    slot_offset(triple + SLOT_STRIDE, graft_resource)?,
                     record.state_offset,
-                    1,
+                    state_count,
                 )];
                 if let Some(behavior_offset) = record.behavior_offset {
                     slots.push((
-                        slot_offset(triple + SLOT_STRIDE * 2, content.resource)?,
+                        slot_offset(triple + SLOT_STRIDE * 2, graft_resource)?,
                         behavior_offset,
                         0,
                     ));
@@ -1857,10 +1927,11 @@ pub(crate) fn patches(
                     resource_index: 0,
                     bytes: record.bytes,
                     slots,
+                    base_owner_override,
                 });
             } else {
                 let graft = resolve(&content, group, include_behavior)?;
-                let mut targets = vec![(triple + SLOT_STRIDE, graft.state_target, 1)];
+                let mut targets = vec![(triple + SLOT_STRIDE, graft.state_target, state_count)];
                 if let Some(behavior_target) = graft.behavior_target {
                     targets.push((triple + SLOT_STRIDE * 2, behavior_target, 0));
                 }

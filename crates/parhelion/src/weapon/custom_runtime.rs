@@ -52,6 +52,7 @@ pub(crate) fn preflight_runtime_edits(
             selected: content_group,
             own: None,
         },
+        None,
         allocator,
         &mut Vec::new(),
     )
@@ -63,6 +64,9 @@ pub(super) fn author_runtime_edits(
     overrides: &WeaponCloneOverrides,
     hud_key: Option<u32>,
     groups: crate::weapon_behavior::ContentGroups,
+    // Entity from the render-gear donor; used as a behavior-slot fallback when the gameplay
+    // donor's content owner lacks the triple structure needed to graft a behavior record.
+    behavior_fallback_entity: Option<Vec<u8>>,
     allocator: AppendedTagAllocator,
     tags: &mut Vec<NewTagSpec>,
 ) -> AuthoringResult<()> {
@@ -73,6 +77,7 @@ pub(super) fn author_runtime_edits(
     let grafts = crate::weapon_behavior::patches(
         manager,
         entity,
+        behavior_fallback_entity.as_deref(),
         groups,
         &overrides.additional_behaviors,
         overrides
@@ -294,10 +299,26 @@ pub(super) fn append_patched_runtime_resource_owners(
                 owner_entry.file_type
             )));
         }
-        let mut owner_payload = read_tag(manager, owner_tag, "runtime component owner")?;
+        // When an append carries a base_owner_override the behavior record is being grafted
+        // onto a borrowed content owner (e.g. Borealis's) because the gameplay donor's own
+        // owner lacks behavior-slot space. Load that base instead of the entity's current
+        // binding owner; the entity binding is still retargeted below so the compiled weapon
+        // references the new authored owner rather than the original gameplay donor's.
+        let base_override = appends
+            .iter()
+            .filter(|a| {
+                weapon_component_bindings(entity, a.binding_hash)
+                    .ok()
+                    .and_then(|b| b.get(usize::from(a.resource_index)).map(|b| b.owner_tag))
+                    == Some(owner_tag.0)
+            })
+            .find_map(|a| a.base_owner_override);
+        let payload_tag = base_override.map_or(owner_tag, TagHash);
+        let mut owner_payload = read_tag(manager, payload_tag, "runtime component owner")?;
         if usize::try_from(read_u64(&owner_payload, 0)?).ok() != Some(owner_payload.len()) {
             return Err(invalid(format!(
-                "Runtime component owner {owner_tag} has an inconsistent file-size field"
+                "Runtime component owner {} has an inconsistent file-size field",
+                payload_tag
             )));
         }
         // Growth first, so the slots that point into the new bytes are ordinary patches from here.
@@ -382,17 +403,21 @@ pub(super) fn append_patched_runtime_resource_owners(
         }
         // Byte-range edits can include native references. Retarget the final payload
         // so copying source bytes cannot restore a link to the stock owner.
+        // When a base_owner_override was used the payload came from a different tag
+        // (e.g. Borealis); retarget its internal self-references from that tag.
         retarget_weapon_component_owner_payload(
             &mut owner_payload,
             entity,
-            owner_tag.0,
+            payload_tag.0,
             authored_owner_tag.0,
         )
         .map_err(invalid)?;
+        // Always retarget the entity binding from the gameplay donor's original owner
+        // so the compiled weapon references the new authored owner.
         retarget_weapon_component_owner(entity, owner_tag.0, authored_owner_tag.0)
             .map_err(invalid)?;
         runtime_new_tags.push(NewTagSpec {
-            template_tag: owner_tag,
+            template_tag: payload_tag,
             payload: owner_payload,
             storage: crate::NewTagStorageMode::InheritTemplate,
         });

@@ -858,6 +858,11 @@ pub struct WeaponRuntimeResourceAppend {
     /// Slots to fill in, as the slot's resource-relative offset, the offset inside `bytes` it
     /// should reach, and the count written in the following eight bytes.
     pub slots: Vec<(u32, usize, i64)>,
+    /// When `Some`, load this tag's payload as the base owner rather than the entity's current
+    /// binding owner. Used when the gameplay donor's content owner lacks behavior-slot space and
+    /// the slot layout is borrowed from a render-gear donor (e.g. Borealis for a sniper rifle).
+    /// The entity binding is still retargeted from the original owner to the new authored one.
+    pub base_owner_override: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

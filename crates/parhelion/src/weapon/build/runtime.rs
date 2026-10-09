@@ -223,12 +223,21 @@ pub(super) fn author_entities(
             };
             #[cfg(feature = "d2-model-importer")]
             let runtime_overrides = &extended_overrides;
+            // Use the render-gear donor's already-resolved entity bytes as a behavior-slot
+            // fallback. When the gameplay donor (e.g. Eye of Sol) lacks the behavior triple
+            // needed for element switching, the render-gear donor (e.g. Borealis) supplies
+            // the slot layout so the graft can proceed on any weapon type.
+            let behavior_fallback_entity = donor
+                .render_gear_donor
+                .as_ref()
+                .map(|rg| rg.definition.clone());
             author_runtime_edits(
                 manager,
                 &mut pattern_entity,
                 runtime_overrides,
                 hud_key,
                 groups,
+                behavior_fallback_entity,
                 weapon_runtime_tag_allocator,
                 weapon_runtime_new_tags,
             )?;
