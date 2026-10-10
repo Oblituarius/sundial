@@ -17,10 +17,10 @@ jobs:
       - name: Check Out Source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Install Rust 1.88
+      - name: Install Rust 1.99
         run: |
-          rustup toolchain install 1.88.0 --profile minimal --component clippy --component rustfmt --no-self-update
-          rustup default 1.88.0
+          rustup toolchain install 1.99.0 --profile minimal --component clippy --component rustfmt --no-self-update
+          rustup default 1.99.0
 
       - name: Install Build Tools
         run: |
@@ -29,6 +29,8 @@ jobs:
             build-essential \
             pkg-config \
             libgl1-mesa-dev \
+            libgl1-mesa-dri \
+            libglx-mesa0 \
             libwayland-dev \
             libx11-dev \
             libxcursor-dev \
@@ -36,7 +38,9 @@ jobs:
             libxkbcommon-dev \
             libxrandr-dev \
             desktop-file-utils \
-            python3-gi
+            python3-gi \
+            xvfb \
+            xauth
 
       - name: Test Linux Desktop Installation
         run: sh packaging/linux/tests/install.sh
@@ -74,18 +78,60 @@ jobs:
 
       - name: Test Sundial and Parhelion
         run: |
+          set -o pipefail
+          mkdir -p target
           rm -f target/cargo-timings/cargo-timing.html
-          cargo test --release --workspace --locked --timings
+          cargo test --release --workspace --locked --timings --message-format=json | tee target/quality-tests.jsonl
+
+      - name: Verify Linux OpenGL Rendering
+        timeout-minutes: 3
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+          SUNDIAL_PREVIEW_VERIFY_SCOPE: ci
+          SUNDIAL_PREVIEW_VERIFY_OUTPUT: ${{ github.workspace }}/target/linux-gpu-artifacts
+        run: |
+          gpu_test_binary=$(python3 - <<'PY'
+          import json
+          binaries = set()
+          with open('target/quality-tests.jsonl') as log:
+              for line in log:
+                  if not line.startswith('{'):
+                      continue
+                  try:
+                      message = json.loads(line)
+                  except json.JSONDecodeError:
+                      continue
+                  target = message.get('target', {})
+                  if (message.get('reason') == 'compiler-artifact'
+                          and message.get('profile', {}).get('test')
+                          and target.get('name') == 'sundial'
+                          and 'lib' in target.get('kind', [])
+                          and message.get('executable')):
+                      binaries.add(message['executable'])
+          assert len(binaries) == 1, 'Expected one Sundial Release test executable'
+          print(binaries.pop())
+          PY
+          )
+          env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET xvfb-run -a -s '-screen 0 1280x1024x24' "$gpu_test_binary" --exact model_preview::gpu::verification::generated_materials_render_consistently --ignored --nocapture --test-threads=1
+          env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET xvfb-run -a -s '-screen 0 1280x1024x24' "$gpu_test_binary" --exact model_preview::gpu::verification::exports::saved_exports_use_the_gpu_and_cancel_on_close --ignored --nocapture --test-threads=1
+
+      - name: Upload Linux OpenGL Readback
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-gpu-readback
+          path: target/linux-gpu-artifacts
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Check Documentation
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --release --workspace --no-deps --locked --lib
 
-      # Narrow Linux accessibility XML exceptions. Any other RustSec vulnerability
-      # still fails this check.
+      # Any RustSec vulnerability or yanked crate fails this check.
       - name: Audit Dependencies
-        run: cargo audit --deny yanked --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
+        run: cargo audit --deny yanked
 
       - name: Upload Build Timings
         if: always()
@@ -103,11 +149,11 @@ jobs:
       - name: Check Out Source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Install Rust 1.88
+      - name: Install Rust 1.99
         shell: pwsh
         run: |
-          rustup toolchain install 1.88.0 --profile minimal --component clippy --no-self-update
-          rustup default 1.88.0
+          rustup toolchain install 1.99.0 --profile minimal --component clippy --no-self-update
+          rustup default 1.99.0
 
       - name: Cache Rust Dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
