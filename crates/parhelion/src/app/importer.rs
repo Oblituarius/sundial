@@ -59,6 +59,7 @@ pub(super) struct Importer {
     cancel: Arc<AtomicBool>,
     /// (donor count, weapon count) the no-donor set was computed for.
     donor_stamp: (usize, usize),
+    log: sundial::activity_log::FileLog,
 }
 
 /// A running import: one slot per worker thread.
@@ -133,6 +134,8 @@ impl Default for Importer {
         if let Some(path) = &view_path {
             browser.apply_view(browser::View::load(path));
         }
+        let mut log = sundial::activity_log::FileLog::default();
+        log.enable(sundial::activity_log::Product::ParhImporter);
         Self {
             open: false,
             enabled: settings.enabled,
@@ -160,6 +163,7 @@ impl Default for Importer {
             outcome: None,
             cancel: Arc::new(AtomicBool::new(false)),
             donor_stamp: (usize::MAX, usize::MAX),
+            log,
         }
     }
 }
@@ -287,6 +291,9 @@ impl PackageAuthoringApp {
                     self.importer.importing = None;
                     self.importer.import_started = None;
                     self.importer.notice = "Import worker stopped unexpectedly.".into();
+                    self.importer.log.append(&sundial::activity_log::Entry::error(
+                        "Import worker stopped unexpectedly",
+                    ));
                     break;
                 }
                 _ => break,
@@ -298,22 +305,61 @@ impl PackageAuthoringApp {
                     self.importer.scan_started = None;
                     self.importer.notice.clear();
                     match *result {
-                        Ok(inspected) => self.importer.roi = Some(inspected),
-                        Err(error) => self.importer.scan_error = Some(error),
+                        Ok(inspected) => {
+                            let r = &inspected.report;
+                            let platform = r.selected.first().map_or(0, |h| h.platform);
+                            let platform_name = match platform {
+                                7 => "PS4",
+                                8 => "Xbox One",
+                                _ => "unknown platform",
+                            };
+                            let elapsed = self
+                                .importer
+                                .scan_started
+                                .map_or(String::new(), |t| format!(" in {}s", t.elapsed().as_secs()));
+                            self.importer.log.append(&sundial::activity_log::Entry::info(
+                                format!(
+                                    "ROI scan complete: {platform_name} (platform {platform}) packages={} entries={} armor={} weapons={}{elapsed}",
+                                    r.package_count,
+                                    r.entry_count,
+                                    inspected.armor.len(),
+                                    inspected.weapons.len()
+                                ),
+                            ));
+                            self.importer.roi = Some(inspected);
+                        }
+                        Err(error) => {
+                            self.importer.log.append(&sundial::activity_log::Entry::error(
+                                format!("ROI scan error: {error}"),
+                            ));
+                            self.importer.scan_error = Some(error);
+                        }
                     }
                 }
                 Event::RoiExported(result) => {
                     self.importer.receiver = None;
                     self.importer.scan_progress = None;
+                    let elapsed = self
+                        .importer
+                        .scan_started
+                        .map_or(String::new(), |t| format!(" in {}s", t.elapsed().as_secs()));
                     self.importer.scan_started = None;
                     match result {
                         Ok(path) => {
+                            self.importer.log.append(&sundial::activity_log::Entry::info(
+                                format!("ROI export complete{elapsed}: {}", path.display()),
+                            ));
                             self.importer.notice.clear();
                             if let Some(roi) = self.importer.roi.as_mut() {
                                 roi.exported = Some(path);
                             }
                         }
-                        Err(error) => self.importer.notice = error,
+                        Err(error) => {
+                            self.importer.log.append(&sundial::activity_log::Entry::error(
+                                format!("ROI export error: {error}"),
+                            ));
+                            self.importer.notice = error;
+                        }
                     }
                 }
                 Event::PerkPrepared(prepared) => {
@@ -330,6 +376,9 @@ impl PackageAuthoringApp {
                 }
                 Event::ScanProgress(progress) => self.importer.scan_progress = Some(progress),
                 Event::Progress(slot, message) => {
+                    self.importer.log.append(&sundial::activity_log::Entry::info(
+                        format!("Step: {message}"),
+                    ));
                     match self
                         .importer
                         .importing
@@ -341,6 +390,11 @@ impl PackageAuthoringApp {
                     }
                 }
                 Event::Slot(slot, name) => {
+                    if let Some(name) = &name {
+                        self.importer.log.append(&sundial::activity_log::Entry::info(
+                            format!("Item started: {name}"),
+                        ));
+                    }
                     if let Some(entry) = self
                         .importer
                         .importing
@@ -383,10 +437,16 @@ impl PackageAuthoringApp {
                             self.importer.browser.anchor = None;
                             self.importer.scan_error = None;
                             self.importer.notice.clear();
+                            self.importer.log.append(&sundial::activity_log::Entry::info(
+                                format!("D2 scan complete: {} items", weapons.len()),
+                            ));
                             self.importer.weapons = weapons;
                             self.importer.selected.clear();
                         }
                         Err(error) => {
+                            self.importer.log.append(&sundial::activity_log::Entry::error(
+                                format!("D2 scan error: {error}"),
+                            ));
                             self.importer.scan_error = Some(error);
                             self.importer.notice.clear();
                         }
@@ -400,8 +460,38 @@ impl PackageAuthoringApp {
                     self.importer.cancel.store(false, Ordering::Relaxed);
                     self.importer.receiver = None;
                     self.importer.importing = None;
+                    let elapsed = self
+                        .importer
+                        .import_started
+                        .map_or(String::new(), |t| format!(" in {}s", t.elapsed().as_secs()));
                     self.importer.import_started = None;
                     self.importer.notice.clear();
+                    for error in &errors {
+                        self.importer.log.append(&sundial::activity_log::Entry::error(
+                            format!("Item failed: {error}"),
+                        ));
+                    }
+                    for path in &paths {
+                        self.importer.log.append(&sundial::activity_log::Entry::info(
+                            format!("Item saved: {}", path.display()),
+                        ));
+                    }
+                    self.importer.log.append(&sundial::activity_log::Entry::new(
+                        if cancelled {
+                            format!(
+                                "Import cancelled: {} added, {} failures{elapsed}",
+                                paths.len(),
+                                errors.len()
+                            )
+                        } else {
+                            format!(
+                                "Import complete: {} added, {} failures{elapsed}",
+                                paths.len(),
+                                errors.len()
+                            )
+                        },
+                        !errors.is_empty(),
+                    ));
                     self.importer.outcome = Some(Outcome {
                         added: paths.len(),
                         show_failures: paths.is_empty(),
@@ -964,6 +1054,10 @@ impl PackageAuthoringApp {
         self.importer.scan_error = None;
         self.importer.outcome = None;
         self.importer.notice.clear();
+        self.importer.log.append(&sundial::activity_log::Entry::info(format!(
+            "D2 scan started: {}",
+            modern.display()
+        )));
         let ctx = ctx.clone();
         thread::spawn(move || {
             let result = service::scan_cached(

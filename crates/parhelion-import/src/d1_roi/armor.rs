@@ -36,8 +36,8 @@ impl Source {
             self.report
                 .selected
                 .iter()
-                .all(|package| package.platform == 8),
-            "Armor discovery currently supports Xbox One Rise of Iron packages"
+                .all(|package| matches!(package.platform, 7 | 8)),
+            "Armor discovery requires Xbox One or PS4 Rise of Iron packages"
         );
         let (_, definitions) = self.table(0x80801933)?;
         let (_, strings) = self.table(0x808034C7)?;
@@ -249,6 +249,9 @@ impl Source {
         let mut components = Vec::new();
         for component in entity_data.array(0x20, 12, Some(0x80800715))? {
             let owner = entity_data.u32(component)?;
+            if matches!(owner, 0 | u32::MAX) {
+                continue;
+            }
             let resource = self.read(owner)?;
             let mut entry = json!({"owner":owner,"class":self.reference(owner)?});
             if self.reference(owner)? == 0x80800861 && resource.u64(24)? != 0 {
@@ -257,14 +260,20 @@ impl Source {
                 let class = resource.u32(at - 4)?;
                 entry["resource_class"] = json!(class);
                 if matches!(class, 0x80801A9C | 0x80801BF6) {
-                    let model = resource.u32(at + 0x1C4)?;
-                    let (mut report, streams) = self.model(model)?;
+                    let model = resource.u32(at + 0x15C)?;
+                    if matches!(model, 0 | u32::MAX) {
+                        continue;
+                    }
+                    let (mut report, streams) = self.model(model)
+                        .with_context(|| format!("model({model:08X})"))?;
                     report["component"] = json!(owner);
                     report["cloth"] = json!(class == 0x80801BF6);
                     if class == 0x80801BF6 {
-                        report["cloth_solver"] = self.cloth_solver(&resource, at, assets)?;
+                        report["cloth_solver"] = self.cloth_solver(&resource, at, assets)
+                            .with_context(|| format!("cloth_solver owner={owner:08X} at={at:#X}"))?;
                     }
-                    report["plates"] = self.plates(&resource, at, assets)?;
+                    report["plates"] = self.plates(&resource, at, assets)
+                        .with_context(|| format!("plates owner={owner:08X} at={at:#X} resource_len={}", resource.0.len()))?;
                     assets.extend(streams);
                     models.push(report);
                 }
@@ -276,6 +285,267 @@ impl Source {
         Ok((models, components))
     }
 
+    /// Dump raw art and assignment table content for diagnostic use.
+    /// Returns {art_row_count, art_rows_sample, assignment_count, assignment_sample}.
+    pub fn probe_art_tables(&self) -> Result<Value> {
+        let (art_tag, art) = self.table(0x808034D7)?;
+        let art_rows = art.array(8, 24, Some(0x80803433))?;
+        let (assignments_tag, assignment_data) = self.table(0x80803AAA)?;
+        let assign_rows = assignment_data.array(8, 8, Some(0x80803AA9))?;
+        // Sample first 10 art rows.
+        let mut art_sample = Vec::new();
+        for &row in art_rows.iter().take(10) {
+            art_sample.push(json!({
+                "row_offset": row,
+                "u32_0": art.u32(row).ok(),
+                "u32_4": art.u32(row + 4).ok(),
+                "u64_8": art.u64(row + 8).ok(),
+                "ref_u32_0": art.u32(row).ok().and_then(|t| self.reference(t).ok()),
+                "ref_u32_4": art.u32(row + 4).ok().and_then(|t| self.reference(t).ok()),
+            }));
+        }
+        // Sample first 10 assignment rows.
+        let mut assign_sample = Vec::new();
+        for &row in assign_rows.iter().take(10) {
+            let key = assignment_data.u32(row).ok();
+            let val = assignment_data.u32(row + 4).ok();
+            assign_sample.push(json!({
+                "row_offset": row,
+                "key": key,
+                "value": val,
+                "value_class": val.and_then(|t| if t >= 0x80800000 { self.reference(t).ok() } else { None }),
+            }));
+        }
+        // Walk first 3 armor items through the tables manually.
+        let armor_list = self.armor()?;
+        let mut walkthrough = Vec::new();
+        for item in armor_list.iter().take(3) {
+            let arrangement = item.arrangements.first().copied().unwrap_or(u16::MAX);
+            let row_opt = art_rows.get(usize::from(arrangement)).copied();
+            let mut entry = json!({"hash": item.hash, "name": item.name, "arrangement": arrangement, "row": row_opt});
+            if let Some(row) = row_opt {
+                let key_m = art.u32(row).ok();
+                let key_f = art.u32(row + 4).ok();
+                entry["key_masculine"] = json!(key_m);
+                entry["key_feminine"] = json!(key_f);
+                // Look up in assignments.
+                let mut assignments = std::collections::BTreeMap::new();
+                for &r in &assign_rows {
+                    if let (Ok(k), Ok(v)) = (assignment_data.u32(r), assignment_data.u32(r + 4)) {
+                        assignments.insert(k, v);
+                    }
+                }
+                let parent_m = key_m.and_then(|k| assignments.get(&k).copied());
+                let parent_f = key_f.and_then(|k| assignments.get(&k).copied());
+                entry["parent_masculine"] = json!(parent_m);
+                entry["parent_feminine"] = json!(parent_f);
+                // Follow parent → entity → first component owner.
+                if let Some(parent_tag) = parent_m {
+                    if parent_tag >= 0x80800000 {
+                        if let Ok(pdata) = self.read(parent_tag) {
+                            if let Ok(entity_tag) = pdata.u32(16) {
+                                entry["entity"] = json!(entity_tag);
+                                entry["entity_class"] = json!(self.reference(entity_tag).ok());
+                                if entity_tag >= 0x80800000 {
+                                    if let Ok(edata) = self.read(entity_tag) {
+                                        // Try component array at offset 0x20, stride 12, class 0x80800715.
+                                        let comps = edata.array(0x20, 12, Some(0x80800715));
+                                        entry["comp_array_ok"] = json!(comps.is_ok());
+                                        if let Ok(comp_rows) = comps {
+                                            entry["comp_count"] = json!(comp_rows.len());
+                                            // Report first component owner tag.
+                                            let first_owner = comp_rows.first().and_then(|&c| edata.u32(c).ok());
+                                            entry["first_owner"] = json!(first_owner);
+                                            entry["first_owner_class"] = json!(first_owner.and_then(|t| if t >= 0x80800000 { self.reference(t).ok() } else { Some(0) }));
+                                            // Probe first owner resource: check u64@24, pointer, class, model tag.
+                                            let mut owner_probes = Vec::new();
+                                            for &comp_offset in comp_rows.iter().take(3) {
+                                                if let Ok(owner_tag) = edata.u32(comp_offset) {
+                                                    if matches!(owner_tag, 0 | u32::MAX) { continue; }
+                                                    if let Ok(res) = self.read(owner_tag) {
+                                                        let ptr64 = res.u64(24).ok().unwrap_or(0);
+                                                        let ptr_at = res.pointer(24).ok();
+                                                        let res_class = ptr_at.and_then(|a| if a >= 4 { res.u32(a - 4).ok() } else { None });
+                                                        let model_tag = ptr_at.and_then(|a| res.u32(a + 0x1C4).ok());
+                                                        let hex: Vec<String> = res.0.iter().take(64).collect::<Vec<_>>().chunks(4).map(|c| c.iter().map(|b| format!("{b:02X}")).collect::<String>()).collect();
+                                                        // Scan all u32-aligned values in resource that look like Tiger tags;
+                                                        // resolve class for each to find the model (0x80801AB5).
+                                                        let tag_offsets: Vec<Value> = (0..res.0.len().saturating_sub(3))
+                                                            .step_by(4)
+                                                            .filter_map(|o| {
+                                                                let v = u32::from_le_bytes(res.0[o..o+4].try_into().ok()?);
+                                                                if v >= 0x80800000 && v < 0x81200000 {
+                                                                    let class = self.reference(v).ok();
+                                                                    Some(json!({"offset":o,"value":v,"class":class}))
+                                                                } else { None }
+                                                            })
+                                                            .collect();
+                                                        owner_probes.push(json!({
+                                                            "owner": owner_tag,
+                                                            "bytes": res.0.len(),
+                                                            "u64_at_24": ptr64,
+                                                            "pointer_24": ptr_at,
+                                                            "resource_class": res_class,
+                                                            "model_tag": model_tag,
+                                                            "model_class": model_tag.and_then(|t| if t >= 0x80800000 { self.reference(t).ok() } else { None }),
+                                                            "hex_first_64": hex,
+                                                            "tag_offsets": tag_offsets,
+                                                        }));
+                                                    }
+                                                }
+                                            }
+                                            entry["owner_probes"] = json!(owner_probes);
+                                        }
+                                        // First 32 bytes of entity hex.
+                                        let hex: Vec<String> = edata.0.iter().take(32).collect::<Vec<_>>().chunks(4).map(|c| c.iter().map(|b| format!("{b:02X}")).collect::<String>()).collect();
+                                        entry["entity_hex_first_32"] = json!(hex);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            walkthrough.push(entry);
+        }
+        // Dump the parent objects that armor_bodies actually uses for the first 3 armor items.
+        let mut parent_dump_tags: Vec<u32> = walkthrough.iter()
+            .flat_map(|item| {
+                [item["parent_masculine"].as_u64(), item["parent_feminine"].as_u64()]
+            })
+            .filter_map(|v| v.map(|n| n as u32))
+            .filter(|&t| t >= 0x80800000)
+            .collect::<Vec<_>>();
+        parent_dump_tags.sort();
+        parent_dump_tags.dedup();
+        parent_dump_tags.truncate(4);
+        let mut parent_dumps = Vec::new();
+        for parent_tag in parent_dump_tags {
+            if let Ok(data) = self.read(parent_tag) {
+                let hex: Vec<String> = data.0.iter().take(64)
+                    .collect::<Vec<_>>()
+                    .chunks(4)
+                    .map(|c| c.iter().map(|b| format!("{b:02X}")).collect::<String>())
+                    .collect();
+                parent_dumps.push(json!({
+                    "tag": parent_tag,
+                    "class": self.reference(parent_tag).ok(),
+                    "bytes": data.0.len(),
+                    "hex_first_64": hex,
+                    "u32_at_0": data.u32(0).ok(),
+                    "u32_at_4": data.u32(4).ok(),
+                    "u32_at_8": data.u32(8).ok(),
+                    "u32_at_12": data.u32(12).ok(),
+                    "u32_at_16": data.u32(16).ok(),
+                    "u32_at_20": data.u32(20).ok(),
+                    "u32_at_24": data.u32(24).ok(),
+                    "u64_at_16": data.u64(16).ok(),
+                    "u64_at_24": data.u64(24).ok(),
+                }));
+            }
+        }
+        Ok(json!({
+            "art_tag": art_tag, "art_row_count": art_rows.len(), "art_rows_sample": art_sample,
+            "assignments_tag": assignments_tag, "assignment_count": assign_rows.len(),
+            "assignment_sample": assign_sample,
+            "armor_walkthrough": walkthrough,
+            "parent_object_dumps": parent_dumps,
+        }))
+    }
+
+    /// Probe geometry layouts of the first N armor items and return raw diagnostic JSON.
+    /// Intended for diagnostic examples and integration tests; not for production use.
+    pub fn probe_geometry(&self, sample: usize) -> Result<Value> {
+        let armor_list = self.armor()?;
+        let mut seen_slots = std::collections::BTreeSet::new();
+        let mut sampled = Vec::new();
+        for item in &armor_list {
+            if seen_slots.insert(item.slot) {
+                sampled.push(item.clone());
+            }
+            if sampled.len() >= sample {
+                break;
+            }
+        }
+        let mut results = Vec::new();
+        for item in &sampled {
+            let mut assets = BTreeMap::new();
+            let bodies = match self.armor_bodies(item, &mut assets) {
+                Ok(b) => b,
+                Err(e) => {
+                    results.push(json!({"hash":item.hash,"name":item.name,"slot":item.slot,
+                        "error":format!("{e:#}")}));
+                    continue;
+                }
+            };
+            let mut body_reports = Vec::new();
+            for body in &bodies {
+                let entity = body["entity"].as_u64().context("entity field")? as u32;
+                let entity_data = self.read(entity)?;
+                let entity_class = self.reference(entity)?;
+                let comp_array = entity_data.array(0x20, 12, Some(0x80800715));
+                let comp_ok = comp_array.is_ok();
+                let mut comp_reports = Vec::new();
+                if let Ok(rows) = comp_array {
+                    for &comp in &rows {
+                        let owner = entity_data.u32(comp)?;
+                        if matches!(owner, 0 | u32::MAX) {
+                            continue;
+                        }
+                        let owner_class = self.reference(owner)?;
+                        if owner_class != 0x80800861 {
+                            comp_reports.push(json!({"owner":owner,"owner_class":owner_class,"skipped":true}));
+                            continue;
+                        }
+                        let resource = self.read(owner)?;
+                        if resource.u64(24)? == 0 {
+                            comp_reports.push(json!({"owner":owner,"owner_class":owner_class,"null_pointer":true}));
+                            continue;
+                        }
+                        let at = resource.pointer(24)?;
+                        let res_class = resource.u32(at - 4)?;
+                        let model_tag = if matches!(res_class, 0x80801A9C | 0x80801BF6) {
+                            resource.u32(at + 0x15C).ok()
+                        } else {
+                            None
+                        };
+                        let model_class = match model_tag {
+                            Some(t) if !matches!(t, 0 | u32::MAX) => {
+                                Some(self.reference(t)?)
+                            }
+                            _ => None,
+                        };
+                        let plate_probe = resource.array(at + 0x1A8, 0x30, Some(0x80801B12));
+                        let plate_probes = json!([{"offset":"at+0x1A8","stride":0x30,"ok":plate_probe.is_ok(),
+                            "rows":plate_probe.as_ref().map(|r|r.len()).ok()}]);
+                        // Cloth solver tag and Havok magic check.
+                        let mut cloth_info = json!(null);
+                        if matches!(res_class, 0x80801BF6) {
+                            if let Ok(solver_tag) = resource.u32(at + 0x8C0) {
+                                if let Ok(data) = self.read(solver_tag) {
+                                    let magic_ok = data.0.len() >= 8
+                                        && data.0[0..8] == [0x57,0xE0,0xE0,0x57,0x10,0xC0,0xC0,0x10];
+                                    let sdk_ok = data.0.len() >= 55
+                                        && data.0[40..55] == *b"hk_2012.2.0-r1\0";
+                                    cloth_info = json!({"tag":solver_tag,"magic_ok":magic_ok,"sdk_ok":sdk_ok,
+                                        "header":data.0.get(0..16).map(hex::encode)});
+                                }
+                            }
+                        }
+                        comp_reports.push(json!({"owner":owner,"owner_class":owner_class,
+                            "resource_class":res_class,"model_tag":model_tag.unwrap_or(0),"model_class":model_class,
+                            "plate_probes":plate_probes,"cloth":cloth_info}));
+                    }
+                }
+                body_reports.push(json!({"body":body["body"],"entity_class":entity_class,
+                    "entity_class_ok":entity_class==0x80800734,"component_array_ok":comp_ok,
+                    "components":comp_reports}));
+            }
+            results.push(json!({"hash":item.hash,"name":item.name,"slot":item.slot,"bodies":body_reports}));
+        }
+        Ok(json!(results))
+    }
+
     fn plates(
         &self,
         resource: &Payload,
@@ -283,9 +553,11 @@ impl Source {
         assets: &mut BTreeMap<u32, Payload>,
     ) -> Result<Value> {
         let mut result = Vec::new();
-        // Xbox One's component descriptors expand its plate rows to 56 bytes.
-        for row in resource.array(at + 0x220, 56, Some(0x80801B12))? {
-            let tag = resource.u32(row + 48)?;
+        for row in resource.array(at + 0x1A8, 0x30, Some(0x80801B12))? {
+            let tag = resource.u32(row + 0x28)?;
+            if matches!(tag, 0 | u32::MAX) {
+                continue;
+            }
             ensure!(
                 self.reference(tag)? == 0x80801C3C,
                 "Unexpected armor plate set"
@@ -305,6 +577,9 @@ impl Source {
                 let mut placements = Vec::new();
                 for row in plate.array(0x10, 20, Some(0x80800163))? {
                     let texture = plate.u32(row)?;
+                    if matches!(texture, 0 | u32::MAX) {
+                        continue;
+                    }
                     let metadata = self.texture(texture, assets)?;
                     let data = metadata["data"].as_u64().context("Plate texture data")?;
                     placements.push(json!({"texture":texture,"data":data,"descriptor":metadata,

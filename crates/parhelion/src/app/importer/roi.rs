@@ -30,6 +30,10 @@ impl PackageAuthoringApp {
         self.importer.scan_error = None;
         self.importer.roi = None;
         self.importer.notice.clear();
+        self.importer.log.append(&sundial::activity_log::Entry::info(format!(
+            "ROI scan started: {}",
+            folder.display()
+        )));
         let ctx = ctx.clone();
         thread::spawn(move || {
             let result = (|| -> anyhow::Result<Inspected> {
@@ -302,9 +306,14 @@ impl PackageAuthoringApp {
         let options = d1_roi::NativeOptions {
             xg_library: self.importer.settings.d1_xg_library.clone(),
         };
+        self.importer.log.append(&sundial::activity_log::Entry::info(format!(
+            "ROI weapon import started: {} ({:08X})",
+            item.name, item.hash
+        )));
         self.run_import(ctx, vec![item.name.clone()], move |_, progress| {
             let model = service::model_directory(&root.join("models"), &item.name, item.hash)?;
             let output = service::reserve_assets(&model, "d1-roi")?.join("import");
+            progress("Opening Rise of Iron source".to_owned());
             let source = d1_roi::Source::open(&folder, |_, _| {})?;
             source.prepare_weapon_on_base(item.hash, &native, &bases, &output, &options, progress)
         });
@@ -362,11 +371,17 @@ impl PackageAuthoringApp {
             .map(|donor| serde_json::json!({"hash":donor.hash,"name":donor.name,"bucket_hash":donor.bucket_hash,
                 "class_type":self.catalog.as_ref().and_then(|catalog|catalog.item_class_type(donor.hash)),"collection_backed":donor.collection_backed})).collect::<Vec<_>>();
         let donors = serde_json::json!({"gear":gear});
-        let names = selected.iter().map(|item| item.name.clone()).collect();
+        let names: Vec<String> = selected.iter().map(|item| item.name.clone()).collect();
+        self.importer.log.append(&sundial::activity_log::Entry::info(format!(
+            "ROI armor import started: {} items: {}",
+            names.len(),
+            names.join(", ")
+        )));
         self.run_import(ctx, names, move |index, progress| {
             let item = &selected[index];
             let model = service::model_directory(&root.join("models"), &item.name, item.hash)?;
             let output = service::reserve_assets(&model, "d1-roi")?.join("import");
+            progress("Opening Rise of Iron source".to_owned());
             let source = d1_roi::Source::open(&folder, |_, _| {})?;
             source.prepare_armor(item.hash, &native, &donors, &output, &options, progress)
         });
@@ -381,6 +396,11 @@ impl PackageAuthoringApp {
         };
         let selected: Vec<_> = inspected.selected.iter().copied().collect();
         let Ok(root) = data_root() else { return };
+        self.importer.log.append(&sundial::activity_log::Entry::info(format!(
+            "ROI export started: {} items from {}",
+            selected.len(),
+            folder.display()
+        )));
         let (sender, receiver) = mpsc::channel();
         self.importer.receiver = Some(receiver);
         self.importer.scan_started = Some(Instant::now());
@@ -397,6 +417,8 @@ impl PackageAuthoringApp {
                         total: selected.len(),
                         weapons: 0,
                     }));
+                    ctx.request_repaint();
+                    let _ = sender.send(Event::Progress(0, format!("Exporting {item:08X}")));
                     ctx.request_repaint();
                     source.export_armor(*item, &output.join(format!("{item:08X}")))?;
                 }

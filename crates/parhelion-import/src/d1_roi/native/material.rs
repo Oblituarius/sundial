@@ -130,8 +130,10 @@ impl Assembly<'_> {
             simulated,
             layout,
         } = draw;
+        let ps4_source = self.source.platform() == 7;
+        let expected_class = if ps4_source { 0x80801AD7 } else { 0x80801C32 };
         ensure!(
-            self.source.reference(tag)? == 0x80801C32,
+            self.source.reference(tag)? == expected_class,
             "Source material class differs"
         );
         let source = self.source.read(tag)?;
@@ -173,6 +175,46 @@ impl Assembly<'_> {
                 4 => (Stage::Pixel, 1),
                 _ => unreachable!(),
             };
+            if ps4_source {
+                // PS4: GCN shaders are not translatable to DXBC; textures are bound at
+                // draw time by TFX opcodes, not in static material arrays. Apply only the
+                // constant vectors (inline cbuffer) and leave the shader slot null.
+                let values = vectors(&source, from + 0x58)?;
+                let constants = vectors(&source, from + 0x38)?;
+                let mut program = expression::translate(
+                    &[],
+                    constants,
+                    &expression::Inputs {
+                        globals: &self.globals,
+                        dye: dye_data.as_ref(),
+                        secondary: dye % 2 != 0,
+                        plates: &equipment.plates,
+                        detail: &detail,
+                        objects: 0,
+                        object_channels: &self.object_channels,
+                        outputs: values.len() / 16,
+                        samplers: 0,
+                        stage: packed,
+                        reticle: pass == 16,
+                    },
+                )?;
+                program.initialize(&values)?;
+                array(&mut out, to + 8, 0x80807211, &[], 8)?;
+                put(&mut out, to + 0x18, &0u64.to_le_bytes())?;
+                array(&mut out, to + 0x20, 0x80800009, &program.code, 1)?;
+                array(&mut out, to + 0x30, 0x80800090, &program.constants, 16)?;
+                array(&mut out, to + 0x40, 0x808073F3, &[], 16)?;
+                array(&mut out, to + 0x50, 0x80800090, &values, 16)?;
+                put(&mut out, to + 0x70, &0u32.to_le_bytes())?;
+                out[to + 0x74] = if values.is_empty() { 0 } else { 0x10 };
+                put(
+                    &mut out,
+                    to + 0x80,
+                    &(if values.is_empty() { u32::MAX } else { 0 }).to_le_bytes(),
+                )?;
+                evidence.push(json!({"stage":stage,"object_inputs":0,"defaulted_source_globals":program.defaulted_globals,"ps4_gcn_shader":shader}));
+                continue;
+            }
             let StageInputs {
                 mut textures,
                 samplers,

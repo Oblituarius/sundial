@@ -181,6 +181,10 @@ impl Source {
         assets: &mut BTreeMap<u32, Payload>,
     ) -> Result<Value> {
         let tag = owner.u32(resource + 0x8C0)?;
+        ensure!(
+            !matches!(tag, 0 | u32::MAX),
+            "Cloth solver tag is null for component at {resource:#X}"
+        );
         let data = self.read(tag)?;
         ensure!(
             data.bytes::<8>(0)? == [0x57, 0xE0, 0xE0, 0x57, 0x10, 0xC0, 0xC0, 0x10]

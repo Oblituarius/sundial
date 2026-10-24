@@ -24,8 +24,8 @@ pub struct Weapon {
 impl Source {
     pub fn weapons(&self) -> Result<Vec<Weapon>> {
         ensure!(
-            self.report.selected.iter().all(|p| p.platform == 8),
-            "Weapon discovery currently supports Xbox One Rise of Iron packages"
+            self.report.selected.iter().all(|p| matches!(p.platform, 7 | 8)),
+            "Weapon discovery requires Xbox One or PS4 Rise of Iron packages"
         );
         let (_, definitions) = self.table(0x80801933)?;
         let (_, strings) = self.table(0x808034C7)?;
@@ -166,6 +166,10 @@ impl Source {
     /// Export executable talent references and every selectable source model.
     /// This provenance bundle does not claim native runtime compatibility.
     pub fn export_weapon(&self, hash: u32, output: &Path) -> Result<PathBuf> {
+        ensure!(
+            self.platform() != 7,
+            "PS4 weapon export is not yet supported"
+        );
         let output = self.output(output)?;
         let item = self
             .weapons()?

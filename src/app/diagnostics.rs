@@ -79,6 +79,7 @@ pub(super) fn build_report(context: &ReportContext<'_>) -> String {
     report.push_str("\n\n");
 
     activity::append_parhelion_log(&mut report);
+    activity::append_importer_log(&mut report);
 
     report
 }
@@ -112,6 +113,7 @@ pub(super) fn build_startup_failure_report(install_path: Option<&Path>, error: &
         report.push_str("selected_install = unavailable\n\n");
     }
     activity::append_parhelion_log(&mut report);
+    activity::append_importer_log(&mut report);
     report
 }
 

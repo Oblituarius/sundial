@@ -1,5 +1,6 @@
-//! Xbox texture storage translated without recompressing its authored mip levels.
+//! D1 ROI texture storage translated without recompressing its authored mip levels.
 use super::*;
+mod ps4;
 mod xg;
 
 pub(super) struct Texture {
@@ -47,6 +48,9 @@ fn mip_major(face_major: &[u8], lengths: &[(usize, usize)], layers: usize) -> Re
 
 impl Source {
     pub(super) fn linear_texture(&self, tag: u32, library: Option<&Path>) -> Result<Texture> {
+        if self.platform() == 7 {
+            return self.linear_texture_ps4(tag);
+        }
         let mut assets = BTreeMap::new();
         let metadata = self.texture(tag, &mut assets)?;
         let header = assets.get(&tag).context("Source texture header")?;
@@ -105,6 +109,36 @@ impl Source {
             width,
             height,
             layers,
+            mips,
+            bytes,
+        })
+    }
+
+    fn linear_texture_ps4(&self, tag: u32) -> Result<Texture> {
+        let mut assets = BTreeMap::new();
+        let metadata = self.texture(tag, &mut assets)?;
+        let header = assets.get(&tag).context("Source PS4 texture header")?;
+        // Assemble raw bytes: high-res mips first (if streamed), then base data.
+        let mut raw = Vec::new();
+        if let Some(high) = metadata["high_mips"].as_u64() {
+            raw.extend_from_slice(&assets[&(high as u32)].0);
+        }
+        let data = metadata["data"].as_u64().context("Source PS4 texture storage")? as u32;
+        raw.extend_from_slice(&assets[&data].0);
+        // PS4 T# fields
+        let gcn = ps4::gcn_format(&header.0)?;
+        let format = ps4::gcn_to_dxgi(gcn)
+            .ok_or_else(|| anyhow::anyhow!("PS4 GCN format {gcn:?} has no DXGI mapping"))?;
+        let width = header.u16(0x28)?;
+        let height = header.u16(0x2A)?;
+        let mips = header.u8(0x31)?;
+        let dxgi = ps4::dxgi_fmt(format)?;
+        let bytes = ps4::deswizzle_chain(&raw, width, height, mips, dxgi)?;
+        Ok(Texture {
+            format,
+            width,
+            height,
+            layers: 1,
             mips,
             bytes,
         })

@@ -28,11 +28,14 @@ impl Source {
         options: &NativeOptions,
         progress: &mut dyn FnMut(String),
     ) -> Result<PathBuf> {
+        progress("Verifying source integrity".to_owned());
         let output = self.output(output)?;
+        progress(format!("Exporting source weapon {hash:08X}"));
         // Check each base's rigs against one export before converting on it, since the rigs
         // decide most refusals and a conversion reads the whole source again.
         let export = self.export_weapon(hash, &output.join("source"))?;
         let source: Value = serde_json::from_slice(&fs::read(export)?)?;
+        progress(format!("Checking rig compatibility ({} base candidates)", bases.len()));
         let mut reader = Reader::discovery(native, &output.join("rig-checks"), false)?;
         let mut refused = Vec::new();
         for &base in bases {
@@ -75,11 +78,13 @@ impl Source {
         options: &NativeOptions,
         progress: &mut dyn FnMut(String),
     ) -> Result<PathBuf> {
+        progress("Verifying source integrity".to_owned());
         let output = self.output(output)?;
         let output = crate::io::outside(
             &output,
             native.parent().context("Native installation root")?,
         )?;
+        progress(format!("Reading investment tables for {hash:08X}"));
         let weapon = self
             .weapons()?
             .into_iter()

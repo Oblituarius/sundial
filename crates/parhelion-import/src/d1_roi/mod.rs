@@ -213,6 +213,17 @@ impl Source {
         &self.report
     }
 
+    pub fn platform(&self) -> u16 {
+        self.report.selected.first().map_or(0, |h| h.platform)
+    }
+
+    /// Detile a texture tag and return (dxgi_format, width, height, mips, linearised_byte_count).
+    /// Used by diagnostic examples and integration tests; for production use `prepare_*` methods.
+    pub fn probe_texture(&self, tag: u32) -> Result<(u32, u16, u16, u8, usize)> {
+        let t = self.linear_texture(tag, None)?;
+        Ok((t.format, t.width, t.height, t.mips, t.bytes.len()))
+    }
+
     pub fn classes(&self, class: u32) -> Vec<u32> {
         self.packages
             .iter()
@@ -223,6 +234,35 @@ impl Source {
                     .iter()
                     .enumerate()
                     .filter(move |(_, entry)| entry.reference == class)
+                    .map(move |(index, _)| 0x80800000 + (u32::from(id) << 13) + index as u32)
+            })
+            .collect()
+    }
+
+    /// Count all (file_type, file_subtype) pairs across selected packages.
+    pub fn file_type_frequencies(&self) -> BTreeMap<(u8, u8), usize> {
+        let mut map = BTreeMap::new();
+        for package in self.packages.values() {
+            for entry in package.reader.entries() {
+                *map.entry((entry.file_type, entry.file_subtype)).or_default() += 1;
+            }
+        }
+        map
+    }
+
+    /// Return tags with the given file_type and file_subtypes (diagnostic use).
+    pub fn tags_by_file_type(&self, file_type: u8, file_subtypes: &[u8]) -> Vec<u32> {
+        self.packages
+            .iter()
+            .flat_map(|(&id, package)| {
+                package
+                    .reader
+                    .entries()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, entry)| {
+                        entry.file_type == file_type && file_subtypes.contains(&entry.file_subtype)
+                    })
                     .map(move |(index, _)| 0x80800000 + (u32::from(id) << 13) + index as u32)
             })
             .collect()

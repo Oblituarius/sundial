@@ -119,6 +119,10 @@ impl Header {
             ensure!(self.patch == 0, "Unpatchable package has a nonzero patch");
             return Ok((family, Some(generation.parse()?)));
         }
+        if let Some(family) = base.strip_suffix("_unpatchable") {
+            ensure!(self.patch == 0, "Unpatchable package has a nonzero patch");
+            return Ok((family, Some(0)));
+        }
         Ok((base, None))
     }
 

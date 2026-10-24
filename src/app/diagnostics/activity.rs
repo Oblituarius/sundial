@@ -8,14 +8,28 @@ const MAX_ACTIVITY_BYTES: u64 = 256 * 1024;
 
 pub(super) fn append_parhelion_log(report: &mut String) {
     if let Some(path) = crate::activity_log::Product::Parhelion.log_path() {
-        append_at(report, &path);
+        append_log(report, &path, "Parhelion Activity", "Parhelion Activity Unavailable");
     }
 }
 
-fn append_at(report: &mut String, path: &Path) {
+pub(super) fn append_importer_log(report: &mut String) {
+    if let Some(path) = crate::activity_log::Product::ParhImporter.log_path() {
+        append_log(
+            report,
+            &path,
+            "Parhelion Importer Activity",
+            "Parhelion Importer Activity Unavailable",
+        );
+    }
+}
+
+fn append_log(report: &mut String, path: &Path, section: &str, unavailable: &str) {
+    let separator = "-".repeat(section.len());
     match read_tail(path) {
         Ok((text, truncated)) if !text.trim().is_empty() => {
-            report.push_str("Recent Parhelion Activity (Oldest First)\n---------------------------------------\n");
+            report.push_str(&format!(
+                "Recent {section} (Oldest First)\n{separator}\n"
+            ));
             report.push_str(&format!("source = {}\n", path.display()));
             if truncated {
                 report.push_str("Earlier entries omitted. Showing the latest 256 KiB.\n");
@@ -26,7 +40,11 @@ fn append_at(report: &mut String, path: &Path) {
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => {
-            report.push_str(&format!("Parhelion Activity Unavailable\n-----------------------------\nsource = {}\nerror = {error}\n\n", path.display()));
+            let unavail_sep = "-".repeat(unavailable.len());
+            report.push_str(&format!(
+                "{unavailable}\n{unavail_sep}\nsource = {}\nerror = {error}\n\n",
+                path.display()
+            ));
         }
     }
 }
@@ -78,7 +96,12 @@ mod tests {
     fn unreadable_activity_does_not_discard_the_report() {
         let directory = TestDirectory::new("diagnostic-parhelion-read-error");
         let mut report = "Sundial report\n".to_owned();
-        append_at(&mut report, &directory.0);
+        append_log(
+            &mut report,
+            &directory.0,
+            "Parhelion Activity",
+            "Parhelion Activity Unavailable",
+        );
         assert!(report.starts_with("Sundial report\n"));
         assert!(report.contains("Parhelion Activity Unavailable"));
     }

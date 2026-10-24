@@ -84,20 +84,32 @@ impl Source {
         options: &NativeOptions,
         progress: &mut dyn FnMut(String),
     ) -> Result<PathBuf> {
+        progress("Verifying source integrity".to_owned());
         let output = self.output(output)?;
         let output = crate::io::outside(
             &output,
             native.parent().context("Native installation root")?,
         )?;
+        progress(format!("Reading investment tables for {item:08X}"));
         let armor = self
             .armor()?
             .into_iter()
             .find(|a| a.hash == item)
             .context("Selected source armor is missing")?;
+        progress(format!("Reading body components for {}", armor.name));
         let mut assets = BTreeMap::new();
         let bodies = self.armor_bodies(&armor, &mut assets)?;
+        progress(format!("Reading ornaments for {}", armor.name));
         let ornaments = self.ornaments(&armor, &mut assets)?;
+        progress(format!("Reading dye data for {}", armor.name));
         let dyes = self.dyes(armor.definition, &mut assets)?;
+        progress(format!(
+            "Source: {} body variants, {} ornaments, {} dye sets, {} assets",
+            bodies.len(),
+            ornaments.len(),
+            dyes.len(),
+            assets.len()
+        ));
         let namespace = format!("parhelion.import.d1_roi.{item:08x}");
         let identity = crate::d2_mot::batch::identity(&namespace)?;
         let private_item = u32::from_str_radix(
@@ -107,7 +119,9 @@ impl Source {
                 .trim_start_matches("0x"),
             16,
         )?;
+        progress("Opening native D2 packages".to_owned());
         let mut assembly = Assembly::new(self, native, &output.join("graph"), options, None)?;
+        progress("Searching for native armor donor".to_owned());
         let mut selected = None;
         for donor in donors["gear"]
             .as_array()
@@ -167,6 +181,7 @@ impl Source {
             "No native armor template has the required class, slot and appearance choices",
         )?;
         let donor_hash = number(&donor["hash"])?;
+        progress(format!("Donor: {donor_hash:08X}"));
         progress(format!("Converting {}", armor.name));
         let mut reference = assembly.armor_graph(
             &armor,

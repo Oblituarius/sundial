@@ -52,6 +52,7 @@ impl Entry {
 pub enum Product {
     Sundial,
     Parhelion,
+    ParhImporter,
 }
 
 impl Product {
@@ -60,6 +61,7 @@ impl Product {
             directory.join("logs").join(match self {
                 Self::Sundial => "sundial.log",
                 Self::Parhelion => "parhelion.log",
+                Self::ParhImporter => "parhelion-importer.log",
             })
         })
     }

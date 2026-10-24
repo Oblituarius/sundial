@@ -32,12 +32,24 @@ impl Source {
             "Unexpected texture header {tag:08X}"
         );
         let header = self.read(tag)?;
-        ensure!(
-            header.u32(0x2C)? == 0xBEEFCAFE,
-            "Unsupported Xbox texture descriptor {tag:08X}"
-        );
-        let width = header.u16(0x30)?;
-        let height = header.u16(0x32)?;
+        let ps4 = self.platform() == 7;
+        if ps4 {
+            // PS4 GCN T# is 32 bytes; BEEFCAFE sits at +0x24 (in the T# padding).
+            ensure!(
+                header.0.len() >= 0x2A && header.u32(0x24)? == 0xBEEFCAFE,
+                "Unsupported PS4 texture descriptor {tag:08X}"
+            );
+        } else {
+            ensure!(
+                header.u32(0x2C)? == 0xBEEFCAFE,
+                "Unsupported Xbox texture descriptor {tag:08X}"
+            );
+        }
+        let (width, height) = if ps4 {
+            (header.u16(0x28)?, header.u16(0x2A)?)
+        } else {
+            (header.u16(0x30)?, header.u16(0x32)?)
+        };
         ensure!(width > 0 && height > 0, "Empty source texture dimensions");
         let buffer = self
             .package(entry.reference)?
@@ -61,23 +73,33 @@ impl Source {
             assets.insert(buffer.reference, self.read(buffer.reference)?);
             Some(buffer.reference)
         } else {
+            // Xbox: raw data in file_type 1 or 3. PS4: file_type 5 for base mips.
             ensure!(
-                matches!(buffer.file_type, 1 | 3) && buffer.file_subtype == entry.file_subtype,
-                "Unsupported texture payload"
+                matches!(buffer.file_type, 1 | 3 | 5) && buffer.file_subtype == entry.file_subtype,
+                "Unsupported texture payload (file_type={}, expected 1/3/5)",
+                buffer.file_type
             );
             None
         };
-        let report = json!({"tag":tag,"data":entry.reference,"high_mips":high_mips,"format":header.u32(0)?,"width":width,"height":height,
-            "depth":header.u16(0x34)?,"layers":header.u16(0x36)?,"tile_mode":header.u32(4)?,"mips":header.u8(0x39)?});
+        let report = if ps4 {
+            json!({"tag":tag,"data":entry.reference,"high_mips":high_mips,"format":0u32,"width":width,"height":height,
+                "depth":1u16,"layers":1u16,"tile_mode":0u32,"mips":header.u8(0x31)?})
+        } else {
+            json!({"tag":tag,"data":entry.reference,"high_mips":high_mips,"format":header.u32(0)?,"width":width,"height":height,
+                "depth":header.u16(0x34)?,"layers":header.u16(0x36)?,"tile_mode":header.u32(4)?,"mips":header.u8(0x39)?})
+        };
         assets.insert(entry.reference, self.read(entry.reference)?);
         assets.insert(tag, header);
         Ok(report)
     }
 
     pub(super) fn material(&self, tag: u32, assets: &mut BTreeMap<u32, Payload>) -> Result<Value> {
+        let ps4 = self.platform() == 7;
+        let expected_class = if ps4 { 0x80801AD7 } else { 0x80801C32 };
         ensure!(
-            self.reference(tag)? == 0x80801C32,
-            "Unsupported Xbox material class for {tag:08X}"
+            self.reference(tag)? == expected_class,
+            "Unsupported {} material class for {tag:08X}",
+            if ps4 { "PS4" } else { "Xbox" }
         );
         let data = self.read(tag)?;
         let mut stages = Vec::new();
@@ -93,6 +115,13 @@ impl Source {
                 continue;
             }
             let program = self.read(shader)?;
+            if ps4 {
+                // PS4 GCN shaders — no DXBC, no readable TFX code array.
+                // Textures/samplers are empty arrays; bound at draw time by TFX opcodes.
+                stages.push(json!({"stage":name,"shader":shader,"shader_class":self.reference(shader)?,"textures":[],"samplers":[],"tfx":[],"code_bytes":0}));
+                assets.insert(shader, program);
+                continue;
+            }
             let code = program.array(8, 1, Some(0x80800009))?;
             let start = *code.first().context("Empty shader program")?;
             ensure!(

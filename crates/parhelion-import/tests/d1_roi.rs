@@ -7,9 +7,20 @@ use std::{env, fs, path::Path};
 use tiger_pkg::{DestinyVersion, TagHash, Version};
 
 fn package(path: &Path, patch: u16, language: u16, block_patch: u16, payload: &[u8]) {
+    package_platform(path, 8, patch, language, block_patch, payload);
+}
+
+fn package_platform(
+    path: &Path,
+    platform: u16,
+    patch: u16,
+    language: u16,
+    block_patch: u16,
+    payload: &[u8],
+) {
     let mut data = vec![0u8; 0x200 + payload.len()];
     data[..2].copy_from_slice(&24u16.to_le_bytes());
-    data[2..4].copy_from_slice(&8u16.to_le_bytes());
+    data[2..4].copy_from_slice(&platform.to_le_bytes());
     data[4..6].copy_from_slice(&0x812u16.to_le_bytes());
     data[0x20..0x22].copy_from_slice(&patch.to_le_bytes());
     data[0x22..0x24].copy_from_slice(&language.to_le_bytes());
@@ -126,6 +137,24 @@ fn unpatchable_generations_keep_index_and_storage_together() -> Result<()> {
         b"wrong identity",
     );
     ensure!(Source::open(&root, |_, _| {}).is_err());
+
+    // Test _unpatchable naming convention (alias for generation 0)
+    let root2 = temp.path().join("source2");
+    fs::create_dir(&root2)?;
+    package(&root2.join("xboxone_fixture_unp3_0.pkg"), 0, 0, 0, b"generation 3");
+    package(&root2.join("xboxone_fixture_unpatchable_0.pkg"), 0, 0, 0, b"generation 0 alias");
+    let mut data = fs::read(&root2.join("xboxone_fixture_unp3_0.pkg"))?;
+    data[0x10..0x18].copy_from_slice(&(55707u64 * 100).to_le_bytes());
+    data[0x18..0x1C].copy_from_slice(&55707u32.to_le_bytes());
+    fs::write(&root2.join("xboxone_fixture_unp3_0.pkg"), data)?;
+    data = fs::read(&root2.join("xboxone_fixture_unpatchable_0.pkg"))?;
+    data[0x10..0x18].copy_from_slice(&(52553u64 * 100).to_le_bytes());
+    data[0x18..0x1C].copy_from_slice(&52553u32.to_le_bytes());
+    fs::write(&root2.join("xboxone_fixture_unpatchable_0.pkg"), data)?;
+    let source2 = Source::open(&root2, |_, _| {})?;
+    // unp3 (gen 3) should win over unpatchable (gen 0) since 3 > 0
+    ensure!(source2.read(0x81824000)?.0 == b"generation 3");
+
     Ok(())
 }
 
@@ -288,7 +317,7 @@ fn mounted_roi_armor_exports_both_bodies_and_original_referenced_streams() -> Re
                 }
                 if matches!(class, 0x80801A9C | 0x80801BF6) {
                     models.insert(u32::from_le_bytes(
-                        raw[offset + 0x1C4..offset + 0x1C8].try_into()?,
+                        raw[offset + 0x15C..offset + 0x160].try_into()?,
                     ));
                 }
             }
@@ -318,5 +347,53 @@ fn mounted_roi_armor_exports_both_bodies_and_original_referenced_streams() -> Re
             "profile":"release", "native_conversion":false, "slots":slots, "exports":exports
         }))?,
     )?;
+    Ok(())
+}
+
+#[test]
+fn ps4_packages_pass_discovery_gate_and_block_export() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().join("source");
+    fs::create_dir_all(&root)?;
+    package_platform(
+        &root.join("ps4_fixture_0812_en_0.pkg"),
+        7,
+        0,
+        0,
+        0,
+        b"ps4 payload",
+    );
+    let source = Source::open(&root, |_, _| {})?;
+    ensure!(source.report().selected.iter().all(|p| p.platform == 7));
+    // armor() and weapons() must pass the platform gate (fail on missing tables, not platform)
+    let armor_err = source.armor().unwrap_err();
+    ensure!(
+        !armor_err.to_string().contains("Xbox One"),
+        "armor() still has a platform-8-only gate: {armor_err}"
+    );
+    ensure!(
+        armor_err.to_string().contains("Missing or ambiguous")
+            || armor_err.to_string().contains("PS4"),
+        "Unexpected armor() error: {armor_err}"
+    );
+    let weapon_err = source.weapons().unwrap_err();
+    ensure!(
+        !weapon_err.to_string().contains("Xbox One"),
+        "weapons() still has a platform-8-only gate: {weapon_err}"
+    );
+    // armor export now passes the platform gate; it fails on missing investment tables.
+    let export_err = source.export_armor(0, temp.path().join("out").as_path()).unwrap_err();
+    ensure!(
+        !export_err.to_string().contains("not yet supported"),
+        "export_armor must no longer block PS4 at the platform gate: {export_err}"
+    );
+    // weapon export is still blocked with a clear PS4 message until Phase 4.
+    let export_err = source
+        .export_weapon(0, temp.path().join("out2").as_path())
+        .unwrap_err();
+    ensure!(
+        export_err.to_string().contains("PS4"),
+        "export_weapon must name PS4 in its not-yet-supported message: {export_err}"
+    );
     Ok(())
 }

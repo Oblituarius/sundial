@@ -2728,6 +2728,7 @@ dependencies = [
  "sha1",
  "sha2",
  "sundial",
+ "swizzleinator",
  "tempfile",
  "tiger-pkg",
  "ureq",
@@ -3726,6 +3727,10 @@ dependencies = [
  "kurbo",
  "siphasher",
 ]
+
+[[package]]
+name = "swizzleinator"
+version = "0.2.1"
 
 [[package]]
 name = "syn"
