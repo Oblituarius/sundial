@@ -361,6 +361,7 @@ pub(super) fn events(
     for &(tag, _) in native_clips {
         event_library.add_native(nr.tag(tag, Some(0x80808F49))?.as_ref());
     }
+    event_library.include_native_resources(nr)?;
     Ok(event_library)
 }
 
@@ -505,7 +506,12 @@ fn extra_clip(
         let Some(mode) = action_mode.or_else(|| extras.modes.get(native_tag).copied()) else {
             continue;
         };
-        if !static_pose && template.u16(0x142)? != source_clip.u16(0x142)? {
+        // A named action establishes playback independently of this event template.
+        // The slot table still checks the source clip's own calibrated rig shape.
+        if action_mode.is_none()
+            && !static_pose
+            && template.u16(0x142)? != source_clip.u16(0x142)?
+        {
             continue;
         }
         let attempt = if event_free {
@@ -738,7 +744,7 @@ pub fn prepare_with_rig(
     // any of them; a donor whose clips do not align cleanly keeps its native clips.
     let mut pairs = clip_pairs(&mut sr, &mut nr, &native_clips, &source_clips)?;
     let calibration_pairs = calibration_clips(&mut sr, &mut nr, &native_clips, calibration)?;
-    let slots = match clips::slots::Table::derive(
+    let mut slots = match clips::slots::Table::derive(
         pairs
             .iter()
             .chain(&calibration_pairs)
@@ -753,6 +759,15 @@ pub fn prepare_with_rig(
             )));
         }
     };
+    if let Some(reference) = calibration
+        && !slots
+            .shapes()
+            .contains_key(&u16::try_from(source.bones.len())?)
+    {
+        controls::owned_slots(
+            &mut sr, &mut nr, source_rig, native_rig, reference, &mut slots,
+        )?;
+    }
     let alignment = slots
         .shapes()
         .iter()
@@ -792,11 +807,6 @@ pub fn prepare_with_rig(
                 .push(markers);
         }
     }
-    let slot_markers = slots
-        .slot_markers()
-        .iter()
-        .map(|hash| format!("{hash:08X}"))
-        .collect::<Vec<_>>();
     let event_library = events(
         &mut sr,
         &mut nr,
@@ -1030,7 +1040,6 @@ pub fn prepare_with_rig(
             "retargeted_bones": retargeted,
             "unmapped_source_bones": unmapped,
             "slot_alignment": alignment,
-            "slot_markers": slot_markers,
             "pose_bindings": pose_bindings,
             "pose_layers": pose_layers,
             "files": files,

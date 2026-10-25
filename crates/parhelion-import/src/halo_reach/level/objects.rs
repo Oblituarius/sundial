@@ -13,14 +13,16 @@ use super::{
         material::Material,
         model::{self, Primitive},
         object::Object,
-        resource::Pages,
+        resource::{Absent, Pages},
         rig,
     },
-    METRES_PER_UNIT, ZONE_SET_BSPS, ZONE_SET_SIZE, ZONE_SETS,
+    METRES_PER_UNIT,
     variant::Variant,
 };
 use anyhow::{Context, Result, ensure};
-use std::collections::{BTreeMap, btree_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
+mod pose;
+use super::mission::pose::{Pose, Poses};
 
 /// A scenario placement block: its rows, their size, its palette of one tag reference per row, and
 /// the palette's tag group.
@@ -96,16 +98,26 @@ const UNSOLID: [&str; 3] = ["rmd ", "rmw ", "rmhg"];
 pub struct Objects {
     pub materials: Vec<Material>,
     pub primitives: Vec<Primitive>,
+    /// Each scripted pose stays a separate render entity with its own lighting binding.
+    pub props: Vec<Vec<Primitive>>,
     pub faces: Vec<[[f32; 3]; 3]>,
+    /// The structure BSPs each of `faces` belongs to, as a primitive's [`Primitive::bsps`].
+    pub face_bsps: Vec<u32>,
     /// Each drawn object's path and placement count.
     pub placed: BTreeMap<String, usize>,
     /// Each placed object's path and the primitives it leaves out because their material never
     /// draws. An object left with none is not counted as placed.
     pub hidden: BTreeMap<String, usize>,
+    /// Loaded placements whose machine motion and collision lifecycle have no native binding.
+    pub motion: BTreeMap<String, usize>,
+    /// Constant mission clip assignments, including objects excluded for conflicting poses.
+    pub poses: Poses,
     /// The skies' render geometry about the origin, in meters and in the order Reach draws it,
     /// with materials among `materials`, and each vertex's color: the light Reach baked into
     /// the sky's vertex color stream. It is never stood on.
     pub sky: Vec<(Primitive, Vec<[f32; 3]>)>,
+    /// The objects left out because their render geometry holds no data in the cache.
+    pub absent: BTreeSet<String>,
 }
 
 /// Whether a surface drawn with `material` is solid: neither blended nor a decal, water or
@@ -152,6 +164,7 @@ fn model_of(
     pages: &mut Pages,
     tag: &Tag,
     variant: &str,
+    pose: Option<&Pose>,
 ) -> Result<Option<model::Model>> {
     let object = Object::read_appearance(cache, tag)?;
     let Some(render) = object
@@ -164,9 +177,17 @@ fn model_of(
     let requested = (!variant.is_empty() && object.variants.iter().any(|v| v.name == variant))
         .then_some(variant);
     let selection = choices(&object, requested, &BTreeMap::new())?;
-    model::read_static(cache, pages, render, &selection)
-        .with_context(|| format!("Object {}", tag.path))
-        .map(Some)
+    let mut model = if pose.is_some() {
+        model::read(cache, pages, render, &selection)
+    } else {
+        model::read_static(cache, pages, render, &selection)
+    }
+    .with_context(|| format!("Object {}", tag.path))?;
+    if let Some(pose) = pose {
+        pose::apply(cache, pages, &mut model, pose)
+            .with_context(|| format!("Posing object {}", tag.path))?;
+    }
+    Ok(Some(model))
 }
 
 /// Each primitive's vertex colors in `model`, the render model `render` draws: the stream of
@@ -178,7 +199,7 @@ fn vertex_colors(
     render: &Tag,
     model: &model::Model,
 ) -> Result<Vec<Vec<[f32; 3]>>> {
-    let geometry = model::Geometry::read(cache, render, render.address()? + MODEL_GEOMETRY, false)?;
+    let geometry = model::Geometry::read(cache, render, render.address()? + MODEL_GEOMETRY)?;
     let mut streams = BTreeMap::<usize, Option<Vec<[f32; 3]>>>::new();
     model
         .primitives
@@ -253,6 +274,7 @@ impl Objects {
     /// Adds `model`'s primitives moved by `transform`, naming its materials from `base`, and
     /// its solid triangles as collision when `collides`. A primitive whose material `hidden`
     /// marks as never drawn is left out of both.
+    #[allow(clippy::too_many_arguments)]
     fn place(
         &mut self,
         path: &str,
@@ -261,6 +283,7 @@ impl Objects {
         transform: &[f32; 16],
         collides: bool,
         hidden: &[bool],
+        bsps: u32,
     ) -> Result<()> {
         let count = self.primitives.len();
         for source in &model.primitives {
@@ -274,6 +297,7 @@ impl Objects {
             let mut primitive = source.clone();
             primitive.material = source.material.map(|material| base + material);
             primitive.instance = Some(format!("{path}#{count}"));
+            primitive.bsps = bsps;
             for vertex in &mut primitive.vertices {
                 vertex.position = rig::point(transform, vertex.position, true);
                 if let Ok(normal) = rig::normalize(rig::point(transform, vertex.normal, false)) {
@@ -299,6 +323,7 @@ impl Objects {
                     let corner = |i: u32| primitive.vertices[i as usize].position;
                     self.faces
                         .push([corner(face[0]), corner(face[1]), corner(face[2])]);
+                    self.face_bsps.push(bsps);
                 }
             }
             self.primitives.push(primitive);
@@ -320,14 +345,15 @@ fn model_for<'a>(
     cache: &Cache,
     pages: &mut Pages,
     objects: &mut Objects,
-    models: &'a mut BTreeMap<(String, String), Option<Loaded>>,
+    models: &'a mut BTreeMap<(String, String, Option<Pose>), Option<Loaded>>,
     tag: &Tag,
     name: String,
+    pose: Option<&Pose>,
 ) -> Result<Option<&'a Loaded>> {
-    let key = (tag.path.clone(), name);
+    let key = (tag.path.clone(), name, pose.cloned());
     if !models.contains_key(&key) {
-        let model = match model_of(cache, pages, tag, &key.1)? {
-            Some(model) => {
+        let model = match model_of(cache, pages, tag, &key.1, key.2.as_ref()) {
+            Ok(Some(model)) => {
                 let hidden = model
                     .materials
                     .iter()
@@ -337,7 +363,12 @@ fn model_for<'a>(
                 objects.materials.extend(model.materials.iter().cloned());
                 Some((model, base, hidden))
             }
-            None => None,
+            Ok(None) => None,
+            Err(error) if error.downcast_ref::<Absent>().is_some() => {
+                objects.absent.insert(tag.path.clone());
+                None
+            }
+            Err(error) => return Err(error),
         };
         models.insert(key.clone(), model);
     }
@@ -352,17 +383,63 @@ fn fixed_machine(cache: &Cache, row: usize) -> Result<bool> {
         && cache.i16(row + DEVICE_POSITION_GROUP)? < 0)
 }
 
-/// Reads the objects the scenario places, and with a map `variant` the variant's Forge objects in
-/// place of the scenario's own placements of every object the variant's palette offers.
-pub fn read(cache: &Cache, pages: &mut Pages, variant: Option<&Variant>) -> Result<Objects> {
+/// A placement's origin structure BSP, -1 for none, and the mask of the BSPs it may attach to.
+const PLACEMENT_ORIGIN_BSP: usize = 0x40;
+const PLACEMENT_ATTACH_BSPS: usize = 0x54;
+
+/// Whether the placement at `row` belongs to a structure BSP in `loaded`: its origin BSP when it
+/// names one, else any BSP its attach mask allows, every BSP when the mask is empty. A campaign
+/// scenario places each stretch's objects in that stretch's BSPs.
+fn in_loaded_bsp(cache: &Cache, row: usize, loaded: u32) -> Result<bool> {
+    if let Ok(origin) = u32::try_from(cache.i16(row + PLACEMENT_ORIGIN_BSP)?) {
+        return Ok(origin < 32 && (loaded >> origin) & 1 != 0);
+    }
+    let attach = u32::from(cache.u16(row + PLACEMENT_ATTACH_BSPS)?);
+    Ok(attach == 0 || attach & loaded != 0)
+}
+
+/// The structure BSPs the placement at `row` belongs to ([`in_loaded_bsp`]), zero for any.
+pub(super) fn placement_bsps(cache: &Cache, row: usize) -> Result<u32> {
+    Ok(
+        match u32::try_from(cache.i16(row + PLACEMENT_ORIGIN_BSP)?) {
+            Ok(origin) if origin < 32 => 1 << origin,
+            Ok(_) => 0,
+            Err(_) => u32::from(cache.u16(row + PLACEMENT_ATTACH_BSPS)?),
+        },
+    )
+}
+
+/// Whether the scenario creates the placement at `row` in the structure BSPs `loaded`: it is not
+/// marked never placed, and it belongs to one of them ([`in_loaded_bsp`]). Sound scenery shares the
+/// placement layout of the other objects.
+pub(super) fn placed_in(cache: &Cache, row: usize, loaded: u32) -> Result<bool> {
+    Ok(cache.u32(row + PLACEMENT_FLAGS)? & NEVER_PLACED == 0 && in_loaded_bsp(cache, row, loaded)?)
+}
+
+/// Reads the objects the scenario places in the structure BSPs its zone sets `zone_sets` load, and
+/// with a map `variant` the variant's Forge objects in place of the scenario's own placements of
+/// every object the variant's palette offers.
+pub fn read(
+    cache: &Cache,
+    pages: &mut Pages,
+    variant: Option<&Variant>,
+    zone_sets: &[usize],
+    mission: &super::mission::Program,
+) -> Result<Objects> {
     let scenario = cache.only("scnr")?.address()?;
+    let loaded = super::loaded_bsps(cache, zone_sets)?;
     let mut objects = Objects {
         materials: Vec::new(),
         primitives: Vec::new(),
+        props: Vec::new(),
         faces: Vec::new(),
+        face_bsps: Vec::new(),
         placed: BTreeMap::new(),
         hidden: BTreeMap::new(),
+        motion: BTreeMap::new(),
+        poses: super::mission::pose::read(mission)?,
         sky: Vec::new(),
+        absent: BTreeSet::new(),
     };
     let mut models = BTreeMap::new();
     for block in [&CRATES, &SCENERY, &CONTROLS, &MACHINES] {
@@ -376,7 +453,7 @@ pub fn read(cache: &Cache, pages: &mut Pages, variant: Option<&Variant>) -> Resu
             if index < 0 || cache.u32(row + PLACEMENT_FLAGS)? & NEVER_PLACED != 0 {
                 continue;
             }
-            if block.group == MACHINES.group && !fixed_machine(cache, row)? {
+            if !in_loaded_bsp(cache, row, loaded)? {
                 continue;
             }
             let Some(tag) = palette.get(usize::try_from(index)?).with_context(|| {
@@ -385,13 +462,29 @@ pub fn read(cache: &Cache, pages: &mut Pages, variant: Option<&Variant>) -> Resu
             else {
                 continue;
             };
+            if block.group == MACHINES.group && !fixed_machine(cache, row)? {
+                *objects.motion.entry(tag.path.clone()).or_default() += 1;
+                continue;
+            }
             if tag.path.starts_with(MARKERS) || variant.is_some_and(|variant| variant.replaces(tag))
             {
                 continue;
             }
             let name = cache.string_id(cache.u32(row + PLACEMENT_VARIANT)?)?;
-            let Some((model, base, hidden)) =
-                model_for(cache, pages, &mut objects, &mut models, tag, name)?
+            let object = cache.i16(row + 2)?;
+            let pose = u16::try_from(object)
+                .ok()
+                .and_then(|index| objects.poses.objects.get(&index))
+                .cloned();
+            let Some((model, base, hidden)) = model_for(
+                cache,
+                pages,
+                &mut objects,
+                &mut models,
+                tag,
+                name,
+                pose.as_ref(),
+            )?
             else {
                 continue;
             };
@@ -403,7 +496,12 @@ pub fn read(cache: &Cache, pages: &mut Pages, variant: Option<&Variant>) -> Resu
                 .floats::<3>(row + PLACEMENT_POSITION)?
                 .map(|value| value * METRES_PER_UNIT);
             let transform = placement(position, cache.floats(row + PLACEMENT_ROTATION)?, scale);
-            objects.place(&tag.path, model, *base, &transform, true, hidden)?;
+            let bsps = placement_bsps(cache, row)?;
+            let first = objects.primitives.len();
+            objects.place(&tag.path, model, *base, &transform, true, hidden, bsps)?;
+            if pose.is_some() && objects.primitives.len() > first {
+                objects.props.push(objects.primitives.split_off(first));
+            }
         }
     }
     // A map variant's crates, scenery and controls, at its own positions and axes. Its machines
@@ -420,28 +518,45 @@ pub fn read(cache: &Cache, pages: &mut Pages, variant: Option<&Variant>) -> Resu
             &mut models,
             tag,
             placement.variant.clone(),
+            None,
         )?
         else {
             continue;
         };
         let transform = transform(placement.position, placement.axes, 1.);
-        objects.place(&tag.path, model, *base, &transform, true, hidden)?;
+        objects.place(&tag.path, model, *base, &transform, true, hidden, 0)?;
     }
-    // Each sky active on a structure BSP the scenario loads draws around the level from its
-    // origin. A sky active on none is active on all.
-    let loaded = match cache.block(scenario + ZONE_SETS, ZONE_SET_SIZE)?.first() {
-        Some(&zone_set) => cache.u32(zone_set + ZONE_SET_BSPS)?,
-        None => u32::MAX,
-    };
+    read_skies(cache, pages, scenario, loaded, &mut objects)?;
+    Ok(objects)
+}
+
+fn read_skies(
+    cache: &Cache,
+    pages: &mut Pages,
+    scenario: usize,
+    loaded: u32,
+    objects: &mut Objects,
+) -> Result<()> {
+    // Each sky assigned to a loaded structure BSP draws around the level from its origin.
+    // An empty mask assigns no BSP. Such rows can be alternate or cinematic sky entries,
+    // including another reference to the same sky, so treating zero as all duplicates layers.
     for row in cache.block(scenario + SKIES, SKY_SIZE)? {
         let active = u32::from(cache.u16(row + SKY_BSPS)?);
-        if active != 0 && active & loaded == 0 {
+        if active & loaded == 0 {
             continue;
         }
         let Some(tag) = cache.reference(row, Some("scen"))? else {
             continue;
         };
-        if let Some(model) = model_of(cache, pages, &tag, "")? {
+        let model = match model_of(cache, pages, &tag, "", None) {
+            Ok(model) => model,
+            Err(error) if error.downcast_ref::<Absent>().is_some() => {
+                objects.absent.insert(tag.path.clone());
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(model) = model {
             let render = Object::read_appearance(cache, &tag)?
                 .world
                 .and_then(|branch| branch.model)
@@ -451,10 +566,10 @@ pub fn read(cache: &Cache, pages: &mut Pages, variant: Option<&Variant>) -> Resu
             objects.materials.extend(model.materials.iter().cloned());
             let start = objects.primitives.len();
             // Every sky primitive stays, so each keeps its vertex colors.
-            objects.place(&tag.path, &model, base, &rig::IDENTITY, false, &[])?;
+            objects.place(&tag.path, &model, base, &rig::IDENTITY, false, &[], active)?;
             let sky = objects.primitives.split_off(start);
             objects.sky.extend(sky.into_iter().zip(colors));
         }
     }
-    Ok(objects)
+    Ok(())
 }

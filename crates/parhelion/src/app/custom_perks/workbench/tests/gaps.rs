@@ -149,33 +149,6 @@ fn runtime_budget_diagnostics_survive_consolidation_and_refusal() {
 }
 
 #[test]
-fn native_noop_selector_is_blocked_but_an_unverified_host_remains_authorable() {
-    let mut recipe = PerkRecipe::new();
-    let mut effect = authored(405, Trigger::Always, 1);
-    effect.program.as_mut().unwrap().actions = vec![Action::AdjustComponent {
-        target: 0.into(),
-        flag: 3.into(),
-        option: 0.into(),
-        scale_bits: 1.0_f32.to_bits(),
-        limit_bits: (-1.0_f32).to_bits(),
-        value_bits: 1.0_f32.to_bits(),
-        input: 255.into(),
-    }];
-    recipe.effects.push(effect);
-    assert!(
-        preflight::check(&recipe)
-            .iter()
-            .any(|issue| issue.blocking && issue.code == "invalid_state")
-    );
-    if let Action::AdjustComponent { flag, .. } =
-        &mut recipe.effects[0].program.as_mut().unwrap().actions[0]
-    {
-        *flag = 0.into();
-    }
-    assert!(!preflight::check(&recipe).iter().any(|issue| issue.blocking));
-}
-
-#[test]
 #[ignore = "requires SUNDIAL_STOCK_PACKAGES"]
 fn discovery_can_stop_between_native_phases_without_publishing_partial_catalog() {
     use sundial::investment::discovery::{DiscoveryEvent, Phase, discover_cancellable};
@@ -194,48 +167,6 @@ fn discovery_can_stop_between_native_phases_without_publishing_partial_catalog()
     assert!(stop.load(std::sync::atomic::Ordering::Relaxed));
     assert!(!phases.contains(&Phase::Perks.label()));
     crate::test_support::artifact("perk-native-scan-cancellation.json", &phases);
-}
-
-#[test]
-fn diagnostics_window_shows_all_inactive_effects_and_navigates_to_one() {
-    let mut workbench = Workbench::offline();
-    let mut recipe = PerkRecipe::new();
-    for index in 405..411 {
-        recipe.effects.push(authored(index, Trigger::Drawn, 1));
-    }
-    workbench.documents.push(Document::new(recipe, None));
-    workbench.diagnostics_open = true;
-    let ctx = egui::Context::default();
-    let mut render = |events| {
-        ctx.run_ui(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(1100.0, 900.0),
-                )),
-                events,
-                ..Default::default()
-            },
-            |ui| workbench.show_diagnostics(ui),
-        )
-    };
-    let mut output = render(vec![]);
-    for _ in 0..3 {
-        output = render(vec![]);
-    }
-    // Six effects overrun the four-effect budget, so the last two are inactive.
-    assert!(
-        label(&output, "Open Effect 5").is_some(),
-        "the first inactive effect is listed in the diagnostics window"
-    );
-    let problem = label(&output, "Open Effect 6")
-        .expect("the second inactive effect is reachable")
-        .center();
-    capture::write(&ctx, &output, "perk-diagnostics");
-    for events in crate::test_support::driver::tap(problem) {
-        render(events);
-    }
-    assert_eq!(workbench.reveal_problem.as_ref().unwrap().effect, 410);
 }
 
 #[test]

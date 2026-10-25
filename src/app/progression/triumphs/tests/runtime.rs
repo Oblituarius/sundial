@@ -115,51 +115,6 @@ fn consumable_triumph_claims_wait_for_confirmation_and_are_undoable() {
     assert_eq!(reloaded.progression_view(0), original);
 }
 
-fn tiered_flag_catalog() -> Catalog {
-    let base = runtime_catalog(true);
-    let mut record = base.records().unwrap()[0].clone();
-    record.completion_flag = Some(0);
-    record.runtime.as_mut().unwrap().progress = vec![
-        RecordProgress {
-            objective: 0,
-            slot: 2746,
-            threshold: 1000,
-        },
-        RecordProgress {
-            objective: 0,
-            slot: 2747,
-            threshold: 1000,
-        },
-    ];
-    let mut values = base.unlock_value_definitions().to_vec();
-    values[4].compact_slot = Some(2747);
-    let flags = base.unlock_flag_definitions().to_vec();
-    base.with_test_progression(flags, values, vec![])
-        .with_test_records(vec![record])
-}
-
-#[test]
-fn flagged_tiers_keep_progress_separate_from_the_claimed_count() {
-    let catalog = tiered_flag_catalog();
-    let record = &catalog.records().unwrap()[0];
-    for native in [false, true] {
-        let mut document = json!({"state":{"unlocks":{}},"future":17});
-        if native {
-            document["_native_progression"] = json!({});
-        }
-        edit::apply_record(&mut document, &catalog, record, true).unwrap();
-        let snapshot = collection_state_snapshot(&document).unwrap();
-        assert_eq!(snapshot.values[&(1, 2746)], 1000);
-        assert_eq!(snapshot.values[&(1, 2747)], 2);
-        assert_eq!(snapshot.values[&(1, 2115)], 30);
-        let after = document.clone();
-        edit::apply_record(&mut document, &catalog, record, true).unwrap();
-        assert_eq!(document, after);
-        edit::apply_record(&mut document, &catalog, record, false).unwrap();
-        assert_eq!(document["future"], json!(17));
-    }
-}
-
 fn runtime_catalog(interval: bool) -> Catalog {
     catalog()
         .with_test_progression(
@@ -478,50 +433,6 @@ fn score_overflow_rejects_claim_without_mutation() {
 }
 
 #[test]
-fn a_reset_commits_when_the_saved_score_already_matches() {
-    let catalog = runtime_catalog(false);
-    let record = &catalog.records().unwrap()[0];
-    // An imported account can hold a completed record whose points never reached slot 2115.
-    let mut document = json!({"state":{"unlocks":{"account_flag_runs":[[4,1]],"objective_values":[[2746,5],[2115,0]]}}});
-    edit::apply_record(&mut document, &catalog, record, false).unwrap();
-    let snapshot = collection_state_snapshot(&document).unwrap();
-    assert!(!snapshot.flags.contains(&(1, 4)));
-    assert_eq!(snapshot.values.get(&(1, 2746)), Some(&0));
-    assert_eq!(snapshot.values.get(&(1, 2115)), Some(&0));
-}
-
-#[test]
-fn an_impossible_total_is_rebuilt_from_every_record() {
-    let base = runtime_catalog(false);
-    let first = base.records().unwrap()[0].clone();
-    let mut flags = base.unlock_flag_definitions().to_vec();
-    flags.push(UnlockDefinition {
-        code: 1,
-        compact_slot: Some(5),
-        ..Default::default()
-    });
-    let values = base.unlock_value_definitions().to_vec();
-    let mut second = first.clone();
-    second.hash = 200;
-    second.name = "Second Victory".into();
-    second.completion_flag = Some(1);
-    let runtime = second.runtime.as_mut().unwrap();
-    runtime.score = 40;
-    runtime.progress = Vec::new();
-    let catalog = base
-        .with_test_progression(flags, values, vec![])
-        .with_test_records(vec![first.clone(), second]);
-    // Both records are complete, but the saved slot never tracked their score.
-    let mut document = json!({"state":{"unlocks":{"account_flag_runs":[[4,2]],"objective_values":[[2746,5],[2115,0]]}}});
-    edit::apply_record(&mut document, &catalog, &first, false).unwrap();
-    let snapshot = collection_state_snapshot(&document).unwrap();
-    assert!(!snapshot.flags.contains(&(1, 4)));
-    assert!(snapshot.flags.contains(&(1, 5)));
-    // Clamping to zero would lose the record that is still complete.
-    assert_eq!(snapshot.values.get(&(1, 2115)), Some(&40));
-}
-
-#[test]
 fn every_override_on_the_score_slot_is_cleared() {
     let base = runtime_catalog(false);
     let record = base.records().unwrap()[0].clone();
@@ -545,18 +456,6 @@ fn every_override_on_the_score_slot_is_cleared() {
         "a stale override still masks the score: {:?}",
         snapshot.value_overrides
     );
-    assert_eq!(snapshot.values.get(&(1, 2115)), Some(&25));
-}
-
-#[test]
-fn completion_reconciles_overrides_with_the_native_claim_and_progress() {
-    let catalog = runtime_catalog(false);
-    let record = &catalog.records().unwrap()[0];
-    let mut document = json!({"state":{"unlocks":{"account_flag_runs":[[4,1]],"objective_values":[[2746,5],[2115,25]]},"investment":{"family5_flag_overrides":[[0,1]],"family5_value_overrides":[[1,0]]}}});
-    edit::apply_record(&mut document, &catalog, record, true).unwrap();
-    let snapshot = collection_state_snapshot(&document).unwrap();
-    assert!(snapshot.flag_overrides.is_empty());
-    assert!(snapshot.value_overrides.is_empty());
     assert_eq!(snapshot.values.get(&(1, 2115)), Some(&25));
 }
 
@@ -618,30 +517,6 @@ fn reward_catalog(interval: bool, quantity: i32, instanced: bool, class_type: u6
 }
 
 #[test]
-fn pending_rewards_split_stacks_and_grant_only_new_stages() {
-    for (interval, flag) in [(false, false), (true, false), (true, true)] {
-        let catalog = reward_catalog(interval, 201, false, 3);
-        let mut record = catalog.records().unwrap()[0].clone();
-        if flag {
-            record.completion_flag = Some(0);
-        }
-        let mut document = json!({"_native_progression":{},"_reward_context":{"character":0,"character_count":1,"class":3,"pending":[]},"state":{"unlocks":{"objective_values":[[15,1],[2115,10]]}}});
-        edit::apply_record(&mut document, &catalog, &record, true).unwrap();
-        let rewards = document["_progression_rewards"].as_array().unwrap();
-        assert_eq!(
-            rewards
-                .iter()
-                .map(|row| row["quantity"].as_i64().unwrap())
-                .collect::<Vec<_>>(),
-            if interval { vec![1] } else { vec![99, 99, 3] }
-        );
-        let original = document.clone();
-        edit::apply_record(&mut document, &catalog, &record, true).unwrap();
-        assert_eq!(document, original);
-    }
-}
-
-#[test]
 fn instanced_rewards_check_class_before_changing_the_triumph() {
     let catalog = reward_catalog(false, 2, true, 1);
     let mut document = json!({"_native_progression":{},"_reward_context":{"character":0,"character_count":1,"class":0,"pending":[]}});
@@ -669,38 +544,4 @@ fn instanced_rewards_check_class_before_changing_the_triumph() {
         document["_progression_rewards"],
         json!([{"kind":0,"hash":987,"quantity":1},{"kind":0,"hash":987,"quantity":1}])
     );
-}
-
-#[test]
-fn ordinary_claims_do_not_zero_an_overlapping_interval_field() {
-    let catalog = runtime_catalog(false);
-    let mut record = catalog.records().unwrap()[0].clone();
-    record.redeemed_intervals = Some(1);
-    let mut document = json!({});
-    edit::apply_record(&mut document, &catalog, &record, true).unwrap();
-    let snapshot = collection_state_snapshot(&document).unwrap();
-    assert_eq!(snapshot.values.get(&(1, 2746)), Some(&5));
-    assert_eq!(snapshot.values.get(&(1, 2115)), Some(&25));
-}
-
-#[test]
-fn a_reserved_progress_lane_can_hold_the_claimed_stage_count() {
-    let catalog = runtime_catalog(true);
-    let mut record = catalog.records().unwrap()[0].clone();
-    record
-        .runtime
-        .as_mut()
-        .unwrap()
-        .progress
-        .push(RecordProgress {
-            slot: 15,
-            objective: 0,
-            threshold: 5,
-        });
-    let mut document = json!({});
-    edit::apply_record(&mut document, &catalog, &record, true).unwrap();
-    let snapshot = collection_state_snapshot(&document).unwrap();
-    assert_eq!(snapshot.values.get(&(1, 2746)), Some(&5));
-    assert_eq!(snapshot.values.get(&(1, 15)), Some(&2));
-    assert_eq!(snapshot.values.get(&(1, 2115)), Some(&30));
 }

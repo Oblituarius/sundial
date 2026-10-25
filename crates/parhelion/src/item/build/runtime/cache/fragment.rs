@@ -12,15 +12,22 @@ fn pack(
     tags.iter()
         .enumerate()
         .map(|(index, tag)| {
+            let assigned = allocator
+                .assigned_tag(
+                    start.checked_add(index)?,
+                    "Cached runtime",
+                    "runtime resource",
+                )
+                .ok()?
+                .0;
+            let loading = relocate::loading(manager, tag, assigned);
+            let fields = if loading.is_some() {
+                Some(vec![(8, assigned), (12, read_u32(&tag.payload, 12).ok()?)])
+            } else {
+                relocate::fields(manager, tag)
+            };
             Some(Tag {
-                assigned: allocator
-                    .assigned_tag(
-                        start.checked_add(index)?,
-                        "Cached runtime",
-                        "runtime resource",
-                    )
-                    .ok()?
-                    .0,
+                assigned,
                 template: tag.template_tag.0,
                 storage: match tag.storage {
                     crate::NewTagStorageMode::InheritTemplate => 0,
@@ -29,7 +36,8 @@ fn pack(
                     crate::NewTagStorageMode::GpuHull => 3,
                     crate::NewTagStorageMode::GpuDomain => 4,
                 },
-                fields: relocate::fields(manager, tag),
+                fields,
+                loading,
                 span: append(bytes, &tag.payload),
             })
         })
@@ -37,11 +45,7 @@ fn pack(
 }
 
 fn package_id(index: usize) -> Option<u16> {
-    let window = crate::package_profile::window();
-    window
-        .base
-        .checked_add(u16::try_from(index).ok()?)
-        .filter(|id| *id <= window.top)
+    crate::package_profile::window().nth(index)
 }
 
 /// Records where each tag of `group` moves under `plan`, after checking each is where its cached
@@ -158,7 +162,7 @@ impl Pending<'_> {
         animation: &mut AnimationCache,
     ) -> Result<Restored, Reason> {
         let started = std::time::Instant::now();
-        let loaded = self.read();
+        let loaded = self.read(manager);
         self.timings.borrow_mut().load += started.elapsed();
         let (entry, bytes) = loaded?;
         let started = std::time::Instant::now();
@@ -179,9 +183,6 @@ impl Pending<'_> {
             ));
         }
         let exact = entry.state == self.state;
-        if !exact && !entry.relocatable {
-            return Err(Reason::UnsupportedRelocation);
-        }
         let started = std::time::Instant::now();
         let restored = self.replay(
             manager,
@@ -197,7 +198,7 @@ impl Pending<'_> {
         restored
     }
 
-    fn read(&self) -> Result<(Entry, Vec<u8>), Reason> {
+    fn read(&self, manager: &PackageManager) -> Result<(Entry, Vec<u8>), Reason> {
         let file = File::open(&self.path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 Reason::Missing
@@ -218,6 +219,18 @@ impl Pending<'_> {
             if previous.source != current.source {
                 return Err(Reason::SourceChanged);
             }
+        }
+        // A known layout rejection cannot become a hit after checking payloads.
+        // Keep input-first diagnostics for changed recipe keys, and retain every
+        // checksum and input check for exact-allocation or relocatable candidates.
+        if entry.key == self.key
+            && entry.result.is_some() == self.returns
+            && entry.state != self.state
+            && !entry.relocatable
+        {
+            return Err(Reason::UnsupportedRelocation(relocate::limitation(
+                manager, &entry,
+            )));
         }
         let bytes = read_member(&mut archive, "payload.bin", ENTRY_LIMIT).ok_or_else(|| {
             Reason::Damaged("missing, oversized or unreadable payload.bin".into())
@@ -351,6 +364,24 @@ impl Pending<'_> {
                 .zip(&plans)
                 .map(|(group, plan)| restore_group(group, plan, bytes, (&moves, exact)))
                 .collect::<Option<Vec<_>>>()?;
+            // Loading-index arrays can grow or shrink as package groups split or merge.
+            // Replay the pure allocation decisions with their actual relocated lengths before
+            // committing anything. A changed budget or package choice recompiles the fragment.
+            let mut layout = assets.packages.layout().ok()?;
+            for ((group, plan), (tags, _)) in entry.groups.iter().zip(&plans).zip(&restored_groups)
+            {
+                let actual = layout
+                    .append(
+                        &group.reservation.bounds,
+                        tags.iter().map(|tag| tag.payload.len()),
+                    )
+                    .ok()?;
+                if (actual.package_index, actual.package_id, actual.base)
+                    != (plan.package_index, plan.package_id, plan.base)
+                {
+                    return None;
+                }
+            }
             let restored_assignments = match entry.assignment {
                 Some((pattern, tag)) => {
                     append_weapon_entity_assignment(assignments.clone(), pattern, moved(tag))
@@ -387,6 +418,7 @@ impl Pending<'_> {
                 .impacts
                 .into_iter()
                 .map(|mut impact| {
+                    impact.damage = moved(impact.damage);
                     impact.responses = impact.responses.map(moved);
                     impact
                 })
@@ -516,14 +548,25 @@ impl Pending<'_> {
                         .map(|tag| tag.0)
                 })
                 .collect::<Option<Vec<_>>>()?;
+            let loading_references = all
+                .iter()
+                .flat_map(|tag| tag.loading.iter().flatten())
+                // Native indexes also retain package IDs beyond the authored allocation
+                // domain. Those memberships cannot move, and must not become private tags.
+                .filter(|(package, _)| {
+                    *package <= crate::package_profile::MAX_AUTHORED_STANDALONE_PACKAGE_ID
+                })
+                .map(|&(package, entry)| TagHash::new(package, entry).0);
             for reference in all
                 .iter()
                 .flat_map(|tag| tag.fields.iter().flatten().map(|(_, tag)| *tag))
                 .chain(placed.iter().copied())
                 .chain(assignment.map(|(_, tag)| tag))
                 .chain(result)
+                .chain(impacts.iter().map(|impact| impact.damage))
                 .chain(impacts.iter().filter_map(|impact| impact.responses))
                 .chain(entry_references)
+                .chain(loading_references)
             {
                 if owned.contains(&reference) {
                     continue;
@@ -636,15 +679,17 @@ impl Pending<'_> {
                         (reservation.base..end).contains(&reference.new_tag_ordinal)
                     })
                     .map(|reference| {
-                        (
+                        Some((
                             reference.new_tag_ordinal,
                             match reference.reference {
                                 crate::NewTagReference::Template => None,
                                 crate::NewTagReference::Appended(ordinal) => Some(ordinal),
+                                // Absolute references cannot be relocated by this cache format.
+                                crate::NewTagReference::Tag(_) => return None,
                             },
-                        )
+                        ))
                     })
-                    .collect(),
+                    .collect::<Option<Vec<_>>>()?,
             });
             positions[reservation.package_index] = end;
         }

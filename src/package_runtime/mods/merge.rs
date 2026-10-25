@@ -5,9 +5,11 @@
 pub mod describe;
 mod entry;
 mod layout;
+pub mod localize;
 mod manifest;
 mod plan;
 pub mod recipes;
+pub mod relayout;
 mod rows;
 pub mod sidecar;
 

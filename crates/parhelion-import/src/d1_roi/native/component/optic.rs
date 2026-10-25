@@ -5,8 +5,93 @@ mod fallback;
 const OPTIC: u32 = 0x81529E1F;
 const ENTITY: u32 = 0x80BBCC85;
 const ADAPTER: u32 = 0x80C70C06;
+/// The native optic's only numeric provider: interface `80809AE1`, method 2 of `80803941`.
+/// In stock entity `8161ECA5` it feeds bank receiver `4F437B90`, the name D1 sight banks
+/// receive from their optic's only numeric provider (`8080053B`, method 3 of `80802170`).
+/// Both optics list their six interfaces in the same order and kinds.
+const VALUE_PROVIDER: u64 = 0x598;
+
+/// The native connection feeding a bank receiver declaration from the optic's value provider.
+pub(super) fn receiver_connection(
+    optic: &Payload,
+    [bank_id, optic_id]: [u32; 2],
+    declaration: usize,
+    [bank_index, optic_index]: [usize; 2],
+    native: &mut Reader,
+) -> Result<Vec<u8>> {
+    use crate::tiger::entity::links;
+    let metadata = native.tag(optic.u32(VALUE_PROVIDER as usize + 8)?, Some(0x80809C54))?;
+    let object = links::Object {
+        owner: OPTIC,
+        class: 0x80809AE1,
+        offset: VALUE_PROVIDER,
+    };
+    let interface = links::Interface::read(optic, object, &metadata, false)?;
+    ensure!(
+        interface.instance_class == 0x80809AE2
+            && interface.methods.len() == 1
+            && interface.methods[0].implementation_class == 0x80803941
+            && interface.methods[0].index == 2,
+        "Native optic value provider differs"
+    );
+    let mut row = vec![0; 72];
+    put(&mut row, 0, &0x811C9DC5u32.to_le_bytes())?;
+    put(&mut row, 8, &bank_id.to_le_bytes())?;
+    put(&mut row, 12, &0x808097A8u32.to_le_bytes())?;
+    put(&mut row, 16, &(declaration as u64).to_le_bytes())?;
+    put(&mut row, 24, &(bank_index as u64).to_le_bytes())?;
+    put(&mut row, 32, &0x811C9DC5u32.to_le_bytes())?;
+    put(&mut row, 40, &optic_id.to_le_bytes())?;
+    put(&mut row, 44, &0x80809AE1u32.to_le_bytes())?;
+    put(&mut row, 48, &VALUE_PROVIDER.to_le_bytes())?;
+    put(&mut row, 56, &(optic_index as u64).to_le_bytes())?;
+    Ok(row)
+}
 
 impl Assembly<'_> {
+    /// Bank receivers a sight of this entity feeds through its value provider, keyed by bank
+    /// and source declaration. Other providers have no translation, so their receivers are
+    /// absent here.
+    pub(super) fn optic_feeds(&mut self, entity: &Payload) -> Result<BTreeMap<(u32, u64), u32>> {
+        let components = entity
+            .array(0x20, 12, Some(0x80800715))?
+            .into_iter()
+            .map(|at| entity.u32(at))
+            .collect::<Result<Vec<_>>>()?;
+        let mut feeds = BTreeMap::new();
+        for row in entity.array(0x30, 88, Some(0x8080054E))? {
+            let selector = usize::try_from(entity.u64(row + 72)?)?;
+            let Some(&tag) = components.get(selector) else {
+                continue;
+            };
+            if entity.u64(row + 24)? != 0x80800668
+                || entity.u64(row + 40)? != 0x811C9DC5
+                || entity.u64(row + 48)? != u64::from(tag)
+                || entity.u64(row + 64)? != 0x8080053B
+                || entity.u64(row + 80)? != 0
+            {
+                continue;
+            }
+            let optic = self.source.read(tag)?;
+            if optic.u32(optic.pointer(24)? - 4)? != 0x808027FC {
+                continue;
+            }
+            let offset = usize::try_from(entity.u64(row + 56)?)?;
+            let metadata = self.source.read(optic.u32(offset + 8)?)?;
+            let methods = metadata.array(16, 24, Some(0x808005C0))?;
+            if metadata.u32(8)? == 0x8080053B
+                && metadata.u32(12)? == 0x80800539
+                && methods.len() == 1
+                && metadata.u32(methods[0])? == 0x80802170
+                && metadata.u32(methods[0] + 4)? == 3
+                && metadata.bytes::<16>(methods[0] + 8)? == [0; 16]
+            {
+                feeds.insert((entity.u32(row + 8)?, entity.u64(row + 16)?), tag);
+            }
+        }
+        Ok(feeds)
+    }
+
     fn aim_adapter(&mut self, tag: u32, offset: u64) -> Result<()> {
         let source = self.source.read(tag)?;
         let native = self.native.tag(ADAPTER, Some(0x80809C36))?;
@@ -100,33 +185,46 @@ impl Assembly<'_> {
                 .map(|at| p.u8(at))
                 .collect()
         };
+        let zoom = code(source, s + 0xB8)?;
         ensure!(
-            code(source, s + 0xB8)? == code(&component.payload, n + 0xA0)?
-                && source.bytes::<16>(s + 0xD8)? == component.payload.bytes::<16>(n + 0xC0)?,
-            "Source optic zoom procedure requires translation"
+            source.bytes::<16>(s + 0xD8)? == component.payload.bytes::<16>(n + 0xC0)?,
+            "Source optic zoom parameters differ"
         );
         let constants = source.array(s + 0xC8, 16, Some(0x80800090))?;
-        let values = component.payload.array(n + 0xB0, 16, Some(0x80800090))?;
-        ensure!(
-            constants.len() == values.len(),
-            "Source optic zoom constant count differs"
-        );
-        for (from, to) in constants.into_iter().zip(values) {
-            put(&mut component.payload.0, to, &source.bytes::<16>(from)?)?;
+        let mut values = Vec::new();
+        let mut lanes = Vec::new();
+        for from in constants {
+            let mut vector = [0; 4];
+            for (lane, bits) in vector.iter_mut().enumerate() {
+                *bits = source.u32(from + lane * 4)?;
+                ensure!(
+                    f32::from_bits(*bits).is_finite(),
+                    "Nonfinite optic zoom constant"
+                );
+            }
+            lanes.push(vector);
+            values.extend(source.bytes::<16>(from)?);
         }
+        // Optic procedures use the channel dialect. Preserve the source curve instead of
+        // requiring the stock optic template to contain the same expression and vector count.
+        crate::d1_roi::procedure::validate(&zoom, &lanes, source.u64(s + 0xD8)? as usize)?;
+        array(&mut component.payload.0, n + 0xA0, 0x80800009, &zoom, 1)?;
+        array(&mut component.payload.0, n + 0xB0, 0x80800090, &values, 16)?;
         put(
             &mut component.payload.0,
             n + 0xE0,
             &source.bytes::<24>(s + 0xF8)?,
         )?;
-        let inputs = source.array(s + 0xE8, 48, Some(0x80800927))?;
+        // Input definitions `80800927` are 40 bytes with the name at +32 on PS4, as material
+        // input definitions are.
+        let inputs = source.array(s + 0xE8, self.source.field(48, 40), Some(0x80800927))?;
         let definitions = component.payload.array(n + 0xD0, 40, Some(0x80809789))?;
         ensure!(
             inputs.len() == definitions.len(),
             "Source optic zoom input count differs"
         );
         for (from, to) in inputs.into_iter().zip(definitions) {
-            let name = source.u32(from + 40)?;
+            let name = source.u32(from + self.source.field(40, 32))?;
             ensure!(
                 name == component.payload.u32(to + 32)?,
                 "Source optic zoom input identity differs"
@@ -135,10 +233,19 @@ impl Assembly<'_> {
         }
         let source_connections = source_entity.array(0x30, 88, Some(0x8080054E))?;
         let native_connections = component.entity.array(0x20, 72, Some(0x80809BC9))?;
-        for (sd, nd, marker) in [(0x1D0, 0x198, 0x8D0DD3CD), (0x270, 0x228, 0x0B7BA45D)] {
+        // PS4 provider objects are 8 bytes (first) and 32 bytes (second) shorter, start 0x40
+        // before their poses and hold the instance class as a u32 after a zero word, where
+        // Xbox One holds it as a u64 (measured on CUSA00219 optic `80A77047`).
+        let ps4 = self.source.platform() == 7;
+        let aims = [
+            (self.source.field(0x1D0, 0x1C8), 0x198, 0x8D0DD3CD),
+            (self.source.field(0x270, 0x250), 0x228, 0x0B7BA45D),
+        ];
+        let (class_at, padding_at) = if ps4 { (36, 40) } else { (40, 36) };
+        for (sd, nd, marker) in aims {
             ensure!(
-                source.u32(s + sd - 40)? == 0x8080052A
-                    && source.u32(s + sd - 36)? == 0
+                source.u32(s + sd - class_at)? == 0x8080052A
+                    && source.u32(s + sd - padding_at)? == 0
                     && source.u32(s + sd - 32)? <= 2
                     && source.u32(s + sd - 28)? == u32::MAX
                     && source.bytes::<8>(s + sd - 24)? == [0; 8]
@@ -192,7 +299,8 @@ impl Assembly<'_> {
                 .copied()
                 .filter(|at| {
                     source_entity.u64(at + 8).ok() == Some(u64::from(source_tag))
-                        && source_entity.u64(at + 16).ok() == Some((s + sd - 0x48) as u64)
+                        && source_entity.u64(at + 16).ok()
+                            == Some((s + sd - self.source.field(0x48, 0x40)) as u64)
                 })
                 .collect::<Vec<_>>();
             let to = native_connections
@@ -258,7 +366,7 @@ impl Assembly<'_> {
         component.seal()?;
         self.evidence
             .push(json!({"source_optic":source_tag,"native_template":OPTIC,
-            "aim":"Source defaults, movement providers, camera offset and matching zoom procedure",
+            "aim":"Source defaults, movement providers, camera offset and validated source zoom procedure",
             "gameplay_verified":false}));
         Ok(component)
     }

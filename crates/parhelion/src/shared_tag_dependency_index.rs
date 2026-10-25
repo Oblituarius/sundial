@@ -22,6 +22,7 @@ const GROUP_SIZE: usize = 0x28;
 
 pub(crate) mod native;
 pub(crate) mod partition;
+pub(crate) mod relocate;
 pub(crate) mod scoped;
 
 use sundial::package_authoring::loading_index::{Group, entries as indexed_dependencies};
@@ -73,6 +74,14 @@ fn append_array(
 
 pub(crate) fn encode(template: &[u8], groups: &BTreeMap<u16, Group>) -> AuthoringResult<Vec<u8>> {
     let tags = sundial::package_authoring::loading_index::tag64(template).map_err(invalid)?;
+    encode_with_hashes(template, groups, &tags)
+}
+
+fn encode_with_hashes(
+    template: &[u8],
+    groups: &BTreeMap<u16, Group>,
+    tags: &[u64],
+) -> AuthoringResult<Vec<u8>> {
     let mut payload = template[..0x30].to_vec();
     payload[TAG64_DESCRIPTOR..0x30].fill(0);
     write_u64(&mut payload, 0x10, groups.len() as u64)?;
@@ -124,6 +133,22 @@ pub(crate) fn encode(template: &[u8], groups: &BTreeMap<u16, Group>) -> Authorin
     let size = payload.len() as u64;
     write_u64(&mut payload, 0, size)?;
     Ok(payload)
+}
+
+/// Removes selected hash dependencies while preserving package groups and unrelated hashes.
+#[cfg(feature = "d2-model-importer")]
+pub(crate) fn remove_hash_dependencies(
+    payload: &[u8],
+    companion: TagHash,
+    owner: TagHash,
+    removals: &BTreeSet<u64>,
+) -> AuthoringResult<Vec<u8>> {
+    let groups = parse(payload, companion, owner)?;
+    let mut hashes = sundial::package_authoring::loading_index::tag64(payload).map_err(invalid)?;
+    hashes.retain(|hash| !removals.contains(hash));
+    let authored = encode_with_hashes(payload, &groups, &hashes)?;
+    parse(&authored, companion, owner)?;
+    Ok(authored)
 }
 
 /// Reads both native dependency representations, retaining no pointers into package storage.

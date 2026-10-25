@@ -18,6 +18,12 @@ pub(crate) enum Kind {
     Serial(Vec<Node>),
     Repeat(Vec<Node>),
     Parallel(Vec<Node>),
+    /// Repeating native scalar gate. Children retire when the input leaves the range.
+    Range {
+        input: u32,
+        bounds: [f32; 2],
+        children: Vec<Node>,
+    },
     Weighted(Vec<(f32, Node)>),
     Event(u32),
 }
@@ -174,6 +180,15 @@ fn flatten<'a>(
         Kind::Serial(children) | Kind::Repeat(children) | Kind::Parallel(children) => {
             children.iter().collect::<Vec<_>>()
         }
+        Kind::Range {
+            bounds, children, ..
+        } => {
+            ensure!(
+                bounds.iter().all(|v| v.is_finite()) && bounds[0] <= bounds[1],
+                "Sequence scalar gate range is invalid"
+            );
+            children.iter().collect::<Vec<_>>()
+        }
         Kind::Weighted(children) => {
             let total = children.iter().map(|(weight, _)| *weight).sum::<f32>();
             ensure!(
@@ -200,9 +215,12 @@ fn flatten<'a>(
 fn event_layout(class: u32) -> Result<(u32, usize, usize, u32)> {
     Ok(match class {
         0x808093cb => (0x808093ca, 0x38, 0x40, 0),
+        0x808093c4 => (0x808093c3, 0x80, 0x40, 2),
         0x80806cc6 => (0x80806cc5, 0x128, 0x50, 4),
         0x80806b38 => (0x80806b37, 0x78, 0x60, 6),
         0x80808881 => (0x80808880, 0xe0, 0x70, 15),
+        0x80803fe9 => (0x80803fe8, 0x88, 0x60, 18),
+        0x80804595 => (0x80804594, 0x38, 0x50, 19),
         0x80804ab0 => (0x80804aaf, 0x48, 0x40, 38),
         _ => anyhow::bail!("Unsupported native authored event {class:08X}"),
     })
@@ -257,6 +275,7 @@ fn event_defaults(envelopes: &[Payload], needed: &BTreeSet<u32>) -> Result<BTree
 
 /// Rebuild only the control and event storage. Locator and input declarations
 /// remain owned by the caller and keep their existing allocation rows.
+#[allow(clippy::cognitive_complexity)]
 pub(crate) fn write(
     payload: &mut Payload,
     allocation: &mut Payload,
@@ -292,6 +311,7 @@ pub(crate) fn write(
         let (dc, ic, size, kind) = match control.node.kind {
             Kind::Serial(_) | Kind::Repeat(_) => (0x808093d9, 0x808093d8, 0x58, 0),
             Kind::Parallel(_) => (0x808093d7, 0x808093d6, 0x58, 1),
+            Kind::Range { .. } => (0x808093cd, 0x808093cc, 0x68, 6),
             Kind::Weighted(_) => (0x808093d5, 0x808093d4, 0x68, 2),
             Kind::Event(_) => unreachable!(),
         };
@@ -309,6 +329,16 @@ pub(crate) fn write(
             // Byte +32 requests another activation through 0058DF80, unless
             // the caller is shutting the parent down.
             payload.0[d + 0x32] = 1;
+        }
+        if let Kind::Range { input, bounds, .. } = control.node.kind {
+            ensure!(
+                u64::from(input) < payload.u64(definition + 0x188)?,
+                "Sequence scalar gate input is undeclared"
+            );
+            payload.0[d + 0x32] = 1;
+            put(&mut payload.0, d + 0x58, &bounds[0].to_le_bytes())?;
+            put(&mut payload.0, d + 0x5c, &bounds[1].to_le_bytes())?;
+            put(&mut payload.0, d + 0x60, &input.to_le_bytes())?;
         }
         let selectors = array(payload, d + 0x38, 0x808093fb, 4, control.children.len())?;
         for (&at, &(event, index)) in selectors.iter().zip(&control.children) {
@@ -343,7 +373,9 @@ pub(crate) fn write(
         relative(payload, ei[index] + 32, i)?;
         relative(payload, ed[index] + 16, d)?;
         common(payload, d, event.node, Some(event.parent), kind)?;
-        if kind != 0 {
+        // Bodyless ability-completion records end at +38. Their selected slot is runtime
+        // state supplied by the controller, so no definition selector exists to initialize.
+        if size > 0x38 && kind != 0 {
             put(&mut payload.0, d + 0x38, &0xffu32.to_le_bytes())?;
         }
         written.insert(event.node.name, d);

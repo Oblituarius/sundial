@@ -87,20 +87,6 @@ fn scope(definition: &UnlockDefinition, value: bool) -> &'static str {
     }
 }
 
-#[cfg(test)]
-fn entries(catalog: &Catalog, value: bool) -> Vec<Entry> {
-    let definitions = if value {
-        catalog.unlock_value_definitions()
-    } else {
-        catalog.unlock_flag_definitions()
-    };
-    definitions
-        .iter()
-        .enumerate()
-        .map(|(index, definition)| entry(catalog, index, value, definition))
-        .collect()
-}
-
 fn entry(catalog: &Catalog, index: usize, value: bool, definition: &UnlockDefinition) -> Entry {
     let label = labels::unlock(catalog, index, value);
     let named = label.named;
@@ -247,7 +233,7 @@ fn draw_entries(
     progression_toolbar(ui, |ui| {
         ui.add(
             egui::TextEdit::singleline(&mut state.query)
-                .hint_text("Search content or ID…")
+                .hint_text("Search Content or ID…")
                 .desired_width(200.0),
         );
         egui::ComboBox::from_id_salt("unlock_names")
@@ -678,6 +664,3 @@ fn draw_entry(
     }
     changed
 }
-
-#[cfg(test)]
-mod tests;

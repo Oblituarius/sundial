@@ -215,6 +215,7 @@ struct Group {
 struct Target {
     fbo: glow::Framebuffer,
     color: glow::Renderbuffer,
+    normal: glow::Renderbuffer,
     depth: glow::Renderbuffer,
     size: [i32; 2],
     scene_depth: glow::Texture,
@@ -368,6 +369,7 @@ impl State {
             let background = super::output::background(frame.scene, frame.style);
             gl.clear_color(background[0], background[1], background[2], 1.0);
             gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT);
+            gl.clear_buffer_f32_slice(glow::COLOR, 1, &[0.0; 4]);
 
             let material_study = frame.style == Style::Textured
                 && frame.scene.particle_study
@@ -606,7 +608,7 @@ fn expand_attributes(
     normals: &[[f32; 3]],
     tangents: &[[f32; 4]],
 ) -> Vec<f32> {
-    let mut attributes = Vec::with_capacity(order.len() * 48);
+    let mut attributes = Vec::with_capacity(order.len() * 51);
     for &triangle in order {
         let corners = model.triangles[triangle as usize];
         let [a, b, c] = corners.map(|v| positions.get(v as usize).copied().unwrap_or_default());
@@ -649,6 +651,13 @@ fn expand_attributes(
                     .unwrap_or([1.0; 4]),
             );
             attributes.push(f32::from(u8::from(stored_basis)));
+            attributes.push(
+                model
+                    .vertex_ids
+                    .get(vertex as usize)
+                    .copied()
+                    .unwrap_or(vertex) as f32,
+            );
         }
     }
     attributes
@@ -731,6 +740,23 @@ impl Target {
                         return None;
                     }
                 };
+                let normal = match gl.create_renderbuffer() {
+                    Ok(value) => value,
+                    Err(_) => {
+                        gl.delete_renderbuffer(depth);
+                        gl.delete_renderbuffer(color);
+                        gl.delete_framebuffer(fbo);
+                        return None;
+                    }
+                };
+                gl.bind_renderbuffer(glow::RENDERBUFFER, Some(normal));
+                gl.renderbuffer_storage_multisample(
+                    glow::RENDERBUFFER,
+                    samples,
+                    glow::RGBA32F,
+                    size[0],
+                    size[1],
+                );
                 gl.bind_renderbuffer(glow::RENDERBUFFER, Some(color));
                 gl.renderbuffer_storage_multisample(
                     glow::RENDERBUFFER,
@@ -761,6 +787,13 @@ impl Target {
                     glow::RENDERBUFFER,
                     Some(depth),
                 );
+                gl.framebuffer_renderbuffer(
+                    glow::FRAMEBUFFER,
+                    glow::COLOR_ATTACHMENT1,
+                    glow::RENDERBUFFER,
+                    Some(normal),
+                );
+                gl.draw_buffers(&[glow::COLOR_ATTACHMENT0, glow::COLOR_ATTACHMENT1]);
                 let complete =
                     gl.check_framebuffer_status(glow::FRAMEBUFFER) == glow::FRAMEBUFFER_COMPLETE;
                 if complete {
@@ -769,6 +802,7 @@ impl Target {
                         Err(_) => {
                             gl.delete_renderbuffer(depth);
                             gl.delete_renderbuffer(color);
+                            gl.delete_renderbuffer(normal);
                             gl.delete_framebuffer(fbo);
                             return None;
                         }
@@ -802,6 +836,7 @@ impl Target {
                             gl.delete_texture(scene_depth);
                             gl.delete_renderbuffer(depth);
                             gl.delete_renderbuffer(color);
+                            gl.delete_renderbuffer(normal);
                             gl.delete_framebuffer(fbo);
                             return None;
                         }
@@ -822,6 +857,7 @@ impl Target {
                         gl.delete_texture(scene_depth);
                         gl.delete_framebuffer(fbo);
                         gl.delete_renderbuffer(color);
+                        gl.delete_renderbuffer(normal);
                         gl.delete_renderbuffer(depth);
                         continue;
                     }
@@ -830,12 +866,14 @@ impl Target {
                         gl.delete_texture(scene_depth);
                         gl.delete_framebuffer(fbo);
                         gl.delete_renderbuffer(color);
+                        gl.delete_renderbuffer(normal);
                         gl.delete_renderbuffer(depth);
                         return None;
                     };
                     return Some(Self {
                         fbo,
                         color,
+                        normal,
                         depth,
                         size,
                         scene_depth,
@@ -845,6 +883,7 @@ impl Target {
                 }
                 gl.delete_framebuffer(fbo);
                 gl.delete_renderbuffer(color);
+                gl.delete_renderbuffer(normal);
                 gl.delete_renderbuffer(depth);
             }
             None
@@ -856,6 +895,7 @@ impl Target {
         unsafe {
             gl.delete_framebuffer(self.fbo);
             gl.delete_renderbuffer(self.color);
+            gl.delete_renderbuffer(self.normal);
             gl.delete_renderbuffer(self.depth);
             gl.delete_framebuffer(self.scene_fbo);
             gl.delete_texture(self.scene_depth);
@@ -922,7 +962,7 @@ unsafe fn link_feedback(
 unsafe fn compile(gl: &glow::Context, model: &Model) -> Option<(glow::Program, Uniforms)> {
     // SAFETY: live context; shaders are deleted after linking and the program on failure.
     unsafe {
-        let fragment = FRAGMENT.replace(
+        let mut fragment = FRAGMENT.replace(
             "// EFFECT FUNCTIONS",
             &format!(
                 "{}\n{}",
@@ -930,6 +970,13 @@ unsafe fn compile(gl: &glow::Context, model: &Model) -> Option<(glow::Program, U
                 super::effects::native::source(model, false)
             ),
         );
+        if fragment.contains("dFdxFine(") || fragment.contains("dFdyFine(") {
+            fragment = fragment.replacen(
+                "#version 330 core",
+                "#version 330 core\n#extension GL_ARB_derivative_control : require",
+                1,
+            );
+        }
         let vertex = VERTEX.replace(
             "// NATIVE VERTEX FUNCTIONS",
             &super::effects::native::source(model, true),
@@ -1018,7 +1065,7 @@ layout(location = 2) in vec2 aUv;
 layout(location = 3) in vec2 aDetailUv;
 layout(location = 4) in vec4 aStoredTangent;
 layout(location = 5) in vec4 aColor;
-layout(location = 6) in float aBasisValid;
+layout(location = 6) in vec2 aBasisData;
 layout(location = 7) in uvec3 aIndices;
 uniform samplerBuffer uGeometry;
 uniform bool uDeformed;
@@ -1032,7 +1079,7 @@ out vec3 vView;
 out vec3 vNormal;
 out vec2 vUv;
 out vec2 vDetailUv;
-out vec4 vNative[9];
+out vec4 vNative[10];
 flat out float vBasisValid;
 out float vSortDepth;
 // NATIVE VERTEX FUNCTIONS
@@ -1045,7 +1092,7 @@ bool storedBasis(int index){
 void main() {
     vec3 position=aPosition,normal=aStoredNormal;
     aTangent=aStoredTangent;
-    vBasisValid=aBasisValid;
+    vBasisValid=aBasisData.x;
     if(uDeformed){
         int source=int(aIndices.x),b=int(aIndices.y),c=int(aIndices.z);
         position=texelFetch(uGeometry,source*3).xyz;
@@ -1063,7 +1110,7 @@ void main() {
     vView = p;
     vNormal = uRotate * normal;
     vSortDepth=p.z;
-    for(int i=0;i<9;i++)if(any(isnan(vNative[i]))||any(isinf(vNative[i])))vSortDepth=uintBitsToFloat(0x7fc00000u);
+    for(int i=0;i<10;i++)if(any(isnan(vNative[i]))||any(isinf(vNative[i])))vSortDepth=uintBitsToFloat(0x7fc00000u);
     vUv = aUv;
     vDetailUv = aDetailUv;
     gl_Position = vec4(p.x * uScale.x + uPan.x, p.y * uScale.y + uPan.y, p.z * uDepthScale, 1.0);
@@ -1074,7 +1121,7 @@ const FRAGMENT: &str = r#"#version 330 core
 in vec3 vView;
 in vec3 vNormal;
 in vec2 vUv;
-in vec4 vNative[9];
+in vec4 vNative[10];
 flat in float vBasisValid;
 uniform mat3 uRotate;
 uniform sampler2D uAlbedo;
@@ -1098,7 +1145,8 @@ uniform vec3 uDyeAlbedo, uDyeWorn, uEmissive;
 uniform vec4 uParams, uWornParams, uRough, uWornRough, uWear, uDetailTransform, uNormalTransform;
 uniform int uHasLegacyNormal;
 uniform vec3 uLegacyNormal, uLegacyDetail;
-out vec4 fragColor;
+layout(location=0) out vec4 fragColor;
+layout(location=1) out vec4 fragNormal;
 
 uniform vec3 uKeyDir, uHalfDir;
 uniform float uKey, uFill, uExposure;
@@ -1170,7 +1218,9 @@ float studio(vec3 n, float rough) {
     return mix(sharp, 0.32, sat(rough * 2.5));
 }
 
-vec3 light(vec3 albedo, float rough, float metal, float ao, vec3 emission, vec3 n, vec3 tint, float ambient) {
+// iri.rgb is an iridescent texel's specular base and iri.a the factor on its lit colour; a negative
+// alpha means none. Mirrors shader.rs `light`.
+vec3 light(vec3 albedo, float rough, float metal, float ao, vec3 emission, vec3 n, vec4 iri, float ambient) {
     if (n.z > 0.0) n = -n;
     float diffuse = max(dot(n, uKeyDir), 0.0);
     float half_ = max(dot(n, uHalfDir), 0.0);
@@ -1180,15 +1230,19 @@ vec3 light(vec3 albedo, float rough, float metal, float ao, vec3 emission, vec3 
     float highlight = pow(half_, exponent) * (1.2 - 0.8 * glint);
     float fresnel = pow(1.0 - abs(n.z), 5.0);
     float surroundings = studio(n, r);
-    vec3 specular = mix(mix(vec3(0.04), albedo, metal), vec3(1.0), fresnel);
+    bool iridescent = iri.a >= 0.0;
+    vec3 specularBase = iridescent ? clamp(iri.rgb + albedo * metal, 0.0, 1.0) : mix(vec3(0.04), albedo, metal);
+    // Grazing reflectance rises only as far as the surface is smooth. Mirrors shader.rs `light`.
+    vec3 specular = specularBase + (max(vec3(1.0 - r), specularBase) - specularBase) * fresnel;
     vec3 diff = albedo * (1.0 - metal) * (vec3(1.0) - specular) * (uFill * ambient + uKey * diffuse);
-    vec3 refl = tint * specular * (uFill * surroundings * ao + uKey * highlight);
-    return (diff + refl + emission) * uExposure;
+    vec3 refl = specular * (uFill * surroundings * ao + uKey * highlight);
+    return ((diff + refl) * (iridescent ? iri.a : 1.0) + emission) * uExposure;
 }
 
 // EFFECT FUNCTIONS
 void main() {
-    if(uStyle==0 && uNativeIndex>=0){vec3 albedo;vec4 normal;float metal;float ambient;vec3 emission;float coverage;if(nativeSurface(albedo,normal,metal,ambient,emission,coverage)){fragColor=vec4(light(albedo,normal.w,metal,ambient,emission,uRotate*normal.xyz,vec3(1.0),ambient)*coverage,coverage);return;}}
+    fragNormal=vec4(0.0);
+    if(uStyle==0 && uNativeIndex>=0){vec3 albedo;vec4 normal;float metal;float ambient;vec3 emission;float coverage;if(nativeSurface(albedo,normal,metal,ambient,emission,coverage)){fragNormal=vec4(normal.xyz*0.375+vec3(0.5),1.0);fragColor=vec4(light(albedo,normal.w,metal,ambient,emission,uRotate*normal.xyz,vec4(0.0,0.0,0.0,-1.0),ambient)*coverage,coverage);return;}}
     if(uStyle==0 && uNativeIndex>=0 && uEffect>=0){float ambient;fragColor=nativePixel(vec3(0.0),ambient);return;}
     vec2 uv = vUv;
     if (uHasDyeMap == 1 && uStyle == 0) {
@@ -1205,6 +1259,7 @@ void main() {
     bool flatNormal = uFlat == 1 || dot(vNormal, vNormal) < 1e-12;
     vec3 n = flatNormal ? face : normalize(vNormal);
     if (flatNormal && n.z > 0.0) n = -n;
+    fragNormal=vec4((transpose(uRotate)*n)*0.375+vec3(0.5),1.0);
     if (uStyle == 0 && uEffect >= 0) {
         fragColor = effectColor(uv, n);
         return;
@@ -1351,22 +1406,15 @@ void main() {
         albedo=nativeValue.rgb;
         if(nHasIntensity())emission=albedo*nativeValue.a;
     }
-    vec3 tint = vec3(1.0);
+    vec4 iri = vec4(0.0, 0.0, 0.0, -1.0);
     if (painted && uHasIridescence == 1 && uIridescenceId >= 0.0) {
-        float nDotV = sat(abs(n.z));
-        // Row per id, top down. Unused rows hold a magenta placeholder.
+        // Row per id, top down, read at column (n.v)^2 and squared, as the native deferred pass does.
+        // Unused rows hold a magenta placeholder.
         float rows = float(textureSize(uIridescence, 0).y);
-        vec4 iri = texture(uIridescence, vec2(nDotV, (uIridescenceId + 0.5) / rows));
-        bool placeholder = iri.r > 0.98 && iri.g < 0.02 && iri.b > 0.98;
-        float strength = placeholder ? 0.0 : 1.0 - dot(dyeColor, vec3(0.2126, 0.7152, 0.0722));
-        if (placeholder) {
-        } else if (mod(uIridescenceId, 2.0) < 0.5) {
-            albedo = mix(albedo, iri.rgb, strength);
-            metal = mix(metal, 1.0, strength);
-        } else {
-            tint = mix(vec3(1.0), iri.rgb, strength);
-        }
+        vec4 lookup = texture(uIridescence, vec2(sat(n.z * n.z), (uIridescenceId + 0.5) / rows));
+        if (!(lookup.r > 0.98 && lookup.g < 0.02 && lookup.b > 0.98)) iri = lookup * lookup;
     }
-    fragColor = vec4(light(albedo, rough, metal, ao, emission, n, tint, nativeAmbient>=0.0?nativeAmbient:ao), 1.0);
+    fragNormal=vec4((transpose(uRotate)*n)*0.375+vec3(0.5),1.0);
+    fragColor = vec4(light(albedo, rough, metal, ao, emission, n, iri, nativeAmbient>=0.0?nativeAmbient:ao), 1.0);
 }
 "#;

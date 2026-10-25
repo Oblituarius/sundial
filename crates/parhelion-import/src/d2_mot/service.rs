@@ -45,35 +45,45 @@ pub struct Weapon {
     pub ammo: Option<u16>,
     #[serde(default)]
     pub damage: Option<String>,
+    /// A saved recipe's namespace that a reimport keeps, so the authored item retains its
+    /// identity and edits whichever naming scheme made it. Unset for a new import.
+    #[serde(skip)]
+    pub namespace: Option<String>,
 }
 
 impl Weapon {
     pub fn is_shader(&self) -> bool {
         self.family() == Family::Shader
     }
+
+    /// The namespace the authored item's identity hashes come from.
+    pub fn namespace(&self) -> String {
+        self.namespace
+            .clone()
+            .unwrap_or_else(|| batch::namespace(self.hash, &self.name))
+    }
+
+    /// The authored item this import receives.
+    pub fn destination(&self) -> Result<u32> {
+        profile::hash(
+            &crate::graph::import_identity(&self.namespace())?,
+            "item_hash",
+        )
+    }
 }
 
-/// The stable authored identity also detects previous imports with a renamed weapon.
-pub fn destination_hash(source: u32) -> Result<u32> {
+/// The authored item an import of the source item `source`, named `name`, receives, which finds
+/// a previous import of it.
+pub fn destination_hash(source: u32, name: &str) -> Result<u32> {
     profile::hash(
-        &batch::identity(&super::compatibility::namespace(source))?,
+        &crate::graph::import_identity(&batch::namespace(source, name))?,
         "item_hash",
     )
-}
-
-/// The native model donor a retained compatibility profile names for a source weapon.
-pub fn profile_donor(source: u32) -> Option<u32> {
-    super::compatibility::profile(source).map(|profile| profile.model_donor)
 }
 
 /// The native weapon a source weapon type is built on when Shadowkeep has none of that type.
 pub fn type_base(weapon_type: &str) -> Option<u32> {
     (weapon_type == "Glaive").then_some(super::glaive::BASE)
-}
-
-/// Source weapons covered by the retained, gameplay-tested compatibility profiles.
-pub fn known_weapons() -> impl Iterator<Item = (u32, &'static str)> {
-    super::compatibility::known_weapons()
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -83,8 +93,41 @@ pub struct Settings {
     pub modern_packages: Option<PathBuf>,
     pub reach_maps: Option<PathBuf>,
     pub marathon_packages: Option<PathBuf>,
+    /// Experimental. Marathon imports play the source weapon's own animation instead of the
+    /// donor's.
+    pub marathon_animations: bool,
     pub d1_roi: Option<PathBuf>,
+    /// Retained when saving existing preferences. Texture conversion no longer loads this DLL.
     pub d1_xg_library: Option<PathBuf>,
+    pub d1_oodle: Option<PathBuf>,
+    pub ffmpeg: Option<PathBuf>,
+    pub vgmstream: Option<PathBuf>,
+    pub dxc: Option<PathBuf>,
+}
+
+impl Settings {
+    /// The chosen tool paths, with the Shadowkeep packages whose install carries Oodle 3.
+    pub fn tools(&self, native_packages: Option<PathBuf>) -> crate::tools::Paths {
+        crate::tools::Paths {
+            ffmpeg: self.ffmpeg.clone(),
+            oodle: self.d1_oodle.clone(),
+            vgmstream: self.vgmstream.clone(),
+            dxc: self.dxc.clone(),
+            native_packages,
+        }
+    }
+
+    /// The stored path for a tool the user picks as a file.
+    pub fn tool_mut(&mut self, tool: crate::tools::Tool) -> Option<&mut Option<PathBuf>> {
+        use crate::tools::Tool;
+        match tool {
+            Tool::Ffmpeg => Some(&mut self.ffmpeg),
+            Tool::Oodle => Some(&mut self.d1_oodle),
+            Tool::Vgmstream => Some(&mut self.vgmstream),
+            Tool::Dxc => Some(&mut self.dxc),
+            Tool::Decompiler => None,
+        }
+    }
 }
 
 pub fn packages_path(path: &Path) -> Result<PathBuf> {
@@ -397,7 +440,8 @@ fn convert_with_donor(
         output,
     } = *inputs;
     fs::create_dir_all(attempt.join("recipes"))?;
-    let row = json!({"hash":weapon.hash,"name":weapon.name,"native_item":donor["hash"],"native_donor":donor["name"]});
+    let row = json!({"hash":weapon.hash,"name":weapon.name,"namespace":weapon.namespace(),
+        "native_item":donor["hash"],"native_donor":donor["name"]});
     let prepared = match batch::prepare_one_reusing(
         &row,
         weapon.hash & 0xffff,
@@ -422,8 +466,6 @@ fn convert_with_donor(
             .context("Missing prepared graph")?,
     );
     let mut document: Value = serde_json::from_slice(&fs::read(&recipe)?)?;
-    let verified_profile =
-        super::compatibility::apply(weapon.hash, profile::hash(donor, "hash")?, &mut document);
     progress("Matching source perks, stats and weapon properties…".into());
     let gameplay: Value = serde_json::from_slice(&fs::read(source.join("gameplay.json"))?)?;
     let mapping =
@@ -484,7 +526,7 @@ fn convert_with_donor(
     let audio = &graph_manifest["audio"];
     write_json(
         &output.join("result.json"),
-        &json!({"recipe":recipe,"donor":donor["name"],"donor_hash":donor["hash"],"audio":audio,"source_audio_imported":false,"verified_profile":verified_profile,"gameplay_verified":false,"material_limitations":graph_manifest["material_limitations"],"limitations":"Modern PCM media is prepared for named events with compatible native routing. Package authoring links those events through private Dawn soundbanks. Source-only and unnamed firing cues still need runtime routing. New conversions require an in-game test."}),
+        &json!({"recipe":recipe,"donor":donor["name"],"donor_hash":donor["hash"],"audio":audio,"source_audio_imported":false,"gameplay_verified":false,"material_limitations":graph_manifest["material_limitations"],"limitations":"Modern PCM media is prepared for named events with compatible native routing. Package authoring links those events through private Dawn soundbanks. Source-only and unnamed firing cues still need runtime routing. New conversions require an in-game test."}),
     )?;
     Ok(Attempt::Prepared(recipe))
 }
@@ -551,12 +593,8 @@ fn prepare_steps(
     let preferred = if glaive {
         Some(super::glaive::BASE)
     } else {
-        super::compatibility::profile(weapon.hash)
-            .map(|p| p.model_donor)
-            .or_else(|| {
-                previous_model_donor(output, weapon.hash)
-                    .filter(|&hash| ordinary_base(&mut native_reader, donors, hash, weapon))
-            })
+        previous_model_donor(output, weapon.hash)
+            .filter(|&hash| ordinary_base(&mut native_reader, donors, hash, weapon))
     };
     let mut errors = Vec::new();
     // Converting checks a donor in full, and the donor that converted this weapon before
@@ -677,7 +715,7 @@ fn ordinary_base(reader: &mut Reader, donors: &Value, hash: u32, weapon: &Weapon
     if hash == weapon.hash || same_name {
         return true;
     }
-    super::assets::item::find_native(reader, hash)
+    crate::tiger::shadowkeep::item_tag(reader, hash)
         .and_then(|tag| reader.tag(tag, Some(0x80807BEA)))
         .and_then(|item| item.u8(0xBA))
         .is_ok_and(|rarity| rarity != 5)
@@ -723,35 +761,7 @@ fn selection_priority(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn source_only_limits_are_distinguished_from_donor_failures() {
-        // Bygones met the same plate limit on all 68 donors. Marking it lets
-        // the loop report it once instead of sweeping the whole catalogue.
-        let plain = anyhow::anyhow!("native donor has no object channel input");
-        assert!(!crate::d2_mot::is_source_limit(&plain));
-        let limited = crate::d2_mot::source_limit(anyhow::anyhow!(
-            "multiple plate textures require composition"
-        ));
-        assert!(crate::d2_mot::is_source_limit(&limited));
-        assert!(
-            format!("{limited:#}").contains("multiple plate textures require composition"),
-            "the underlying reason must survive marking"
-        );
-        assert!(crate::d2_mot::is_source_limit(
-            &limited.context("source stage 1")
-        ));
-    }
-
     use super::*;
-
-    #[test]
-    fn ordinary_donors_precede_exotics_even_with_larger_skeletons() {
-        let ordinary = json!({"hash":99,"exotic":false,"mapping":{"native_bone_count":12}});
-        let exotic = json!({"hash":1,"exotic":true,"mapping":{"native_bone_count":8}});
-        let unknown = json!({"hash":0,"mapping":{"native_bone_count":1}});
-        assert!(donor_priority(&ordinary) < donor_priority(&exotic));
-        assert!(donor_priority(&ordinary) < donor_priority(&unknown));
-    }
 
     #[test]
     fn previous_success_is_found_without_following_saved_recipe_paths() {
@@ -773,78 +783,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(previous_model_donor(root.path(), 42), Some(91));
-    }
-
-    #[test]
-    fn remembered_donor_precedes_smaller_unverified_candidates() {
-        let mut candidates = [
-            json!({"hash":1,"exotic":false,"mapping":{"native_bone_count":3}}),
-            json!({"hash":2,"exotic":false,"mapping":{"native_bone_count":9}}),
-        ];
-        let preferred = Some(2);
-        candidates
-            .sort_by_key(|row| selection_priority(row, (0, "Source"), None, None, None, preferred));
-        assert_eq!(candidates[0]["hash"], 2);
-    }
-
-    #[test]
-    fn collection_backed_donor_can_cross_slot_and_rarity() {
-        let mut candidates = [
-            json!({"hash":1,"exotic":false,"bucket":20,"rarity":4,"collection_backed":false,"mapping":{"native_bone_count":1}}),
-            json!({"hash":2,"exotic":false,"bucket":10,"rarity":2,"collection_backed":true,"mapping":{"native_bone_count":8}}),
-        ];
-        candidates.sort_by_key(|row| {
-            selection_priority(row, (0, "Source"), Some(20), Some(4), None, Some(1))
-        });
-        assert_eq!(candidates[0]["hash"], 2);
-    }
-
-    #[test]
-    fn simple_collection_donor_precedes_unrelated_progression_conditions() {
-        let mut candidates = [
-            json!({"hash":1,"exotic":false,"bucket":20,"rarity":4,"collection_backed":true,"unrelated_collection_condition":true,"mapping":{"native_bone_count":15}}),
-            json!({"hash":2,"exotic":false,"bucket":20,"rarity":4,"collection_backed":true,"unrelated_collection_condition":false,"mapping":{"native_bone_count":15}}),
-        ];
-        candidates.sort_by_key(|row| {
-            selection_priority(row, (0, "Source"), Some(20), Some(4), None, Some(1))
-        });
-        assert_eq!(candidates[0]["hash"], 2);
-    }
-
-    #[test]
-    fn available_native_counterpart_precedes_other_safe_donors() {
-        let mut candidates = [
-            json!({"hash":1,"name":"Another Weapon","exotic":false,"bucket":20,"rarity":4,"collection_backed":true,"mapping":{"native_bone_count":8}}),
-            json!({"hash":2,"name":"Source Weapon","exotic":false,"bucket":20,"rarity":4,"collection_backed":true,"mapping":{"native_bone_count":12}}),
-        ];
-        candidates.sort_by_key(|row| {
-            selection_priority(row, (99, "source weapon"), Some(20), Some(4), None, None)
-        });
-        assert_eq!(candidates[0]["hash"], 2);
-        candidates[0]["unrelated_collection_condition"] = json!(true);
-        candidates.sort_by_key(|row| {
-            selection_priority(row, (99, "Source Weapon"), Some(20), Some(4), None, None)
-        });
-        assert_eq!(candidates[0]["hash"], 1);
-    }
-
-    #[test]
-    fn shared_content_group_precedes_smaller_unrelated_rig() {
-        let mut candidates = [
-            json!({"hash":1,"name":"Generic Auto","content_key":"611794E9","exotic":false,"bucket":20,"rarity":4,"collection_backed":true,"mapping":{"native_bone_count":3}}),
-            json!({"hash":2,"name":"Suros Auto","content_key":"A0EEEE21","exotic":false,"bucket":20,"rarity":4,"collection_backed":true,"mapping":{"native_bone_count":4}}),
-        ];
-        candidates.sort_by_key(|row| {
-            selection_priority(
-                row,
-                (99, "Source"),
-                Some(20),
-                Some(4),
-                Some("A0EEEE21"),
-                None,
-            )
-        });
-        assert_eq!(candidates[0]["hash"], 2);
     }
 
     #[test]

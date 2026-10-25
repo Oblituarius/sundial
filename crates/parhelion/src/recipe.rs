@@ -56,7 +56,7 @@ pub(crate) fn validate_parhelion_namespace(namespace: &str) -> Result<(), String
 pub(crate) const ARC_LOGIC_DONOR_HASH: u32 = 0xA25B_8F8F;
 #[cfg(test)]
 pub(crate) const ARC_LOGIC_DONOR_NAME: &str = "Arc Logic";
-pub const DEFAULT_SOURCE_TEXT: &str = "Source: Guardians Made Their Own Fate";
+pub const DEFAULT_SOURCE_TEXT: &str = "Source: Guardians Make Their Own Fate";
 #[cfg(test)]
 const MOUNTAINTOP_DONOR_HASH: u32 = 0xEE06_B019;
 #[cfg(test)]
@@ -150,7 +150,7 @@ impl fmt::Display for ParseHexHashError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "Expected a canonical hash such as 0x89ABCDEF; got {:?}",
+            "Expected a canonical hash such as 0x89ABCDEF, got {:?}",
             self.0
         )
     }
@@ -358,6 +358,12 @@ pub struct WeaponSocketColumnRecipe {
     pub reusable_plug_set_index: Option<u16>,
     pub randomized_plug_set_index: Option<u16>,
     pub randomized_selection_program: Vec<WeaponNumericInstructionRecipe>,
+    /// How many leading `choices` stay freely swappable in the socket's own list. When set, every
+    /// choice also joins a private randomized plug set the socket rolls from, the way a stock
+    /// random-roll perk column keeps its curated perks beside its randomized pool. Omitted keeps
+    /// every choice swappable and adds no pool.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reusable_choices: Option<u16>,
 }
 
 /// Runtime edits applied through a private clone of one finished sandbox perk on a socket plug.
@@ -693,6 +699,10 @@ pub struct WeaponRecipeOverrides {
     /// donor's weapon type and creates the shared page when that combination is not stock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collection_destination: Option<crate::collection::Destination>,
+    /// Where the item sits among a stock Collections page's own entries. `None` places it first
+    /// unless another installed Sunrise mod changes the presentation nodes, then last.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection_position: Option<crate::collection::Position>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub exclude_from_sunrise_badge: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1145,6 +1155,7 @@ impl WeaponRecipe {
         let previous = std::mem::take(&mut self.overrides);
         self.overrides = WeaponRecipeOverrides {
             collection_destination: previous.collection_destination,
+            collection_position: previous.collection_position,
             exclude_from_sunrise_badge: previous.exclude_from_sunrise_badge,
             badge: previous.badge,
             corner_icon: previous.corner_icon,

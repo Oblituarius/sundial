@@ -14,6 +14,7 @@ pub(super) struct Depth {
     pub index: u32,
     pub source: u32,
     pub native: u32,
+    pub vectors: u8,
 }
 
 // Only vector zero has an equivalent producer in both transparent scopes.
@@ -42,6 +43,29 @@ fn depth_producer(scope: &Payload, field: usize, write: u8) -> Result<()> {
         }
     }
     ensure!(found, "Transparent depth vector has no producer");
+    Ok(())
+}
+
+fn irradiance_producer(scope: &Payload, field: usize, source: bool) -> Result<()> {
+    let range = scope.array_range(field, 1, Some(0x80800009))?;
+    let code = &scope.0[range];
+    for row in 2..=4 {
+        let expected = [
+            0x3D,
+            if source { 41 } else { 39 },
+            row + if source { 1 } else { 4 },
+            if source { 0x42 } else { 0x43 },
+            row,
+        ];
+        let writes = code
+            .chunks_exact(5)
+            .filter(|pair| pair[3] == expected[3] && pair[4] == row)
+            .collect::<Vec<_>>();
+        ensure!(
+            writes.len() == 1 && writes[0] == expected,
+            "Transparent irradiance vector producer differs"
+        );
+    }
     Ok(())
 }
 
@@ -159,10 +183,25 @@ impl Globals {
         );
         depth_producer(&source_depth, 0x38, 0x42)?;
         depth_producer(&native_depth, 0x58, 0x43)?;
+        irradiance_producer(&source_depth, 0x38, true)?;
+        irradiance_producer(&native_depth, 0x58, false)?;
+        for (scope, field, texture, bind) in [
+            (&source_depth, 0x38, 2, 0x46),
+            (native_depth.as_ref(), 0x58, 7, 0x47),
+        ] {
+            let code = scope.array_range(field, 1, Some(0x80800009))?;
+            ensure!(
+                scope.0[code]
+                    .chunks_exact(5)
+                    .any(|row| row[..4] == [0x3F, 3, texture, bind] && row[4] >> 5 == 1),
+                "Transparent scene-depth texture producer differs"
+            );
+        }
         let depth = Depth {
             index: source_index as u32,
             source: source_depth.u32(0x90)?,
             native: native_depth.u32(0xB8)?,
+            vectors: 0b0001_1101,
         };
         ensure!(
             (1..=9).contains(&depth.source)
@@ -214,6 +253,8 @@ const POWER_SCALE: f32 = 400.0 / 1060.0;
 pub(super) struct Inputs<'a> {
     pub globals: &'a Globals,
     pub dye: Option<&'a Payload>,
+    /// No channel can populate the freshly zeroed source gear-dye extern.
+    pub empty_palette: bool,
     pub secondary: bool,
     pub plates: &'a [String; 3],
     pub detail: &'a [String; 2],
@@ -224,6 +265,8 @@ pub(super) struct Inputs<'a> {
     pub samplers: usize,
     pub stage: u8,
     pub reticle: bool,
+    /// Standalone light parameters use the paired source and native light exposure inputs.
+    pub light: bool,
 }
 
 pub(super) struct Program {
@@ -285,6 +328,7 @@ pub(super) fn operand_bytes(op: u8) -> Result<usize> {
     })
 }
 
+#[allow(clippy::cognitive_complexity)]
 pub(super) fn translate(code: &[u8], constants: Vec<u8>, inputs: &Inputs<'_>) -> Result<Program> {
     ensure!(
         constants.len().is_multiple_of(16) && constants.len() / 16 <= 256,
@@ -329,6 +373,18 @@ pub(super) fn translate(code: &[u8], constants: Vec<u8>, inputs: &Inputs<'_>) ->
                     at += 2;
                     continue;
                 }
+                if matches!(args, [3, 2 | 8]) {
+                    ensure!(
+                        inputs.stage == 1,
+                        "Scene textures are only validated for pixel stages"
+                    );
+                    // Original render-pass writers publish depth at +10/+38 and stencil
+                    // at +40/+78. Texture operands address eight-byte fields.
+                    let field = if args[1] == 2 { 7 } else { 15 };
+                    result.code.extend([0x3F, 3, field, 0x47, slot]);
+                    at += 2;
+                    continue;
+                }
                 let symbol = match args {
                     [25, index @ 0..=2] => &inputs.plates[usize::from(*index)],
                     [27, index @ 0..=1] => &inputs.detail[usize::from(*index)],
@@ -336,10 +392,14 @@ pub(super) fn translate(code: &[u8], constants: Vec<u8>, inputs: &Inputs<'_>) ->
                 };
                 if symbol.is_empty()
                     && let [27, index @ 0..=1] = args
-                    && let Some(dye) = inputs.dye
-                    && dye.u32(0x60 + usize::from(*index) * 4)? == u32::MAX
+                    && (if let Some(dye) = inputs.dye {
+                        dye.u32(0x60 + usize::from(*index) * 4)? == u32::MAX
+                    } else {
+                        inputs.empty_palette
+                    })
                 {
-                    // Source 008C4080 writes a null resource for the absent tag.
+                    // Source 008C4080 writes a null resource for an absent tag. With no dyes,
+                    // the gear extern retains the null pointers from allocator 00855E80.
                     // Native 34 pushes its raw vector and 47 binds its low qword.
                     result.constant([0; 16])?;
                     result.code.extend([0x47, slot]);
@@ -354,6 +414,11 @@ pub(super) fn translate(code: &[u8], constants: Vec<u8>, inputs: &Inputs<'_>) ->
                 at += 2;
             }
             0x3D => {
+                if args == [3, 0] {
+                    // Both checked transparent scopes consume the same depth vector.
+                    result.code.extend([0x3D, 3, 0]);
+                    continue;
+                }
                 if let [75, field @ 4..=5] = args {
                     ensure!(
                         inputs.reticle,
@@ -387,8 +452,19 @@ pub(super) fn translate(code: &[u8], constants: Vec<u8>, inputs: &Inputs<'_>) ->
                             }
                             value
                         } else {
-                            ensure!(*index == 3, "Source material needs an absent equipment dye");
-                            vector([0., 0., 0., 1.])
+                            ensure!(
+                                inputs.empty_palette || *index == 3,
+                                "Source material needs an absent equipment dye"
+                            );
+                            // Fresh gear externs are zeroed. Source 00885547 sets specular to
+                            // (0, 0, 1, 0), then 00885560 sets normal W to one for a missing dye.
+                            // Only a wholly empty palette guarantees the other fields were not
+                            // populated by a previously drawn channel.
+                            match *index {
+                                2 => vector([0., 0., 1., 0.]),
+                                3 => vector([0., 0., 0., 1.]),
+                                _ => [0; 16],
+                            }
                         }
                     }
                     _ => anyhow::bail!("Unsupported source equipment vector {args:?}"),
@@ -396,13 +472,15 @@ pub(super) fn translate(code: &[u8], constants: Vec<u8>, inputs: &Inputs<'_>) ->
                 result.constant(value)?;
             }
             0x3C => match args {
+                [4, 64] | [1, 7] if inputs.light => result.code.extend([op, args[0], args[1]]),
                 [1, 0 | 1] => result.code.extend([op, args[0], args[1]]),
                 // The inspected D1 frame producer writes zero to this fade input.
                 [1, 28] => result.constant([0; 16])?,
                 _ => anyhow::bail!("Untranslated source frame input {args:?}"),
             },
-            // Both view externs provide the reticle projection at matrix six.
-            0x3E if args == [2, 6] => result.code.extend([op, 2, 6]),
+            // The source and native view producers retain these matrix blocks at
+            // extern byte offsets 0x20, 0x60 and 0x120 despite camera layout changes.
+            0x3E if matches!(args, [2, 2 | 6 | 18]) => result.code.extend([op, 2, args[1]]),
             0x3E | 0x40 => anyhow::bail!("Untranslated source matrix or integer extern {args:?}"),
             0x4A => {
                 ensure!(

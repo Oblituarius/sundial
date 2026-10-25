@@ -1,5 +1,7 @@
 mod account_resync;
 mod activity_log;
+#[cfg(feature = "d2-model-importer")]
+mod activity_view;
 mod events;
 mod fields;
 mod icon_preview;
@@ -98,6 +100,13 @@ struct PackageAuthoringApp {
     /// takes back exactly those and never a perk the author placed by hand.
     behavior_pins: socket_editor::BehaviorPins,
     observed_recipe: WeaponRecipe,
+    /// Undo and redo for the open recipe, one step per edit. Each step keeps the behavior pins
+    /// beside the recipe, so a perk a behavior placed comes back as the behavior's to take back.
+    recipe_history:
+        custom_perks::workbench::history::History<(WeaponRecipe, socket_editor::BehaviorPins)>,
+    /// The recipe and behavior pins as `recipe_history` last saw them.
+    recorded_recipe: WeaponRecipe,
+    recorded_pins: socket_editor::BehaviorPins,
     /// Advances whenever the recipe or its baseline is replaced or edited.
     recipe_revision: u64,
     recipe_baseline: WeaponRecipe,
@@ -123,6 +132,8 @@ struct PackageAuthoringApp {
     recipe_entries: Vec<RecipeLibraryEntry>,
     /// The maps folder's recipes, none without the D2 model importer.
     map_entries: Vec<crate::recipe_library::MapLibraryEntry>,
+    #[cfg(feature = "d2-model-importer")]
+    activity_editor: Option<activity_view::Editor>,
     /// The recipes and maps the next build includes.
     enabled_recipe_paths: BTreeSet<PathBuf>,
     packages: PathBuf,
@@ -135,6 +146,9 @@ struct PackageAuthoringApp {
     install_status: build_status::InstallStatus,
     build_started: Option<Instant>,
     latest_build: Option<Result<BuildReport, String>>,
+    /// A build kept from an earlier install for this runtime, under review to install again in
+    /// place of the latest build.
+    restore: Option<BuildReport>,
     /// The namespace of the recipe the latest build stopped on, when one recipe caused it.
     build_blocker: Option<String>,
     build_status_open: bool,
@@ -145,6 +159,8 @@ struct PackageAuthoringApp {
     backup_recipe_snapshots: bool,
     show_preview_fps: bool,
     play_preview_animations: bool,
+    load_preview_models: bool,
+    ability_notice_dismissed: bool,
     preferences_open: bool,
     preferences_error: Option<String>,
     perk_workbench: custom_perks::workbench::Workbench,
@@ -227,6 +243,8 @@ struct PackageAuthoringApp {
     socket_choice_pages: Vec<usize>,
     plug_selection_mode: PlugSelectionMode,
     show_plug_safety_warnings: bool,
+    /// Whether the selected installation's runtime loads Sunrise mods, read when the window opens.
+    mod_loader: bool,
     show_experimental_options: bool,
     preferences_changed: bool,
     open_sundial_preferences: bool,
@@ -294,8 +312,11 @@ impl Default for PackageAuthoringApp {
         let observed_recipe = recipe.clone();
         Self {
             recipe_baseline: recipe.clone(),
+            recorded_recipe: recipe.clone(),
+            recorded_pins: socket_editor::BehaviorPins::default(),
             recipe,
             observed_recipe,
+            recipe_history: Default::default(),
             recipe_revision: 0,
             recipe_path,
             recipe_dirty: false,
@@ -316,6 +337,8 @@ impl Default for PackageAuthoringApp {
             recipe_library,
             recipe_entries,
             map_entries: Vec::new(),
+            #[cfg(feature = "d2-model-importer")]
+            activity_editor: None,
             enabled_recipe_paths,
             packages: PathBuf::new(),
             staging: default_staging_root().display().to_string(),
@@ -327,6 +350,7 @@ impl Default for PackageAuthoringApp {
             install_status: build_status::InstallStatus::default(),
             build_started: None,
             latest_build: None,
+            restore: None,
             build_blocker: None,
             build_status_open: false,
             backup_root: default_backup_root().display().to_string(),
@@ -336,6 +360,8 @@ impl Default for PackageAuthoringApp {
             backup_recipe_snapshots: backup_preferences.backup_recipe_snapshots,
             show_preview_fps: backup_preferences.show_preview_fps,
             play_preview_animations: backup_preferences.play_preview_animations,
+            load_preview_models: backup_preferences.load_preview_models,
+            ability_notice_dismissed: backup_preferences.ability_notice_dismissed,
             preferences_open: false,
             preferences_error: None,
             perk_workbench: custom_perks::workbench::Workbench::default(),
@@ -400,6 +426,7 @@ impl Default for PackageAuthoringApp {
             socket_choice_pages: Vec::new(),
             plug_selection_mode: sundial::investment::default_plug_selection_mode(),
             show_plug_safety_warnings: sundial::investment::show_plug_safety_warnings(),
+            mod_loader: false,
             show_experimental_options: false,
             behavior_pins: socket_editor::BehaviorPins::default(),
             preferences_changed: false,
@@ -468,12 +495,11 @@ impl PackageAuthoringApp {
         self.runtime_dependencies.poll();
         self.barrel_controls.poll_finished();
         if self.upgrade.open || self.upgrade.busy() {
-            egui::CentralPanel::default().show(ui, |ui| {
-                if !self.upgrade.open {
-                    ui.spinner();
-                    ui.label("Checking Installation…");
-                }
-            });
+            if self.upgrade.open {
+                egui::CentralPanel::default().show(ui, |_| {});
+            } else {
+                self.draw_upgrade_loading_screen(ui);
+            }
             if self.upgrade.open {
                 self.draw_upgrade_window(ctx);
             }
@@ -497,6 +523,7 @@ impl PackageAuthoringApp {
             ctx.request_repaint_after(Duration::from_millis(100));
             return;
         }
+        self.start_upgrade_build(ctx);
         self.ensure_runtime_graph(ctx);
         egui::Panel::bottom("parhelion_build_actions")
             .resizable(false)
@@ -514,10 +541,7 @@ impl PackageAuthoringApp {
         egui::CentralPanel::default().show(ui, |ui| {
             workbench_style(ui);
             ui.set_max_width(safe_content_width(ui.available_width()));
-            let running = self.build_receiver.is_some()
-                || self.library_state.busy()
-                || self.install_receiver.is_some()
-                || self.perk_workbench.editing();
+            let running = self.recipe_editing_locked();
             let mut recipe_replaced = false;
             ui.add_enabled_ui(!running, |ui| {
                 recipe_replaced |= self.draw_recipe_library(ui);
@@ -562,8 +586,12 @@ impl PackageAuthoringApp {
         self.draw_build_check(ctx);
         self.draw_discard_confirmation(ctx);
         self.draw_library_windows(ctx);
+        #[cfg(feature = "d2-model-importer")]
+        self.draw_activity_editor(ctx);
         self.synchronize_recipe_dirty();
         self.follow_appearance_preview(ctx);
+        self.recipe_history_shortcuts(ctx);
+        self.record_recipe_history(ctx);
         if self.has_background_work() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
@@ -594,6 +622,27 @@ impl PackageAuthoringApp {
                 message: progress.message,
                 completed: progress.completed,
                 total: progress.total,
+                source_path: self.packages.parent().or(Some(self.packages.as_path())),
+            },
+        );
+    }
+
+    /// The startup check for packages an earlier build left, on the catalog's loading surface.
+    fn draw_upgrade_loading_screen(&mut self, ui: &mut egui::Ui) {
+        let logo = self
+            .logo
+            .get_or_insert_with(|| load_parhelion_logo_texture(ui.ctx()))
+            .clone();
+        let (message, completed, total) = self.upgrade.progress();
+        draw_catalog_loading_view(
+            ui,
+            &logo,
+            CatalogLoadingView {
+                product_name: WINDOW_TITLE,
+                version: sundial::version::display(),
+                message,
+                completed,
+                total,
                 source_path: self.packages.parent().or(Some(self.packages.as_path())),
             },
         );
@@ -688,6 +737,7 @@ impl PackageAuthoringApp {
         self.runtime_donors.invalidate();
         self.invalid_weapon_name = None;
         self.clear_presentation_picker_queries();
+        self.subclass_page.cancel_loads();
         self.perk_request = None;
         self.runtime_bindings_open = false;
         self.workbench_page = WorkbenchPage::Weapon;
@@ -744,6 +794,8 @@ impl PackageAuthoringApp {
             backup_recipe_snapshots: self.backup_recipe_snapshots,
             show_preview_fps: self.show_preview_fps,
             play_preview_animations: self.play_preview_animations,
+            load_preview_models: self.load_preview_models,
+            ability_notice_dismissed: self.ability_notice_dismissed,
             ..ParhelionPreferences::default()
         };
         match preferences.save_default() {
@@ -837,6 +889,8 @@ mod editor_view;
 mod emblem_view;
 mod gear_view;
 mod image_files;
+#[cfg(feature = "d2-model-importer")]
+mod imported_view;
 mod installed;
 mod jobs;
 mod mod_view;

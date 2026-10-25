@@ -14,9 +14,10 @@ pub fn appearance(reference: &GraphReference, kind: &str) -> LocalAppearance {
     let reference = reference.clone();
     let kind = kind.to_owned();
     let key = format!(
-        "{}:{}:{kind:?}",
+        "{}:{}:{kind:?}:{:?}",
         reference.directory.display(),
-        reference.sha256
+        reference.sha256,
+        reference.material_inputs
     );
     LocalAppearance::new(key, move |manager| read(&reference, &kind, manager))
 }
@@ -42,7 +43,8 @@ fn read(
         .directory
         .canonicalize()
         .map_err(|e| e.to_string())?;
-    let (package, symbols, entries) = prepare(&graph, &root, manager)?;
+    let (package, symbols, entries) =
+        prepare(&graph, &root, manager, reference.material_inputs.as_ref())?;
     // Validate after reading too, so concurrent file changes cannot assemble a mixed graph.
     validate(reference, item_kind)?;
     manager.add_local_package(package, entries)?;
@@ -65,6 +67,7 @@ fn prepare(
     graph: &Value,
     root: &Path,
     manager: &PackageManager,
+    inputs: Option<&crate::marathon::MaterialInputs>,
 ) -> Result<(u16, Symbols, Entries), String> {
     let nodes = graph["nodes"]
         .as_array()
@@ -93,6 +96,8 @@ fn prepare(
     }
     let mut bound = crate::tiger::material::bind(graph, root)
         .map_err(|e| format!("Imported model bindings: {e:#}"))?;
+    crate::marathon::inputs::bind(graph, root, inputs, &mut bound)
+        .map_err(|e| format!("Imported material inputs: {e:#}"))?;
     let models = crate::model_symbols(graph).map_err(|e| e.to_string())?;
     let entries = nodes
         .iter()
@@ -181,6 +186,7 @@ fn scene(
     symbols: &Symbols,
     manager: &PackageManager,
 ) -> Result<LocalScene, String> {
+    let dyes = source_dyes(graph, item_kind, symbols)?;
     // A weapon converted as art parts (D1 Rise of Iron) carries its gear art rows and is
     // read like any other arrangement below.
     if item_kind == "weapon" && graph.get("gear_art").is_none() {
@@ -196,14 +202,14 @@ fn scene(
             .map_err(|e| e.to_string())?;
         // A weapon with no private dyes is painted in game by its native donor's default
         // dyes, which the gear path binds. The converted programs multiply by those vectors.
-        let stock_dyes = if graph["dyes"].as_array().is_none_or(Vec::is_empty) {
+        let stock_dyes = if !graph["dyes"].is_array() {
             donor_default_dyes(manager, graph)?
         } else {
             Vec::new()
         };
         return Ok(LocalScene {
             entities: vec![entity],
-            dyes: BTreeMap::new(),
+            dyes,
             stock_dyes,
         });
     }
@@ -260,41 +266,8 @@ fn scene(
                 .map_err(|e| e.to_string())?,
         );
     }
-    let mut dyes = BTreeMap::new();
-    if let Some(source_dyes) = graph["dyes"].as_array() {
-        let layers = graph["dye_rows"]
-            .as_array()
-            .filter(|rows| rows.len() == 3)
-            .ok_or("Imported appearance dye layers missing")?;
-        for layer in [1, 0, 2] {
-            for row in layers[layer]
-                .as_array()
-                .ok_or("Imported appearance dye layer invalid")?
-            {
-                let first = match item_kind {
-                    "armor" => 0,
-                    "ship" => 7,
-                    "sparrow" => 10,
-                    "ghost_shell" => 13,
-                    _ => return Err("Imported appearance kind has no dye slots".into()),
-                };
-                let source = source_dyes
-                    .get(word(&row["dye"])? as usize)
-                    .ok_or("Imported preview dye missing")?;
-                if row["channel"] != source["channel"] {
-                    return Err("Imported preview dye channel differs".into());
-                }
-                let channel = word(&row["channel"])?;
-                let slot = channel
-                    .checked_sub(first)
-                    .filter(|slot| *slot < 3)
-                    .ok_or("Imported preview dye channel invalid")?;
-                dyes.insert(slot as usize, tag(symbols, &source["parent"])?);
-            }
-        }
-    }
-    // A weapon's art parts are painted in game by its native donor's default dyes, as above.
-    let stock_dyes = if item_kind == "weapon" && dyes.is_empty() {
+    // An explicit empty dye array clears the donor's dyes during emission too.
+    let stock_dyes = if item_kind == "weapon" && !graph["dyes"].is_array() {
         donor_default_dyes(manager, graph)?
     } else {
         Vec::new()
@@ -304,6 +277,58 @@ fn scene(
         dyes,
         stock_dyes,
     })
+}
+
+fn source_dyes(
+    graph: &Value,
+    item_kind: &str,
+    symbols: &Symbols,
+) -> Result<BTreeMap<usize, u32>, String> {
+    let first = match item_kind {
+        "armor" => 0,
+        "weapon" => 4,
+        "ship" => 7,
+        "sparrow" => 10,
+        "ghost_shell" => 13,
+        _ => return Err("Imported appearance kind has no dye slots".into()),
+    };
+    let slot = |channel: &Value| -> Result<usize, String> {
+        word(channel)?
+            .checked_sub(first)
+            .filter(|slot| *slot < 3)
+            .map(|slot| slot as usize)
+            .ok_or_else(|| "Imported preview dye channel invalid".into())
+    };
+    let mut dyes = BTreeMap::new();
+    if let Some(source_dyes) = graph["dyes"].as_array() {
+        // Legacy weapon graphs declare baseline channels directly. Gear graphs also name
+        // their custom, default and locked layers, whose precedence matches native emission.
+        if item_kind == "weapon" && graph.get("gear_art").is_none() {
+            for source in source_dyes {
+                dyes.insert(slot(&source["channel"])?, tag(symbols, &source["parent"])?);
+            }
+            return Ok(dyes);
+        }
+        let layers = graph["dye_rows"]
+            .as_array()
+            .filter(|rows| rows.len() == 3)
+            .ok_or("Imported appearance dye layers missing")?;
+        for layer in [1, 0, 2] {
+            for row in layers[layer]
+                .as_array()
+                .ok_or("Imported appearance dye layer invalid")?
+            {
+                let source = source_dyes
+                    .get(word(&row["dye"])? as usize)
+                    .ok_or("Imported preview dye missing")?;
+                if row["channel"] != source["channel"] {
+                    return Err("Imported preview dye channel differs".into());
+                }
+                dyes.insert(slot(&row["channel"])?, tag(symbols, &source["parent"])?);
+            }
+        }
+    }
+    Ok(dyes)
 }
 
 /// The native donor item's own default dyes, read from its definition the way the catalog
@@ -352,11 +377,11 @@ fn validate(reference: &GraphReference, kind: &str) -> Result<(), String> {
             return Err("Choose a weapon appearance for weapon artwork".into());
         }
         reference
-            .validate(word(&graph["item_hash"])?)
+            .validate_opened(word(&graph["item_hash"])?)
             .map_err(|e| format!("{e:#}"))
     } else {
         reference
-            .validate_reusable(kind)
+            .validate_reusable_opened(kind)
             .map_err(|e| format!("{e:#}"))
     }
 }

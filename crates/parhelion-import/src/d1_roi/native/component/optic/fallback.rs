@@ -48,8 +48,16 @@ impl Assembly<'_> {
                     && root.u64(at + 56)? == (definition + 0x60) as u64,
                 "Inherited aim provider is not the root skeleton"
             );
-            let bones = skeleton.array(definition + 0x98, 16, Some(0x808004F4))?;
-            let inverse = skeleton.array(definition + 0xB8, 32, Some(0x808001B0))?;
+            let bones = skeleton.array(
+                definition + self.source.field(0x98, 0x88),
+                16,
+                Some(0x808004F4),
+            )?;
+            let inverse = skeleton.array(
+                definition + self.source.field(0xB8, 0xA8),
+                32,
+                Some(0x808001B0),
+            )?;
             let bone = *bones.first().context("Inherited aim root bone")?;
             let transform = *inverse.first().context("Inherited aim root transform")?;
             ensure!(

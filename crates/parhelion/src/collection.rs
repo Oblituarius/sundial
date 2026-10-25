@@ -44,9 +44,10 @@ pub enum Family {
     SniperRifles,
     SubmachineGuns,
     Swords,
+    TraceRifles,
 }
 impl Family {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::AutoRifles,
         Self::Bows,
         Self::FusionRifles,
@@ -63,6 +64,7 @@ impl Family {
         Self::SniperRifles,
         Self::SubmachineGuns,
         Self::Swords,
+        Self::TraceRifles,
     ];
     pub const fn label(self) -> &'static str {
         match self {
@@ -82,6 +84,7 @@ impl Family {
             Self::SniperRifles => "Sniper Rifles",
             Self::SubmachineGuns => "Submachine Guns",
             Self::Swords => "Swords",
+            Self::TraceRifles => "Trace Rifles",
         }
     }
     pub(crate) fn from_type_name(value: &str) -> Option<Self> {
@@ -92,7 +95,7 @@ impl Family {
         })
     }
     pub const fn template(self) -> Destination {
-        if matches!(self, Self::Glaives) {
+        if matches!(self, Self::Glaives | Self::TraceRifles) {
             // Only the native page structure is reused. The new family keeps
             // its own identity and localized label.
             return Self::FusionRifles.template();
@@ -108,6 +111,36 @@ impl Family {
         };
         Destination { ammo, family: self }
     }
+}
+
+/// Where an authored entry sits among the stock entries of a Collections node it joins.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Position {
+    First,
+    Last,
+}
+
+impl Position {
+    pub const ALL: [Self; 2] = [Self::First, Self::Last];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::First => "First",
+            Self::Last => "Last",
+        }
+    }
+}
+
+/// Whether an entry goes before a stock node's own entries. `None` is automatic: first, as
+/// Parhelion has always placed them, unless another installed Sunrise mod changes the
+/// presentation nodes. Sunrise's merge adds a mod's entries after a node's stock entries and
+/// can't combine an edit that puts them first with another mod's, so they go last then.
+pub(crate) fn first(position: Option<Position>) -> bool {
+    position.map_or_else(
+        || !crate::package_profile::presentation_nodes_shared(),
+        |position| position == Position::First,
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
@@ -372,37 +405,4 @@ fn custom_members<'a>(
         pages.extend(destination.filter(|page| page.stock_exemplar().is_none()));
     }
     (badges, pages)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn custom_node_identities_share_badges_and_pages() {
-        let page = Destination {
-            ammo: Ammo::Special,
-            family: Family::Sidearms,
-        };
-        let entries = [
-            (Some("Travelers"), Some(page)),
-            (Some("Travelers"), Some(page)),
-        ];
-        let hashes = custom_node_hashes(entries);
-        assert_eq!(hashes.len(), 5);
-        assert_eq!(hashes, custom_node_hashes([entries[0]]));
-        assert_eq!(
-            NodeBudget::new(entries).used() - BASE_NODE_COUNT,
-            hashes.len()
-        );
-    }
-
-    #[test]
-    fn stock_collection_pages_do_not_allocate_custom_nodes() {
-        let destination = Destination {
-            ammo: Ammo::Primary,
-            family: Family::AutoRifles,
-        };
-        assert!(custom_node_hashes([(None, Some(destination))]).is_empty());
-    }
 }

@@ -127,12 +127,14 @@ fn choice<T: Clone + PartialEq>(
     changed
 }
 
-/// Halo: Reach and Marathon rows carry a kind and a source type only.
+/// Halo: Reach and Marathon rows carry a kind and a source type only. Marathon also shows its
+/// animation preference, which changes `animations` without counting as a filter change.
 fn draw_source(
     ui: &mut egui::Ui,
     browser: &mut browser::Browser,
     items: &[Weapon],
     source: Source,
+    animations: &mut bool,
 ) -> bool {
     let mut changed = false;
     ui.horizontal_wrapped(|ui| {
@@ -178,15 +180,13 @@ fn draw_source(
         changed |= ui
             .checkbox(&mut browser.show_installed, "Show Installed")
             .changed();
-        changed |= supported_only(ui, browser);
+        if source == Source::Marathon {
+            ui.checkbox(animations, "Marathon Animations").on_hover_text(
+                "Experimental. Imports play the weapon's own Marathon animations instead of the donor's.",
+            );
+        }
     });
     changed
-}
-
-fn supported_only(ui: &mut egui::Ui, browser: &mut browser::Browser) -> bool {
-    ui.checkbox(&mut browser.supported_only, "Supported Only")
-        .on_hover_text("Hide items with no donor.")
-        .changed()
 }
 
 pub(super) fn draw(
@@ -194,9 +194,10 @@ pub(super) fn draw(
     browser: &mut browser::Browser,
     items: &[Weapon],
     source: Source,
+    animations: &mut bool,
 ) -> bool {
-    if source != Source::Modern {
-        return draw_source(ui, browser, items, source);
+    if !matches!(source, Source::Modern | Source::Roi) {
+        return draw_source(ui, browser, items, source, animations);
     }
     let mut changed = false;
     ui.horizontal_wrapped(|ui| {
@@ -210,6 +211,10 @@ pub(super) fn draw(
             &mut filters.family,
             FAMILIES
                 .into_iter()
+                .filter(|family| {
+                    source != Source::Roi
+                        || matches!(family, service::Family::Weapon | service::Family::Armor)
+                })
                 .map(|value| (value, value.label().to_owned())),
             142.0,
         ) {
@@ -254,9 +259,11 @@ pub(super) fn draw(
             SLOTS
                 .into_iter()
                 .filter(|(bucket, _)| {
-                    filters
-                        .family
-                        .is_none_or(|family| service::Family::from_bucket(*bucket) == Some(family))
+                    (source != Source::Roi
+                        || service::Family::from_bucket(*bucket) == Some(service::Family::Armor))
+                        && filters.family.is_none_or(|family| {
+                            service::Family::from_bucket(*bucket) == Some(family)
+                        })
                 })
                 .map(|(value, name)| (value, name.to_owned())),
             142.0,
@@ -280,17 +287,19 @@ pub(super) fn draw(
             .family
             .is_none_or(|family| family == service::Family::Weapon)
         {
-            changed |= choice(
-                ui,
-                "import-damage",
-                "Damage Type",
-                "Damage",
-                &mut filters.damage,
-                DAMAGE
-                    .into_iter()
-                    .map(|value| (value.to_owned(), damage_label(value).to_owned())),
-                142.0,
-            );
+            if source != Source::Roi {
+                changed |= choice(
+                    ui,
+                    "import-damage",
+                    "Damage Type",
+                    "Damage",
+                    &mut filters.damage,
+                    DAMAGE
+                        .into_iter()
+                        .map(|value| (value.to_owned(), damage_label(value).to_owned())),
+                    142.0,
+                );
+            }
             changed |= choice(
                 ui,
                 "import-ammo",
@@ -318,15 +327,18 @@ pub(super) fn draw(
                 142.0,
             );
         }
-        changed |= ui
-            .checkbox(&mut browser.show_installed, "Show Installed")
-            .on_hover_text("Include items already present in the target installation.")
-            .changed();
-        changed |= ui
-            .checkbox(&mut browser.show_dummy, "Include Dummy Items")
-            .on_hover_text("Include display-only definitions. Some lack the data needed to import.")
-            .changed();
-        changed |= supported_only(ui, browser);
+        if source != Source::Roi {
+            changed |= ui
+                .checkbox(&mut browser.show_installed, "Show Installed")
+                .on_hover_text("Include items already present in the target installation.")
+                .changed();
+            changed |= ui
+                .checkbox(&mut browser.show_dummy, "Include Dummy Items")
+                .on_hover_text(
+                    "Include display-only definitions. Some lack the data needed to import.",
+                )
+                .changed();
+        }
     });
     changed
 }

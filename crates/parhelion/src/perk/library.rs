@@ -253,6 +253,19 @@ impl Library {
         Ok(path)
     }
 
+    /// Keeps drafts that no longer open in a new file of their own beside the drafts file, named
+    /// after the window's `session`, and returns its path. The file is flushed before it
+    /// appears and never replaces one already there, so every batch survives until the reader
+    /// removes it.
+    pub fn save_rejected_drafts(&self, session: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+        let path = self
+            .root
+            .join(format!("workbench-drafts.rejected.{session}.json"));
+        sundial::storage::create_file(&path, bytes)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        Ok(path)
+    }
+
     /// The drafts other windows set aside, each with the bytes it holds, in name order.
     pub fn set_aside_drafts(&self) -> Result<Vec<(PathBuf, Vec<u8>)>, String> {
         let mut found = Vec::new();
@@ -375,7 +388,7 @@ impl Library {
             bytes,
             expected,
             &format!(
-                "{} changed outside the workbench. The existing file was preserved. Refresh Library to take it up, or save this perk as a new perk.",
+                "{} changed outside the workbench. The existing file was preserved. Save this perk as a new perk to keep your edits, or discard your changes and refresh the library to load the current file.",
                 path.display()
             ),
         )

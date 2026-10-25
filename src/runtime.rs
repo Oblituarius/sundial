@@ -19,7 +19,8 @@ pub use address::{BindingHash, GraphTag, SchemaHandle};
 pub use item::load as load_weapon_runtime_entity_for_item_with_manager;
 mod invisibility;
 pub use identity::{
-    NativeMember, native_holders, native_member_names, native_members, native_type_name,
+    NativeMember, native_holders, native_member_names, native_members, native_pointer_layout,
+    native_type_name,
 };
 pub mod modifiers;
 
@@ -87,7 +88,7 @@ pub fn component_binding_label(binding: u32) -> String {
 }
 
 /// Native ancestry from the same registered Shadowkeep declarations used to resolve fields.
-pub(crate) fn native_type_inherits(mut class: u32, parent: u32) -> bool {
+pub fn native_type_inherits(mut class: u32, parent: u32) -> bool {
     let Ok(registry) = runtime_registry() else {
         return false;
     };
@@ -438,8 +439,7 @@ struct RegistryMember {
 
 #[derive(Clone, Debug, Deserialize)]
 struct NativeLayoutEntry {
-    #[serde(rename = "byte_offset")]
-    _byte_offset: u32,
+    byte_offset: u32,
     type_code: u32,
 }
 

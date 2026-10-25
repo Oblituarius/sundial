@@ -46,6 +46,8 @@ mod install;
 mod item;
 mod item_kind;
 mod manifest;
+mod mod_family;
+pub use mod_family::{ModReport, ModStatus};
 pub mod map;
 mod merge_data;
 mod package_profile;
@@ -121,8 +123,6 @@ pub(crate) use item::{
     WeaponSocketColumnOverride, WeaponSocketPlugVariantOverride, WeaponVariableDamage,
 };
 pub use item_kind::ItemKind;
-#[cfg(test)]
-pub(crate) use recipe::ARC_LOGIC_DONOR_HASH;
 pub(crate) use recipe::{
     HexHash, RecipeAmmoType, RecipeRarity, RecipeRawPayloadTarget, WeaponArtArrangementRecipe,
     WeaponDonorReference, WeaponDyeReferenceRecipe, WeaponLocaleTextRecipe,

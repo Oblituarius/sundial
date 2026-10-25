@@ -32,15 +32,22 @@ pub fn objects(bytes: &[u8], version: u32) -> Result<BTreeSet<u32>> {
     };
     let count = r.count()?;
     let mut objects = BTreeSet::new();
+    let mut definitions = BTreeSet::new();
     for _ in 0..count {
-        r.u8()?;
+        let kind = r.u8()?;
         let size = r.u32()? as usize;
         let mut item = Read {
             bytes: r.take(size)?,
             at: 0,
         };
         let id = item.u32()?;
-        ensure!(id != 0 && objects.insert(id), "duplicate Init object");
+        // Init can share a numeric identity between an auxiliary bus and an effect
+        // share set. Definitions are unique within their HIRC type, not across it.
+        ensure!(
+            id != 0 && definitions.insert((kind, id)),
+            "duplicate Init object type {kind} identity {id:08X}"
+        );
+        objects.insert(id);
     }
     r.end()?;
     Ok(objects)
@@ -85,7 +92,11 @@ impl Settings {
             bytes: header.context("Init header missing")?,
             at: 0,
         };
-        ensure!(h.u32()? == version, "Init version mismatch");
+        let actual = h.u32()?;
+        ensure!(
+            actual == version,
+            "Wwise Init bank version is {actual}, expected {version}"
+        );
         ensure!(h.u32()? == hash("init"), "settings bank is not Init");
         let mut r = Read {
             bytes: body.context("Init settings missing")?,

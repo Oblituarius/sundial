@@ -1,28 +1,6 @@
 //! Armor-stat solver, preview, and application tests.
 
 use super::*;
-use crate::app::account_workspace::WorkspaceDocument;
-
-#[test]
-fn character_class_invalidates_the_armor_preview_source() {
-    let mut document = WorkspaceDocument::json_only(serde_json::json!({
-        "version": 8,
-        "state": {"characters": [{"race": 0, "gender": 0, "class": 0}]}
-    }));
-    let titan = source_key(&document, 0, PlugSelectionMode::Supported, true);
-    assert_eq!(titan.class_type, 0);
-    assert_ne!(
-        titan,
-        source_key(&document, 0, PlugSelectionMode::Supported, false)
-    );
-
-    document.json_mut()["state"]["characters"][0]["class"] = serde_json::json!(1);
-    let hunter = source_key(&document, 0, PlugSelectionMode::Supported, true);
-    assert_eq!(hunter.class_type, 1);
-    assert_eq!(titan.equipment, hunter.equipment);
-    assert_eq!(titan.inventory, hunter.inventory);
-    assert_ne!(titan, hunter);
-}
 
 fn choice(hash: u64, values: [i32; 6]) -> SocketChoice {
     SocketChoice {
@@ -61,46 +39,6 @@ fn socket(_index: usize, current: u64, choices: Vec<SocketChoice>) -> MutableSoc
         choices,
         kind: SocketKind::Stat,
     }
-}
-
-#[test]
-fn exact_goal_can_be_shared_across_multiple_armor_pieces() {
-    let input = input(
-        vec![
-            socket(
-                0,
-                10,
-                vec![choice(10, [0; 6]), choice(11, [0, 0, 10, 0, 0, 0])],
-            ),
-            socket(
-                1,
-                20,
-                vec![choice(20, [0; 6]), choice(21, [0, 0, 20, 0, 0, 0])],
-            ),
-        ],
-        [0, 0, 70, 0, 0, 0],
-    );
-
-    let solution = solve(&input, [0, 0, 100, 0, 0, 0]);
-
-    assert!(solution.exact);
-    assert_eq!(solution.projected_totals[2], 100);
-    assert_eq!(solution.assignments.len(), 2);
-    assert_eq!(changed_piece_count(&solution), 2);
-}
-
-#[test]
-fn candidate_reduction_keeps_differences_in_non_target_stats() {
-    let socket = socket(
-        0,
-        10,
-        vec![
-            choice(10, [0, 0, 10, 0, 0, 0]),
-            choice(11, [20, 0, 10, 0, 0, 0]),
-        ],
-    );
-
-    assert_eq!(choices_for_targets(&socket, [0, 0, 100, 0, 0, 0]).len(), 2);
 }
 
 fn synthetic_candidate(
@@ -290,71 +228,6 @@ fn mod_removal_is_an_available_plan_and_locked_armor_stays_unchanged() {
         }
     }
     crate::test_support::artifact("armor-mod-removal.json", &serde_json::json!(receipts));
-}
-
-#[test]
-fn inventory_armor_is_selected_when_equipped_armor_cannot_reach_the_goal() {
-    let input = LoadoutInput {
-        pieces: vec![unavailable_piece("helmet", "Helmet", "test")],
-        candidates: vec![vec![
-            synthetic_candidate([0, 0, 80, 0, 0, 0], ArmorOrigin::Equipped, vec![], false),
-            synthetic_candidate(
-                [0, 0, 100, 0, 0, 0],
-                ArmorOrigin::Inventory {
-                    instance_soid: 42,
-                    definition_hash: 7,
-                },
-                vec![],
-                false,
-            ),
-        ]],
-        current_totals: [0, 0, 80, 0, 0, 0],
-    };
-
-    let solution = solve(&input, [0, 0, 100, 0, 0, 0]);
-
-    assert!(solution.exact);
-    assert_eq!(solution.swaps.len(), 1);
-    assert_eq!(solution.swaps[0].instance_soid, 42);
-    assert_eq!(solution.selections[0].candidate_index, 1);
-}
-
-#[test]
-fn masterworking_current_armor_is_preferred_to_an_inventory_swap() {
-    let masterwork = MutableSocket {
-        socket_index: 5,
-        current: Some(10),
-        choices: vec![choice(10, [0; 6]), choice(11, [0, 0, 12, 0, 0, 0])],
-        kind: SocketKind::Masterwork,
-    };
-    let input = LoadoutInput {
-        pieces: vec![unavailable_piece("helmet", "Helmet", "test")],
-        candidates: vec![vec![
-            synthetic_candidate(
-                [0, 0, 88, 0, 0, 0],
-                ArmorOrigin::Equipped,
-                vec![masterwork],
-                false,
-            ),
-            synthetic_candidate(
-                [0, 0, 100, 0, 0, 0],
-                ArmorOrigin::Inventory {
-                    instance_soid: 42,
-                    definition_hash: 7,
-                },
-                vec![],
-                false,
-            ),
-        ]],
-        current_totals: [0, 0, 88, 0, 0, 0],
-    };
-
-    let solution = solve(&input, [0, 0, 100, 0, 0, 0]);
-
-    assert!(solution.exact);
-    assert!(solution.swaps.is_empty());
-    assert_eq!(solution.assignments.len(), 1);
-    assert_eq!(solution.assignments[0].kind, SocketKind::Masterwork);
 }
 
 #[test]

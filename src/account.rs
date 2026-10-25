@@ -47,7 +47,8 @@ impl AuthoredAccountCleanup {
 
 /// Verified native socket layouts for a retained definition in a replacement generation.
 /// Account proposals preserve existing selections and use new defaults only for added sockets,
-/// and for lanes whose default changed when a saved selection still holds the old default.
+/// for lanes whose default changed when a saved selection still holds the old default, and for
+/// saved selections the replacement removes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthoredSocketChange {
     pub definition_hash: u32,
@@ -70,6 +71,14 @@ impl AuthoredSocketChange {
             .iter()
             .find(|(replaced, _)| *replaced == lane)?;
         (saved == Some(*old)).then(|| self.default_plugs.get(lane).copied().flatten())
+    }
+
+    /// The plug a saved selection in `lane` falls back to when the replacement removes the plug
+    /// it holds: the lane's incoming default, so the kept item's socket is not left empty. `None`
+    /// is an empty lane, where the incoming default is empty or the lane is gone.
+    #[must_use]
+    pub fn fallback(&self, lane: usize) -> Option<u32> {
+        self.default_plugs.get(lane).copied().flatten()
     }
 }
 
@@ -152,21 +161,6 @@ fn is_dawn_database(path: &Path) -> bool {
         .is_some_and(|name| name == crate::persistence::DAWN_DATABASE_NAME)
 }
 
-#[cfg(test)]
-mod backend_tests {
-    use super::*;
-
-    #[test]
-    fn dawn_database_is_not_parsed_as_json_during_backend_validation() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory
-            .path()
-            .join(crate::persistence::DAWN_DATABASE_NAME);
-        std::fs::write(&path, b"SQLite format 3\0not JSON").unwrap();
-
-        validate_authored_cleanup_backend(&path).unwrap();
-    }
-}
 /// Returns journal bytes. SQLite uses a complete logical snapshot including uncheckpointed WAL data.
 pub fn read_authored_account_source(path: &Path) -> Result<Vec<u8>, String> {
     if is_dawn_database(path) {

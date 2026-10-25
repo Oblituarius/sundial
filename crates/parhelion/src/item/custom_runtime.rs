@@ -33,7 +33,9 @@ mod sword_profiles;
 mod tests;
 pub(super) use banks::{attached_glyph_patches, bank_glyph_patches, bank_value_patches};
 use graph_tree::*;
-pub(super) use graph_tree::{append_private_graph_tree, split_swapped_values};
+pub(super) use graph_tree::{
+    append_private_graph_tree, append_private_graph_tree_in, split_swapped_values,
+};
 use private_perk::*;
 pub(super) use private_perk::{
     PrivateRuntimeEdits, append_private_action, clone_private_sandbox_perk_runtime,
@@ -60,6 +62,19 @@ pub(crate) fn runtime_hud_key(
         return Ok(None);
     };
     crate::hud_icon::runtime::inherited_key(manager, &entity, content_group).map(Some)
+}
+
+/// Check a saved firing selection against the same prepared group the native build consumes.
+#[cfg(feature = "d2-model-importer")]
+pub(crate) fn validate_imported_projectile(
+    graph: &parhelion_import::GraphReference,
+    symbol: &str,
+) -> AuthoringResult<()> {
+    let inputs = imports::Inputs::open(graph)?;
+    let assets = particles::load(&inputs)?
+        .ok_or_else(|| invalid("The imported model does not include projectile assets"))?;
+    assets.projectile(symbol)?;
+    Ok(())
 }
 
 /// Exercise the compiler's runtime mutation in memory. No package or account is written.

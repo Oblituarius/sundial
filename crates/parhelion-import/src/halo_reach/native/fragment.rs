@@ -57,13 +57,13 @@ pub(super) fn build(
         None,
         encoded.patches,
     )?;
-    let report = super::super::native_material::build(
+    let report = super::material::build(
         cache,
         pages,
         native,
         graph,
         &materials,
-        super::super::native_material::Binding {
+        super::material::Binding {
             palette: &palette,
             rigid: true,
             objects: &BTreeMap::new(),
@@ -71,6 +71,9 @@ pub(super) fn build(
             lenses: &BTreeMap::new(),
             paint: &BTreeMap::new(),
             lightmap: None,
+            vertex_data: None,
+            statics: false,
+            prefix: "",
         },
     )?;
     Ok((

@@ -1,5 +1,6 @@
 //! Inventory icon artwork; the ammunition HUD silhouette is a separate mapping.
 use crate::d2_mot::reader::Reader;
+pub use crate::tiger::icon::{Layer, decode};
 use anyhow::{Context, Result, ensure};
 use std::fs;
 
@@ -40,15 +41,45 @@ pub struct Image {
     pub rgba: Vec<u8>,
 }
 
-/// One undecoded texture: `format` is the DXGI format number from the header.
-pub struct Layer {
-    /// Container slot offset the layer came from.
-    pub slot: usize,
-    pub texture: u32,
-    pub format: u32,
-    pub width: u16,
-    pub height: u16,
-    pub data: Vec<u8>,
+/// Composite browser layers at their native size, anchored top-left. Recipe export uses
+/// the primary artwork API instead, since native rarity and foreground are separate layers.
+pub fn composite(layers: &[Layer]) -> Result<Image> {
+    let width = layers.iter().map(|layer| layer.width).max().unwrap_or(0);
+    let height = layers.iter().map(|layer| layer.height).max().unwrap_or(0);
+    ensure!(
+        width > 0 && height > 0 && width <= 4096 && height <= 4096,
+        "Icon dimensions exceed the supported limit"
+    );
+    let primary = layers
+        .iter()
+        .find(|layer| layer.slot == PRIMARY)
+        .context("The icon has no primary artwork")?;
+    let mut rgba = vec![0u8; usize::from(width) * usize::from(height) * 4];
+    for layer in layers {
+        let pixels = match decode(layer) {
+            Ok(pixels) => pixels,
+            Err(error) if layer.slot == PRIMARY => {
+                return Err(error.context("Could not decode primary icon artwork"));
+            }
+            Err(_) => continue,
+        };
+        for y in 0..usize::from(layer.height) {
+            for x in 0..usize::from(layer.width) {
+                let from = (y * usize::from(layer.width) + x) * 4;
+                let to = (y * usize::from(width) + x) * 4;
+                sundial::image_processing::blend_rgba_pixel(
+                    &mut rgba[to..to + 4],
+                    pixels[from..from + 4].try_into()?,
+                );
+            }
+        }
+    }
+    Ok(Image {
+        texture: primary.texture,
+        width,
+        height,
+        rgba,
+    })
 }
 
 /// Primary artwork as RGBA8, for export.
@@ -106,53 +137,6 @@ pub(crate) fn container(
         }
     }
     r.tag(unique(containers, "icon container")?, Some(0x80803EB8))
-}
-
-/// Decode the same bounded texture formats for browser thumbnails and recipe artwork.
-pub fn decode(layer: &Layer) -> Result<Vec<u8>> {
-    let (width, height) = (usize::from(layer.width), usize::from(layer.height));
-    ensure!(
-        width > 0 && height > 0 && width <= 4096 && height <= 4096,
-        "Unsupported image dimensions"
-    );
-    if matches!(layer.format, 28 | 29) {
-        ensure!(
-            layer.data.len() == width * height * 4,
-            "RGBA image size differs"
-        );
-        return Ok(layer.data.clone());
-    }
-    let block_size = match layer.format {
-        71 | 72 => 8,
-        74 | 75 | 77 | 78 | 98 | 99 => 16,
-        format => anyhow::bail!("Unsupported image texture format {format}"),
-    };
-    let columns = width.div_ceil(4);
-    ensure!(
-        layer.data.len() == columns * height.div_ceil(4) * block_size,
-        "Compressed image size differs"
-    );
-    let mut rgba = vec![0; width * height * 4];
-    for (index, block) in layer.data.chunks_exact(block_size).enumerate() {
-        let mut pixels = [0; 64];
-        match layer.format {
-            71 | 72 => bcdec_rs::bc1(block, &mut pixels, 16),
-            74 | 75 => bcdec_rs::bc2(block, &mut pixels, 16),
-            77 | 78 => bcdec_rs::bc3(block, &mut pixels, 16),
-            _ => bcdec_rs::bc7(block, &mut pixels, 16),
-        }
-        for y in 0..4 {
-            for x in 0..4 {
-                let (px, py) = ((index % columns) * 4 + x, (index / columns) * 4 + y);
-                if px < width && py < height {
-                    let to = (py * width + px) * 4;
-                    let from = (y * 4 + x) * 4;
-                    rgba[to..to + 4].copy_from_slice(&pixels[from..from + 4]);
-                }
-            }
-        }
-    }
-    Ok(rgba)
 }
 
 /// First texture of the first lane of a layer, or `None` when the slot is empty.

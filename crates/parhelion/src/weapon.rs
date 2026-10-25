@@ -9,7 +9,10 @@ pub mod behavior;
 pub(crate) mod burst;
 pub(crate) mod crosshair;
 pub(crate) mod glow;
+#[cfg(feature = "d2-model-importer")]
+pub(crate) mod input;
 pub(crate) mod lenders;
+pub(crate) mod magazine;
 pub(crate) mod perk_bank;
 pub mod projectile;
 pub(crate) mod rig;

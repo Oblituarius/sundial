@@ -27,14 +27,17 @@ pub use assets::HudStatus;
 pub use assets::ImportedAsset;
 pub use assets::ModifierRow;
 pub use assets::NativeAssetPatch;
+pub use assets::NativeAssetProgram;
 pub use assets::NativeAssetResourceAppend;
 pub use assets::NativeAssetResourcePatch;
 mod ability;
 pub use ability::ABILITY_PROPERTY_KIND;
 pub use ability::AbilityInput;
 pub use ability::AbilityTuning;
+mod ability_row;
 pub use ability::ability_properties_in;
 use ability::*;
+pub use ability_row::{AbilityRow, AbilityRowModifier};
 pub use properties::{KeyCatalog, KeyEvidence};
 
 /// The empty FNV-1 hash. A native key holds this value when nothing is named.
@@ -189,7 +192,7 @@ impl NativeNode {
             } else {
                 crate::sandbox_perk::nodes::effect(self.kind)
             }
-            .filter(|entry| entry.observed())
+            .filter(|entry| entry.has_layout())
             .ok_or_else(|| {
                 format!(
                     "{family} kind {} has no recovered native layout.",
@@ -592,12 +595,13 @@ impl Program {
             native: Some(native),
             ability_tunings: self.ability_tunings.clone(),
             ability_inputs: self.ability_inputs.clone(),
+            ability_rows: self.ability_rows.clone(),
             ..Self::default()
         })
     }
 
-    /// The slot and key of every Ability Property action, read from the native graph when
-    /// the program has one and from the typed actions otherwise.
+    /// The slot and key of every Ability Property action in this controller, including its
+    /// additional groups. Child controllers are enumerated separately by `owned_programs`.
     pub fn ability_properties(&self) -> Result<BTreeSet<(AbilityTarget, u32)>, String> {
         if let Some(native) = &self.native {
             return ability_properties_in(&native.graph.emit()?);
@@ -612,6 +616,13 @@ impl Program {
                 }
                 _ => None,
             })
+            .chain(
+                self.additional_groups
+                    .iter()
+                    .flat_map(|group| &group.effects)
+                    .filter(|node| node.kind == ABILITY_PROPERTY_KIND)
+                    .filter_map(|node| ability_property_of(&node.bytes)),
+            )
             .collect())
     }
 
@@ -667,6 +678,15 @@ impl Program {
                 _ => {}
             }
         }
+        for node in self
+            .additional_groups
+            .iter_mut()
+            .flat_map(|group| &mut group.effects)
+        {
+            if node.kind == ABILITY_PROPERTY_KIND && node.bytes.get(4..8) == Some(&from_bytes[..]) {
+                node.bytes[4..8].copy_from_slice(&to.to_le_bytes());
+            }
+        }
         if let Some(native) = &mut self.native {
             let stride =
                 crate::sandbox_perk::action::native::schema::record(ABILITY_PROPERTY_CLASS)?.size;
@@ -686,15 +706,22 @@ impl Program {
         Ok(())
     }
 
-    /// Drops the tunings no Ability Property action applies any more. A program that cannot
-    /// be read keeps them all.
+    /// Drops private bank definitions no Ability Property action applies any more. A program
+    /// that cannot be read keeps them all, including bank-scoped rows and numeric inputs.
     pub fn prune_ability_tunings(&mut self) {
-        if self.ability_tunings.is_empty() {
+        if self.ability_tunings.is_empty()
+            && self.ability_inputs.is_empty()
+            && self.ability_rows.is_empty()
+        {
             return;
         }
         if let Ok(applied) = self.ability_properties() {
             self.ability_tunings
                 .retain(|tuning| applied.iter().any(|(_, key)| *key == tuning.key));
+            self.ability_inputs
+                .retain(|input| applied.contains(&(input.slot, input.key)));
+            self.ability_rows
+                .retain(|row| applied.contains(&(row.slot, row.key)));
         }
     }
 }
@@ -1106,6 +1133,9 @@ pub struct Program {
     /// Private adjustments to native ability inputs, activated by Ability Property actions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ability_inputs: Vec<AbilityInput>,
+    /// Private property rows restricted to one native ability bank.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ability_rows: Vec<AbilityRow>,
     /// Further rearm conditions beside the primary one, carried verbatim.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub alternative_rearms: Vec<NativeNode>,
@@ -1285,11 +1315,30 @@ impl Default for Program {
             additional_groups: Vec::new(),
             ability_tunings: Vec::new(),
             ability_inputs: Vec::new(),
+            ability_rows: Vec::new(),
         }
     }
 }
 
 impl Program {
+    /// This controller and every controller owned by its private attachment graphs.
+    /// Asset and native-node indices remain local to each returned program.
+    pub fn owned_programs(&self) -> impl Iterator<Item = &Self> {
+        let mut pending = vec![self];
+        std::iter::from_fn(move || {
+            let program = pending.pop()?;
+            for edit in program.native_asset_patches.iter().rev() {
+                pending.extend(
+                    edit.programs
+                        .iter()
+                        .rev()
+                        .map(|child| child.program.as_ref()),
+                );
+            }
+            Some(program)
+        })
+    }
+
     /// Every native node the compiler carries verbatim, conditions flagged `true` and
     /// effects `false`: the trigger and ending, every alternative and rearm condition, the
     /// native actions, and the conditions and effects of every further group. Any pass that
@@ -1418,8 +1467,12 @@ impl Program {
             if !matches_graph || matches!(edit.source_graph, 0 | u32::MAX) {
                 return Err("A native asset patch must name its effect's live graph.".into());
             }
-            if edit.patches.is_empty() || edit.patches.len() > 32 {
-                return Err("A native asset patch needs one to 32 resource edits.".into());
+            if edit.patches.len() + edit.programs.len() == 0
+                || edit.patches.len() + edit.programs.len() > 32
+            {
+                return Err(
+                    "A native asset patch needs one to 32 resource edits or controllers.".into(),
+                );
             }
             for patch in &edit.patches {
                 if patch.binding_hash == 0
@@ -1460,12 +1513,67 @@ impl Program {
                     }
                 }
             }
+            for (index, child) in edit.programs.iter().enumerate() {
+                if child.binding_hash == 0
+                    || matches!(child.expected_action, 0 | u32::MAX)
+                    || child.offset.checked_add(4).is_none()
+                    || child.program.native.is_some()
+                    || child.program.imported_labels.is_some()
+                    || !child.program.imported_assets.is_empty()
+                {
+                    return Err("A nested controller needs an authored program and a bounded native action reference.".into());
+                }
+                let overlaps = |binding, resource, offset: u32, size: usize| {
+                    child.binding_hash == binding
+                        && child.resource_index == resource
+                        && child.offset < offset.saturating_add(size as u32)
+                        && offset < child.offset + 4
+                };
+                if edit.patches.iter().any(|patch| {
+                    overlaps(
+                        patch.binding_hash,
+                        patch.resource_index,
+                        patch.offset,
+                        patch.bytes.len(),
+                    )
+                }) || edit.programs[..index].iter().any(|other| {
+                    overlaps(other.binding_hash, other.resource_index, other.offset, 4)
+                }) {
+                    return Err(
+                        "A nested controller reference overlaps another resource edit.".into(),
+                    );
+                }
+            }
         }
         Ok(())
     }
 
     /// Drafts can be empty. Build readiness is checked separately.
     pub fn validate_structure(&self) -> Result<(), String> {
+        // Bound the complete owned tree before validation or recursive compilation.
+        // Source action cycles are rejected separately while importing their references.
+        let mut pending = vec![(self, 0usize)];
+        let mut count = 0;
+        while let Some((program, depth)) = pending.pop() {
+            count += 1;
+            if depth >= 8 || count > 64 {
+                return Err("Nested controllers exceed eight levels or 64 programs.".into());
+            }
+            for child in program
+                .native_asset_patches
+                .iter()
+                .flat_map(|edit| &edit.programs)
+            {
+                pending.push((&child.program, depth + 1));
+            }
+        }
+        for program in self.owned_programs() {
+            program.validate_local_structure()?;
+        }
+        Ok(())
+    }
+
+    fn validate_local_structure(&self) -> Result<(), String> {
         if self.name.trim().is_empty() || self.name.contains('\0') {
             return Err("Enter a name for the custom effect.".into());
         }
@@ -1711,6 +1819,29 @@ impl Program {
 
     pub fn validate(&self) -> Result<(), String> {
         self.validate_structure()?;
+        for program in self.owned_programs() {
+            program.validate_local_readiness()?;
+        }
+        Ok(())
+    }
+
+    fn validate_local_readiness(&self) -> Result<(), String> {
+        if !self.ability_rows.is_empty() {
+            let applied = self.ability_properties()?;
+            let mut keys = BTreeSet::new();
+            for row in &self.ability_rows {
+                row.validate()?;
+                if !keys.insert(row.key)
+                    || !applied.contains(&(row.slot, row.key))
+                    || self.ability_inputs.iter().any(|v| v.key == row.key)
+                    || self.ability_tunings.iter().any(|v| v.key == row.key)
+                {
+                    return Err(
+                        "Private ability row is duplicated or lacks its activating action".into(),
+                    );
+                }
+            }
+        }
         if !self.ability_inputs.is_empty() {
             let applied = self.ability_properties()?;
             let mut keys = BTreeSet::new();

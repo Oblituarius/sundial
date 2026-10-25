@@ -10,7 +10,9 @@ use serde_json::{Value, json};
 use std::{collections::BTreeSet, fs, path::Path};
 pub mod animation;
 pub mod owned;
-mod sections;
+use crate::tiger::animation::sections::{
+    self, validate_native_instance, validate_source_relocation,
+};
 
 pub(crate) fn used_bones(root: &Path, item: &Value) -> Result<BTreeSet<usize>> {
     let report = load(&root.join("report.json"))?;
@@ -32,7 +34,7 @@ pub(crate) fn used_bones(root: &Path, item: &Value) -> Result<BTreeSet<usize>> {
                     .context("Source cloth definition")?,
             )?;
             let solver = raw(root, &format!("{:08X}", definition.u32(0x6A0)?))?;
-            used.extend(super::cloth::used_bones(&solver.0)?);
+            used.extend(crate::tiger::physics::cloth::used_bones(&solver.0)?);
         }
         let model = raw(root, entry["model"].as_str().context("rig source model")?)?;
         let mesh = super::geometry::selected_mesh(&model, entry)?;
@@ -283,16 +285,17 @@ fn unlink_owner(payload: &mut Payload, owner: u32) -> Result<Vec<usize>> {
     }
     Ok(offsets)
 }
-/// Convert the complete source FK arrays into a native component envelope.
-/// The result is unlinked. Animation/controller and entity connections must be
-/// converted before a package may use it.
-pub fn validate_native_instance(bytes: &[u8]) -> Result<()> {
-    sections::validate_instance(&Payload(bytes.to_vec()))
-}
 
 pub fn skeleton(source: &[u8], native: &[u8], native_owner: u32) -> Result<(Payload, Value)> {
     let modern = Payload(source.to_vec());
-    let mut old = Payload(native.to_vec());
+    let original = Payload(native.to_vec());
+    let counts = modern
+        .array(modern.pointer(16)? + 0x30, 64, Some(0x808081DC))?
+        .into_iter()
+        .map(|row| Ok(modern.array(row + 32, 32, Some(0x80809F4F))?.len()))
+        .collect::<Result<Vec<_>>>()?;
+    let (mut old, relocation) =
+        crate::tiger::animation::rig::grow_instance(&original, native_owner, &counts)?;
     let mr = modern.pointer(24)?;
     let nr = old.pointer(24)?;
     let owner_patches = unlink_owner(&mut old, native_owner)?;
@@ -365,10 +368,14 @@ pub fn skeleton(source: &[u8], native: &[u8], native_owner: u32) -> Result<(Payl
     }
     Ok((
         old,
-        json!({"bones":nodes.len(),"sections":sections,"arrays":arrays,"owner_patches":owner_patches}),
+        json!({"bones":nodes.len(),"sections":sections,"arrays":arrays,"owner_patches":owner_patches,
+            "relocation":relocation.map(|(cut, delta)| json!({"cut":cut,"delta":delta}))}),
     ))
 }
 
+/// Convert the complete source FK arrays into a native component envelope.
+/// The result is unlinked. Animation/controller and entity connections must be
+/// converted before a package may use it.
 pub fn convert(
     source: &Path,
     native: &Path,

@@ -6,7 +6,10 @@ use crate::tiger::{
 };
 
 mod channel;
+mod light;
 mod optic;
+mod query;
+mod sequence;
 
 /// A stock weapon part entity: render component, markers and channel bank, each bound to the
 /// weapon's skeleton provider `AE7D0AED`. The character templates below bind to the character
@@ -27,6 +30,8 @@ struct Component {
     symbol: String,
     patches: Vec<Value>,
     inputs: Vec<(u32, usize)>,
+    /// Source owner and input definition paired with the emitted getter definition.
+    incoming: Vec<(u32, usize, usize)>,
 }
 
 impl Component {
@@ -115,6 +120,7 @@ impl Assembly<'_> {
             symbol: symbol.to_owned(),
             patches: Vec::new(),
             inputs: Vec::new(),
+            incoming: Vec::new(),
         })
     }
 
@@ -122,7 +128,11 @@ impl Assembly<'_> {
         let si = source.pointer(16)?;
         let sr = source.pointer(24)?;
         let inputs = source.array(si + 0x118, 88, Some(0x8080077D))?;
-        let definitions = source.array(sr + 0x288, 48, Some(0x80800927))?;
+        let definitions = source.array(
+            sr + self.source.field(0x288, 0x200),
+            self.source.field(48, 40),
+            Some(0x80800927),
+        )?;
         ensure!(
             inputs.len() == definitions.len(),
             "Source material input count differs"
@@ -140,14 +150,22 @@ impl Assembly<'_> {
             .first()
             .context("Native material input definition absent")?;
         let mut names = Vec::new();
+        // PS4 definitions are 40 bytes, with the 808003E8 marker as a word at +28 and the
+        // name at +32.
+        let ps4 = self.source.platform() == 7;
         for (input, def) in inputs.into_iter().zip(definitions) {
+            let marker = if ps4 {
+                u64::from(source.u32(def + 28)?)
+            } else {
+                source.u64(def + 32)?
+            };
             ensure!(
                 source.u64(input + 8)? == def as u64
                     && source.u64(def + 8)? == input as u64
-                    && source.u64(def + 32)? == 0x808003E8,
+                    && marker == 0x808003E8,
                 "Source material input reciprocal definition differs"
             );
-            names.push(source.u32(def + 40)?);
+            names.push(source.u32(def + self.source.field(40, 32))?);
         }
         let input_rows = old.0[ti..ti + 96].repeat(names.len());
         let definition_rows = old.0[td..td + 40].repeat(names.len());
@@ -210,6 +228,7 @@ impl Assembly<'_> {
             u32::try_from(body["entity"].as_u64().context("Source body entity")?)?;
         let source_entity = self.source.read(source_entity_tag)?;
         let mut components = Vec::new();
+        let mut source_owners = BTreeMap::new();
         let mut bank = None;
         // Materials index the body's channel bank by ordinal, so its names are read before
         // any model component converts.
@@ -217,10 +236,26 @@ impl Assembly<'_> {
         for row in source_entity.array(0x20, 12, Some(0x80800715))? {
             let source = self.source.read(source_entity.u32(row)?)?;
             if source.u32(source.pointer(24)? - 4)? == 0x808008F6 {
-                self.object_channels = channel::channel_names(&source)?;
+                self.object_channels = if self.source.platform() == 7 {
+                    channel::ps4::channel_names(&source, 0x20)?
+                } else {
+                    channel::channel_names(&source)?
+                };
             }
         }
-        for row in source_entity.array(0x20, 12, Some(0x80800715))? {
+        // PS4 banks take their receivers from optic feeds; Xbox One banks connect their
+        // incoming channels through `channel_connections`.
+        let ps4 = self.source.platform() == 7;
+        let feeds = if ps4 && self.weapon {
+            self.optic_feeds(&source_entity)?
+        } else {
+            BTreeMap::new()
+        };
+        let mut optics = BTreeMap::new();
+        // Connection rows name a component by tag and by its ordinal in this list, which
+        // distinguishes repeated instances of one component.
+        let rows = source_entity.array(0x20, 12, Some(0x80800715))?;
+        for (ordinal, row) in rows.into_iter().enumerate() {
             let tag = source_entity.u32(row)?;
             let source = self.source.read(tag)?;
             let sr = source.pointer(24)?;
@@ -229,7 +264,7 @@ impl Assembly<'_> {
             match class {
                 0x80801A9C | 0x80801BF6 => {
                     let cloth = class == 0x80801BF6;
-                    let source_model_tag = source.u32(sr + 0x1C4)?;
+                    let source_model_tag = source.u32(sr + self.source.field(0x1C4, 0x15C))?;
                     let source_model = self.source.read(source_model_tag)?;
                     let meshes = source_model.array(0x10, 0xA0, Some(0x80801BBF))?;
                     ensure!(!meshes.is_empty(), "Source model has no meshes");
@@ -251,7 +286,7 @@ impl Assembly<'_> {
                         let ordinal = ordinals[0];
                         let mesh = meshes[ordinal];
                         let name = format!("{name}-mesh-{ordinal}");
-                        let model = self.model(source_model_tag, &ordinals, &format!("{name}-model"), &equipment, self.weapon)?;
+                        let model = self.model(source_model_tag, &ordinals, &format!("{name}-model"), &equipment, self.weapon, cloth.then_some((&source, sr)))?;
                         ensure!(!(cloth && self.weapon), "Source weapon cloth has no native weapon-part template");
                         let (template, entity) = if cloth {
                             (0x80EF8694, 0x80EF8695)
@@ -292,14 +327,22 @@ impl Assembly<'_> {
                 }
                 0x808008F6 => {
                     ensure!(bank.is_none(), "Source body contains multiple inherited banks");
-                    let (component, names) = self.channel_bank(&source, &name, components.len())?;
-                    bank = Some((components.len(), names));
+                    let (component, names, receivers) = if ps4 {
+                        let declarations = source.array(sr - 0x20 + 0xC8, 32, None)?;
+                        let fed = !declarations.is_empty()
+                            && declarations.iter().all(|at| feeds.contains_key(&(tag, *at as u64)));
+                        self.channel_bank_ps4(&source, &name, components.len(), fed)?
+                    } else {
+                        let (component, names) = self.channel_bank(&source, &name, components.len())?;
+                        (component, names, Vec::new())
+                    };
+                    bank = Some((components.len(), names, tag, receivers));
                     components.push(component);
                 }
                 0x80802818 => {
                     let component = self.component(0x80C1D1A4, 0x80BC358D, &name, components.len())?;
                     // The selector publishes the shared gender and helmet-state values.
-                    let selectors = source.array(sr + 0xC0, 24, Some(0x80802423))?;
+                    let selectors = source.array(sr + self.source.field(0xC0, 0xA0), 24, Some(0x80802423))?;
                     ensure!(selectors.len() == 2 && source.u32(selectors[0] + 4)? == 0x69EA00AA && source.u32(selectors[1] + 4)? == 0x090E39A4, "Source state-selector contract differs");
                     let nr = component.payload.pointer(24)?;
                     let native = component.payload.array(nr + 0xA8, 24, Some(0x808038AA))?;
@@ -316,7 +359,12 @@ impl Assembly<'_> {
                     let mut component = self.component(0x8152FE0C, 0x80BC358D, &name, components.len())?;
                     activation(&source, &mut component.payload)?;
                     let nr = component.payload.pointer(24)?;
-                    let markers = source.array(sr + 0xD8, 64, Some(0x80800608))?;
+                    let markers = source.array(sr + self.source.field(0xD8, 0xD0), 64, Some(0x80800608))?;
+                    if self.bone_map.is_some() {
+                        ensure!(markers.iter().all(|&at| source.u32(at).ok() == Some(0)
+                            && source.u32(at + 4).is_ok_and(|mode| mode <= 1)),
+                            "Mapped weapon markers require root bindings");
+                    }
                     let rows = markers.into_iter().flat_map(|at| source.0[at..at + 64].iter().copied()).collect::<Vec<_>>();
                     array(&mut component.payload.0, nr + 0xA8, 0x80809C00, &rows, 64)?;
                     component.seal()?;
@@ -327,7 +375,11 @@ impl Assembly<'_> {
                         row_class: 0x80800428,
                         ..crate::tiger::markers::NATIVE
                     };
-                    let markers = crate::tiger::markers::read(&source, sr + 0xD8, layout)?;
+                    let markers = crate::tiger::markers::read(&source, sr + self.source.field(0xD8, 0xC8), layout)?;
+                    if self.bone_map.is_some() {
+                        ensure!(markers.iter().all(|m| m.binding[0] == 0 && m.binding[1] <= 1),
+                            "Mapped weapon markers require root bindings");
+                    }
                     let mut component = self.component(WEAPON_MARKERS, WEAPON_PART_ENTITY, &name, components.len())?;
                     activation(&source, &mut component.payload)?;
                     component.payload = crate::tiger::markers::replace(&component.payload, &markers)?;
@@ -335,11 +387,28 @@ impl Assembly<'_> {
                     components.push(component);
                 }
                 0x808027FC if self.weapon => {
+                    optics.insert(tag, components.len());
+                    source_owners.insert(ordinal, components.len());
                     components.push(self.optic(tag, &source, &source_entity, &name, components.len())?);
                 }
-                0x80802733 | 0x80801B6F | 0x8080203D if self.weapon => {
+                0x80803136 if self.weapon => {
+                    components.push(self.query(&source, &name, components.len())?);
+                }
+                0x80801B6F if self.weapon && !ps4 => {
+                    components.push(self.light(tag, ordinal, &source, &source_entity, &name, components.len())?);
+                }
+                0x80802733 | 0x8080203D if self.weapon => {
                     self.evidence.push(json!({"source_component":tag,"resource_class":class,
                         "omitted":"Source auxiliary sight effects require separate runtime translation"}));
+                }
+                // PS4 light layouts are unmeasured, so PS4 keeps omitting them.
+                0x80801B6F if self.weapon => {
+                    self.evidence.push(json!({"source_component":tag,"resource_class":class,
+                        "omitted":"Source auxiliary sight effects require separate runtime translation"}));
+                }
+                0x80800610 if self.weapon && !ps4 && source.u64(sr + 0x190)? != 0 => {
+                    source_owners.insert(ordinal, components.len());
+                    components.push(self.scalar_sequence(tag, ordinal, &source, &source_entity, &name, components.len())?);
                 }
                 0x80800610 => self.evidence.push(json!({"source_component":tag,"resource_class":class,"omitted":"source effect sequence is outside the translated visual graph"})),
                 _ => anyhow::bail!("Untranslated source body component {tag:08X}, class {class:08X}"),
@@ -349,7 +418,8 @@ impl Assembly<'_> {
             self.weapon || bank.is_some(),
             "Source body has no inherited material bank"
         );
-        let mut connections = Vec::new();
+        let mut connections =
+            self.channel_connections(&source_entity, &components, &source_owners)?;
         for (index, component) in components.iter().enumerate() {
             for at in component.entity.array(0x20, 72, Some(0x80809BC9))? {
                 if component.entity.u32(at + 8)? == component.template_tag
@@ -368,7 +438,7 @@ impl Assembly<'_> {
                 }
             }
             for (name, def) in &component.inputs {
-                let (bank_index, names) = bank
+                let (bank_index, names, ..) = bank
                     .as_ref()
                     .context("Source material input has no inherited bank")?;
                 let ordinal = names
@@ -393,6 +463,28 @@ impl Assembly<'_> {
                 put(&mut row, 56, &(*bank_index as u64).to_le_bytes())?;
                 put(&mut row, 64, &(ordinal as u32).to_le_bytes())?;
                 connections.push(row);
+            }
+        }
+        if let Some((bank_index, _, bank_tag, receivers)) = bank.as_ref().filter(|_| ps4) {
+            let bank_payload = &components[*bank_index].payload;
+            let declarations =
+                bank_payload.array(bank_payload.pointer(24)? + 0xC8, 32, Some(0x808097A8))?;
+            ensure!(
+                declarations.len() == receivers.len(),
+                "Native receiver declarations differ"
+            );
+            for (receiver, declaration) in receivers.iter().zip(declarations) {
+                let optic = feeds
+                    .get(&(*bank_tag, receiver.declaration as u64))
+                    .and_then(|tag| optics.get(tag))
+                    .context("Source receiver provider was not converted")?;
+                connections.push(optic::receiver_connection(
+                    &components[*optic].template,
+                    [components[*bank_index].id, components[*optic].id],
+                    declaration,
+                    [*bank_index, *optic],
+                    &mut self.native,
+                )?);
             }
         }
         let entity_template_tag = if self.weapon {

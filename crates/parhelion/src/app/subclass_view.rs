@@ -36,6 +36,18 @@ mod values;
 
 pub(in crate::app) use properties::GraphCards;
 
+/// An ability, node or perk's tooltip, in the game's item tooltip once the catalog has loaded.
+fn display_tooltip(
+    response: egui::Response,
+    catalog: Option<&InvestmentCatalog>,
+    tooltip: DisplayTooltip<'_>,
+) -> egui::Response {
+    match catalog {
+        Some(catalog) => catalog.display_tooltip(response, tooltip),
+        None => response.on_hover_ui(|ui| draw_display_tooltip(ui, tooltip)),
+    }
+}
+
 /// The list's width beside the detail panel, and the narrowest pane that keeps the two side by
 /// side.
 const LIST_WIDTH: f32 = 360.0;
@@ -66,6 +78,8 @@ impl Default for SubclassSelection {
     }
 }
 
+type IconLoad = Result<crate::perk::Icon, String>;
+
 /// The subclass page's own state.
 pub(super) struct PageState {
     pub(super) selection: SubclassSelection,
@@ -81,8 +95,9 @@ pub(super) struct PageState {
     /// The generated inventory icon's symbol.
     artwork: crate::artwork_browser::Picker,
     artwork_query: String,
-    /// The generated icon's symbol from a stock perk, until its texture is read.
-    symbol: Option<Receiver<Result<crate::perk::Icon, String>>>,
+    /// The generated icon's symbol from a stock perk, until its texture is read, with the symbol
+    /// it replaces.
+    symbol: Option<(Option<crate::perk::Icon>, Receiver<IconLoad>)>,
     /// The abilities' entities and the list of their values.
     values: values::Values,
     /// Each ability's tree of graphs and the properties they hold.
@@ -129,6 +144,14 @@ impl Default for PageState {
 }
 
 impl PageState {
+    /// Drops artwork still loading for the recipe that was open: the generated icon's symbol, a
+    /// node's icon and a screen art import.
+    pub(super) fn cancel_loads(&mut self) {
+        self.symbol = None;
+        self.icons.cancel();
+        self.art.cancel();
+    }
+
     /// Whether the Add Modifier form is open.
     #[cfg(test)]
     pub(super) const fn adding_modifier(&self) -> bool {
@@ -439,12 +462,17 @@ impl PackageAuthoringApp {
             );
             return;
         };
-        sundial::ui::notice(
-            ui,
-            "Ability Authoring Is Experimental",
-            "Some changes may not behave as expected in game, and some values are not fully \
-             understood yet. Ability authoring will improve in future releases.",
-        );
+        if !self.ability_notice_dismissed
+            && sundial::ui::dismissible_notice(
+                ui,
+                "Ability authoring is experimental. Some changes may not behave as expected in \
+                 game, and some values are not fully understood yet. Ability authoring will \
+                 improve in future releases.",
+            )
+        {
+            self.ability_notice_dismissed = true;
+            self.save_workbench_preferences();
+        }
         self.subclass_page
             .icons
             .poll(&mut self.recipe, base.hash, ui.ctx());

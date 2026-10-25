@@ -1,6 +1,52 @@
 //! Reference locations come from native layouts or the authored v113 Wwise sound layout.
 use super::*;
 
+pub(super) fn limitation(manager: &PackageManager, entry: &Entry) -> String {
+    let unsupported = entry
+        .host
+        .iter()
+        .chain(entry.groups.iter().flat_map(|group| &group.tags))
+        .filter(|tag| tag.fields.is_none())
+        .collect::<Vec<_>>();
+    if unsupported.is_empty() {
+        return "The fragment has an unresolved private dependency or incomplete relocation tracing".into();
+    }
+    let mut details = unsupported
+        .iter()
+        .take(3)
+        .map(|tag| {
+            let reference = manager
+                .get_entry(TagHash(tag.template))
+                .map(|entry| (entry.file_type, entry.reference));
+            let class = reference
+                .filter(|(kind, _)| matches!(*kind, 8 | 16))
+                .map(|(_, reference)| reference);
+            let layout = if class == Some(0x8080_9EF9) {
+                "loading index outside the supported native layout"
+            } else {
+                "unsupported reference layout"
+            };
+            let identity = reference
+                .map(|(_, reference)| match class {
+                    Some(class) => format!(", class {class:08X}"),
+                    None => format!(", entry reference {reference:08X}"),
+                })
+                .unwrap_or_default();
+            format!(
+                "cached tag {:08X} (template {:08X}{identity}): {layout}",
+                tag.assigned, tag.template
+            )
+        })
+        .collect::<Vec<_>>();
+    if unsupported.len() > details.len() {
+        details.push(format!(
+            "{} more unsupported resources",
+            unsupported.len() - details.len()
+        ));
+    }
+    details.join(". ")
+}
+
 pub(super) fn fields(manager: &PackageManager, tag: &NewTagSpec) -> Option<Vec<(usize, u32)>> {
     match tag.storage {
         crate::NewTagStorageMode::AudioMedia
@@ -8,9 +54,8 @@ pub(super) fn fields(manager: &PackageManager, tag: &NewTagSpec) -> Option<Vec<(
         | crate::NewTagStorageMode::GpuDomain => Some(Vec::new()),
         crate::NewTagStorageMode::AudioBank => audio_fields(&tag.payload),
         crate::NewTagStorageMode::InheritTemplate => {
-            // A loading index also names resources through package IDs and bitmap
-            // or sparse entry indices. Ordinary tag-field relocation misses them.
-            // Keep exact-placement reuse, but recompile if allocation changes.
+            // Loading indexes require a validated membership plan in addition to header fields.
+            // `loading` supplies it, while an unsupported index keeps exact-placement reuse.
             if manager.get_entry(tag.template_tag)?.reference == 0x8080_9EF9 {
                 return None;
             }
@@ -22,6 +67,29 @@ pub(super) fn fields(manager: &PackageManager, tag: &NewTagSpec) -> Option<Vec<(
             .ok()
         }
     }
+}
+
+pub(super) fn loading(
+    manager: &PackageManager,
+    tag: &NewTagSpec,
+    assigned: u32,
+) -> Option<BTreeSet<(u16, u16)>> {
+    if tag.storage != crate::NewTagStorageMode::InheritTemplate {
+        return None;
+    }
+    let entry = manager.get_entry(tag.template_tag)?;
+    if entry.file_type != 8 || entry.reference != 0x8080_9EF9 {
+        return None;
+    }
+    let owner = TagHash(word(&tag.payload, 12)?);
+    let companion = TagHash(assigned);
+    let entries =
+        crate::shared_tag_dependency_index::dependency_entries(&tag.payload, companion, owner)
+            .ok()?;
+    [companion, owner]
+        .iter()
+        .all(|tag| entries.contains(&(tag.pkg_id(), tag.entry_index())))
+        .then_some(entries)
 }
 
 fn word(bytes: &[u8], at: usize) -> Option<u32> {
@@ -101,14 +169,37 @@ pub(super) fn unpack(
 ) -> Option<NewTagSpec> {
     let mut payload = slice(bytes, tag.span)?.to_vec();
     if !exact {
-        for (offset, old) in tag.fields.as_ref()? {
-            if word(&payload, *offset)? != *old {
+        if let Some(expected) = &tag.loading {
+            let owner = word(&payload, 12)?;
+            if tag.storage != 0
+                || tag.fields.as_deref()? != [(8, tag.assigned), (12, owner)]
+                || crate::shared_tag_dependency_index::dependency_entries(
+                    &payload,
+                    TagHash(tag.assigned),
+                    TagHash(owner),
+                )
+                .ok()?
+                    != *expected
+            {
                 return None;
             }
-            if let Some(new) = moves.get(old) {
-                payload
-                    .get_mut(*offset..offset.checked_add(4)?)?
-                    .copy_from_slice(&new.to_le_bytes());
+            payload = crate::shared_tag_dependency_index::relocate::remap(
+                &payload,
+                TagHash(tag.assigned),
+                TagHash(owner),
+                moves,
+            )
+            .ok()?;
+        } else {
+            for (offset, old) in tag.fields.as_ref()? {
+                if word(&payload, *offset)? != *old {
+                    return None;
+                }
+                if let Some(new) = moves.get(old) {
+                    payload
+                        .get_mut(*offset..offset.checked_add(4)?)?
+                        .copy_from_slice(&new.to_le_bytes());
+                }
             }
         }
     }

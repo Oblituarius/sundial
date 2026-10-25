@@ -24,11 +24,17 @@ use std::thread;
 use std::time::Instant;
 
 impl SundialApp {
+    /// Inspect the destination before choosing its durable account backend. The same inspection
+    /// stays with the loaded document so banners and save validation describe that source.
+    pub(super) fn load_workspace_document(&mut self, json: Value) -> WorkspaceDocument {
+        self.refresh_runtime_inspection();
+        WorkspaceDocument::load(json, &self.settings_path, self.dawn_account_runtime())
+    }
+
     pub(super) fn reload(&mut self) -> bool {
         match load_workspace_json(&self.settings_path) {
             Ok(json) => {
-                let dawn = self.dawn_account_runtime();
-                let doc = WorkspaceDocument::load(json, &self.settings_path, dawn);
+                let doc = self.load_workspace_document(json);
                 self.install_reloaded_document(doc, false);
                 true
             }
@@ -90,13 +96,10 @@ impl SundialApp {
                 return;
             }
         };
-        let dawn = self.dawn_account_runtime();
-        let document = WorkspaceDocument::load(json, &self.settings_path, dawn);
+        let document = self.load_workspace_document(json);
         self.workspace_refresh_pending = false;
         if document != self.persisted_document {
             self.install_reloaded_document(document, true);
-        } else {
-            self.refresh_runtime_inspection();
         }
     }
 
@@ -141,7 +144,6 @@ impl SundialApp {
         self.class_armor_defaults = account::class_armor_default_characters(&document);
         self.persisted_document = document.clone();
         self.document = document;
-        self.refresh_sunrise_version();
         self.source_warning = validate_workspace_document(&self.document).err();
         self.selected_character = self
             .selected_character
@@ -260,7 +262,11 @@ impl SundialApp {
         );
     }
 
-    pub(super) fn apply_install_load(&mut self, pending: PendingInstallLoad, manifest: Manifest) {
+    pub(super) fn apply_install_load(
+        &mut self,
+        pending: PendingInstallLoad,
+        mut manifest: Manifest,
+    ) {
         let PendingInstallLoad {
             install_path,
             settings_path,
@@ -271,13 +277,13 @@ impl SundialApp {
         self.settings_path = settings_path;
         self.settings_layout = settings_layout;
         self.runtime_state = RuntimeState::inspect(&self.install_path);
+        manifest.adopt_package_access(&self.manifest, self.package_authoring_open);
         self.manifest = manifest;
         self.armor_stats_adjuster = equipment::ArmorStatsAdjusterState::default();
         self.hash_inspection.reset();
         self.progression_ui.reset_navigation();
         self.collections_ui.reset_navigation();
-        let dawn = self.dawn_account_runtime();
-        let document = WorkspaceDocument::load(document, &self.settings_path, dawn);
+        let document = self.load_workspace_document(document);
         let warning = validate_workspace_document(&document).err();
         self.selected_character = 0;
         self.replace_loaded_document(document);
@@ -382,7 +388,11 @@ impl SundialApp {
                                 self.apply_install_load(pending, manifest);
                             }
                         }
-                        (CatalogTaskKind::Rebuild, Ok(manifest)) => {
+                        (CatalogTaskKind::Rebuild, Ok(mut manifest)) => {
+                            // Previews and viewers keep the access they were handed, so the
+                            // rebuilt catalog takes it over rather than leaving them paused.
+                            manifest
+                                .adopt_package_access(&self.manifest, self.package_authoring_open);
                             self.manifest = manifest;
                             self.armor_stats_adjuster =
                                 equipment::ArmorStatsAdjusterState::default();

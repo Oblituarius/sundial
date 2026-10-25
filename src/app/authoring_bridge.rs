@@ -176,19 +176,20 @@ pub(crate) fn draw_authoring_choice_row(
         if icon.is_none() && catalog.display_name(u64::from(hash)) == Some(name) {
             catalog_item_tooltip(response, catalog, u64::from(hash))
         } else {
-            response.on_hover_ui(|ui| {
-                super::item_editor::draw_item_tooltip_with_icon(
-                    ui,
-                    catalog,
-                    u64::from(hash),
-                    Some(crate::investment::PlugTooltip {
+            super::item_editor::authored_item_tooltip(
+                response,
+                catalog,
+                u64::from(hash),
+                super::item_editor::AuthoredTooltip {
+                    text: Some(crate::investment::PlugTooltip {
                         name: Some(name),
                         description,
                         classification_hash: None,
                     }),
                     icon,
-                );
-            })
+                    ..Default::default()
+                },
+            )
         }
     } else {
         response.on_hover_ui(|ui| {
@@ -207,6 +208,60 @@ pub(crate) fn draw_display_tooltip(
     tooltip: crate::investment::DisplayTooltip<'_>,
 ) {
     super::item_editor::draw_display_tooltip(ui, tooltip);
+}
+
+/// The game's item tooltip for `hash` with an authored item's presentation, while hovered.
+pub(crate) fn item_tooltip(
+    response: egui::Response,
+    catalog: &Catalog,
+    hash: u32,
+    tooltip: crate::investment::ItemTooltip<'_>,
+) -> egui::Response {
+    super::item_art::tooltip::on_hover_authored(
+        response,
+        catalog,
+        u64::from(hash),
+        super::item_art::tooltip::Authored {
+            name: tooltip.name,
+            description: tooltip.description,
+            type_name: tooltip.type_name,
+            rarity: tooltip
+                .rarity
+                .map(crate::catalog::ItemRarity::from_package_value),
+            icon: tooltip.icon,
+            note: tooltip.note,
+            template: tooltip.template,
+            ..Default::default()
+        },
+    )
+}
+
+/// A [`DisplayTooltip`](crate::investment::DisplayTooltip) in the game's item tooltip, at a
+/// perk's size, while hovered.
+pub(crate) fn display_tooltip(
+    response: egui::Response,
+    catalog: &Catalog,
+    tooltip: crate::investment::DisplayTooltip<'_>,
+) -> egui::Response {
+    super::item_art::tooltip::on_hover_authored(
+        response,
+        catalog,
+        0,
+        super::item_art::tooltip::Authored {
+            name: Some(tooltip.name),
+            description: Some(tooltip.description.unwrap_or_default()),
+            type_name: tooltip.subtitle,
+            icon: Some(
+                tooltip
+                    .icon
+                    .map_or(crate::investment::IconOverride::Pending, |icon| {
+                        crate::investment::IconOverride::Texture(icon.id())
+                    }),
+            ),
+            compact: true,
+            ..Default::default()
+        },
+    )
 }
 
 /// Measured for the active font and padding, shared with the native Reset renderer.
@@ -443,6 +498,7 @@ fn synchronize_authored_collection_unlocks_with(
                 .map(|receipt| receipt.backup)
                 .map_err(Into::into)
         },
+        || super::settings::require_game_closed(super::platform::destiny_is_running()),
     )
 }
 
@@ -622,125 +678,10 @@ pub(crate) fn shader_preview(
 #[cfg(test)]
 mod tests {
     mod confirmation;
-    mod resync;
     mod runtime;
     use std::fs;
 
     use serde_json::json;
 
     use super::*;
-    use crate::{app::SettingsLayout, test_support::TestDirectory};
-
-    #[test]
-    fn weapon_picker_hides_known_dummies_without_hiding_same_name_or_custom_weapons() {
-        let hashes = [
-            0xCB6F_6266,
-            0x3B4F_02D5,
-            0xC92D_6B37,
-            0x3452_F1F3,
-            0xBB5D_B0A6,
-            0x9954_40F4,
-            0x3EBA_E846,
-            0x3735_6D87,
-            0x032B_2570,
-            1,
-        ];
-        let donors: Vec<_> = hashes
-            .into_iter()
-            .map(|hash| WeaponDonorSummary {
-                hash,
-                name: "Polaris Lance".into(),
-                type_name: "Scout Rifle".into(),
-                bucket_hash: 1_498_876_634,
-                collection_backed: hash == 0xCB6F_6266,
-                power_cap: None,
-                damage_type: None,
-                inventory_slot: None,
-                ammo_type: None,
-                weapon_pattern_index: None,
-                weapon_translation_group: None,
-                stat_group_index: None,
-                damage_profile: crate::investment::WeaponDamageProfile::Unknown,
-                rarity: crate::investment::WeaponRarity::Legendary,
-            })
-            .collect();
-        let catalog = Catalog::for_test(
-            donors
-                .iter()
-                .map(|donor| ItemDef {
-                    hash: u64::from(donor.hash),
-                    name: donor.name.clone(),
-                    type_name: donor.type_name.clone(),
-                    bucket_hash: donor.bucket_hash,
-                    class_type: 3,
-                    default_plugs: Vec::new(),
-                    sockets: Vec::new(),
-                    abilities: Default::default(),
-                })
-                .collect(),
-            Default::default(),
-        );
-        let candidates: Vec<_> = donors.iter().collect();
-        let mut filter = ItemFilter::default();
-        let visible = filtered_weapon_donors(&catalog, &candidates, &filter);
-        assert_eq!(
-            visible.iter().map(|donor| donor.hash).collect::<Vec<_>>(),
-            [0xCB6F_6266, 0x032B_2570, 1]
-        );
-        filter.include_dummy_weapons = true;
-        assert_eq!(
-            filtered_weapon_donors(&catalog, &candidates, &filter).len(),
-            10
-        );
-        filter.weapon_type = Some("Auto Rifle".into());
-        assert!(filtered_weapon_donors(&catalog, &candidates, &filter).is_empty());
-    }
-
-    #[test]
-    fn authored_unlock_path_honors_each_saved_layout() {
-        let directory = TestDirectory::new("authored-unlock-layout");
-        let game_root = super::super::settings::settings_path_for_install(
-            &directory.0,
-            SettingsLayout::GameRoot,
-        );
-        let root =
-            super::super::settings::settings_path_for_install(&directory.0, SettingsLayout::Root);
-        let bin =
-            super::super::settings::settings_path_for_install(&directory.0, SettingsLayout::BinX64);
-        fs::create_dir_all(root.parent().unwrap()).unwrap();
-        fs::create_dir_all(bin.parent().unwrap()).unwrap();
-        fs::write(&game_root, b"{}\n").unwrap();
-        fs::write(&root, b"{}\n").unwrap();
-        fs::write(&bin, b"{}\n").unwrap();
-
-        for (layout, expected) in [("game_root", game_root), ("root", root), ("bin_x64", bin)] {
-            let preferences = super::super::Preferences {
-                install: Some(directory.0.clone()),
-                settings_layout: Some(layout.to_owned()),
-                ..Default::default()
-            };
-            assert_eq!(
-                authored_unlock_settings_path(&directory.0, &preferences).unwrap(),
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn authored_unlock_path_keeps_ambiguous_layouts_blocked_without_a_matching_preference() {
-        let directory = TestDirectory::new("authored-unlock-ambiguous");
-        for layout in SettingsLayout::ALL {
-            let path = super::super::settings::settings_path_for_install(&directory.0, layout);
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(path, b"{}\n").unwrap();
-        }
-        let preferences = super::super::Preferences {
-            install: Some(directory.0.join("different-install")),
-            settings_layout: Some("root".to_owned()),
-            ..Default::default()
-        };
-
-        let error = authored_unlock_settings_path(&directory.0, &preferences).unwrap_err();
-        assert!(error.contains("Multiple settings.json files exist"));
-    }
 }

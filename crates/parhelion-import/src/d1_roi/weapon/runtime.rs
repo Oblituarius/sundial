@@ -2,30 +2,6 @@
 use super::*;
 
 impl Source {
-    pub(in super::super) fn runtime_assignments(
-        &self,
-        assets: &mut BTreeMap<u32, Payload>,
-    ) -> Result<BTreeMap<u32, u32>> {
-        let root_tag = self.named("investment_assets")?;
-        let root = self.read(root_tag)?;
-        let tag = root.u32(0x10)?;
-        ensure!(
-            self.reference(tag)? == 0x80800341,
-            "Source runtime assignment root differs"
-        );
-        let map = self.read(tag)?;
-        let mut result = BTreeMap::new();
-        for row in map.array(8, 8, None)? {
-            ensure!(
-                result.insert(map.u32(row)?, map.u32(row + 4)?).is_none(),
-                "Duplicate source runtime assignment"
-            );
-        }
-        assets.insert(root_tag, root);
-        assets.insert(tag, map);
-        Ok(result)
-    }
-
     pub(in super::super) fn weapon_runtime(
         &self,
         item: &Weapon,
@@ -71,8 +47,10 @@ impl Source {
                 let class = owner.u32(resource - 4)?;
                 components.push(json!({"entity":entity,"owner":tag,"class":class}));
                 if class == 0x8080049A {
-                    let bones = owner.array(resource + 0x98, 16, Some(0x808004F4))?;
-                    let inverse = owner.array(resource + 0xB8, 32, Some(0x808001B0))?;
+                    let bones =
+                        owner.array(resource + self.field(0x98, 0x88), 16, Some(0x808004F4))?;
+                    let inverse =
+                        owner.array(resource + self.field(0xB8, 0xA8), 32, Some(0x808001B0))?;
                     ensure!(
                         !bones.is_empty() && bones.len() == inverse.len(),
                         "Source skeleton arrays differ"
@@ -86,13 +64,15 @@ impl Source {
                     skeletons.push(json!({"entity":format!("{entity:08X}"),"owner":format!("{tag:08X}"),"bones":entries}));
                 }
                 if class == 0x80802580 {
+                    // The default row is the 0xD8 bytes just before the table.
+                    let table = resource + self.field(0x5D8, 0x538);
                     let mut selected = owner
-                        .array(resource + 0x5D8, 0xD8, Some(0x808031DE))?
+                        .array(table, 0xD8, Some(0x808031DE))?
                         .into_iter()
                         .filter(|r| owner.u32(*r).ok() == Some(content))
                         .collect::<Vec<_>>();
                     if selected.is_empty() {
-                        selected.push(resource + 0x500);
+                        selected.push(table - 0xD8);
                     }
                     ensure!(
                         selected.len() == 1,

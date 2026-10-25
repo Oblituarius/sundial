@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::fs;
 
 pub(crate) fn available(recipe: &WeaponRecipe) -> Result<Option<ImportedIcon>, String> {
-    if !recipe.kind.is_weapon()
+    if (!recipe.kind.is_weapon() && recipe.kind != crate::ItemKind::Sparrow)
         || recipe.icon_donor.is_some()
         || recipe.overrides.icon_edit.imported_image.is_some()
     {
@@ -28,7 +28,15 @@ pub(crate) fn available(recipe: &WeaponRecipe) -> Result<Option<ImportedIcon>, S
         .item_hash
         .parse_u32()
         .map_err(|e| e.to_string())?;
-    reference.validate(item).map_err(|e| format!("{e:#}"))?;
+    let validate = || {
+        if recipe.kind.is_weapon() {
+            reference.validate(item)
+        } else {
+            reference.validate_reusable("sparrow")
+        }
+        .map_err(|e| format!("{e:#}"))
+    };
+    validate()?;
     let root = reference
         .directory
         .canonicalize()
@@ -45,7 +53,7 @@ pub(crate) fn available(recipe: &WeaponRecipe) -> Result<Option<ImportedIcon>, S
         return Err("Generated icon escapes its graph folder".into());
     }
     let icon = ImportedIcon::from_bytes(&fs::read(path).map_err(|e| e.to_string())?)?;
-    reference.validate(item).map_err(|e| format!("{e:#}"))?;
+    validate()?;
     Ok(Some(icon))
 }
 
@@ -74,7 +82,12 @@ pub(crate) fn for_model(
     if let Some(icon) = available(&next)? {
         return Ok(Some(icon));
     }
-    let settings = parhelion_import::artwork::Settings::for_recipe(
+    let document: Value = serde_json::from_slice(
+        &fs::read(graph.directory.join("asset-graph.json")).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let settings = parhelion_import::artwork::Settings::for_graph(
+        &document,
         &serde_json::to_value(&next).map_err(|e| e.to_string())?,
     );
     let png = parhelion_import::artwork::render(graph, packages, settings)

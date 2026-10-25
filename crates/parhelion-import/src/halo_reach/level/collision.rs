@@ -3,6 +3,15 @@
 //! for 16-bit indices keeps a large collision BSP instead, whose rows hold 32-bit indices. Its
 //! surfaces are convex polygons whose edges link them, and walking a surface's edges with the
 //! surface on their left winds its points so that their normal faces open space.
+//!
+//! A surface names one of the structure's collision materials. A material with a seam index marks
+//! the faces where the structure meets another structure BSP. Where both are loaded, the player
+//! walks through those faces into the next: a level of several zone sets kept every seam face of
+//! Tip of the Spear solid, an invisible wall where one stretch met the next. So a seam that two
+//! loaded BSPs share ([`shared_seams`]) collides with nothing, and one whose neighbour is not
+//! loaded still closes the level.
+use std::collections::{BTreeMap, BTreeSet};
+
 use super::{Definition, Instance, METRES_PER_UNIT, Space};
 use crate::halo_reach::{
     cache::{Cache, Tag},
@@ -26,6 +35,10 @@ const DEFINITION_SIZE: usize = 0x144;
 const DEFINITION_BSP: usize = 0x08;
 /// No collision surface in the examined levels has more edges.
 const MAX_EDGES: usize = 256;
+/// A structure BSP's collision materials, `0x18`-byte rows whose `i16` at `+0x14` is the seam the
+/// material marks, -1 for none.
+const MATERIALS: (usize, usize) = (0x58, 0x18);
+const MATERIAL_SEAM: usize = 0x14;
 
 /// Where a collision BSP keeps its surfaces, edges and vertices: each block's offset in the BSP's
 /// row and its row size, the offset of a surface's first edge, and the width of every index.
@@ -33,6 +46,8 @@ struct Layout {
     surfaces: usize,
     surface_size: usize,
     surface_first_edge: usize,
+    /// The offset of a surface's `i16` collision material index.
+    surface_material: usize,
     edges: usize,
     edge_size: usize,
     vertices: usize,
@@ -45,6 +60,7 @@ const SMALL: Layout = Layout {
     surfaces: 0x48,
     surface_size: 12,
     surface_first_edge: 2,
+    surface_material: 4,
     edges: 0x54,
     edge_size: 12,
     vertices: 0x60,
@@ -58,6 +74,7 @@ const LARGE: Layout = Layout {
     surfaces: 0x48,
     surface_size: 16,
     surface_first_edge: 4,
+    surface_material: 8,
     edges: 0x54,
     edge_size: 24,
     vertices: 0x60,
@@ -75,6 +92,8 @@ pub struct Polygon {
 /// definition's polygons in its own space.
 pub struct Collision {
     pub structure: Vec<Polygon>,
+    /// The seam each of `structure` is a face of, if any.
+    pub seams: Vec<Option<i16>>,
     pub definitions: Vec<Vec<Polygon>>,
 }
 
@@ -103,14 +122,16 @@ impl Collision {
     }
 }
 
-/// The polygons of the collision BSP at `bsp` in `definition`, laid out as `layout`.
+/// The polygons of the collision BSP at `bsp` in `definition`, laid out as `layout`, without the
+/// surfaces whose collision material index `open` holds, each with its collision material index.
 fn polygons(
     definition: &Definition,
     cache: &Cache,
     pages: &mut Pages,
     bsp: usize,
     layout: &Layout,
-) -> Result<Vec<Polygon>> {
+    open: &BTreeSet<usize>,
+) -> Result<Vec<(Polygon, i16)>> {
     let (surfaces, surface_rows) =
         definition.data(cache, pages, bsp + layout.surfaces, layout.surface_size)?;
     if surfaces == 0 {
@@ -140,6 +161,11 @@ fn polygons(
     };
     let mut out = Vec::with_capacity(surfaces);
     for surface in 0..surfaces {
+        let at = surface * layout.surface_size + layout.surface_material;
+        let material = i16::from_le_bytes([surface_rows[at], surface_rows[at + 1]]);
+        if usize::try_from(material).is_ok_and(|material| open.contains(&material)) {
+            continue;
+        }
         let first = index_at(
             &surface_rows,
             surface * layout.surface_size + layout.surface_first_edge,
@@ -168,17 +194,59 @@ fn polygons(
             }
             ensure!(points.len() < MAX_EDGES, "Collision surface does not close");
         }
-        out.push(Polygon { points });
+        out.push((Polygon { points }, material));
     }
     Ok(out)
 }
 
+/// Each collision material of structure BSP `tag` with the seam it marks, if any.
+fn material_seams(cache: &Cache, tag: &Tag) -> Result<Vec<Option<i16>>> {
+    cache
+        .block(tag.address()? + MATERIALS.0, MATERIALS.1)?
+        .into_iter()
+        .map(|row| Ok(Some(cache.i16(row + MATERIAL_SEAM)?).filter(|&seam| seam >= 0)))
+        .collect()
+}
+
+/// The seams at least two of the structure BSPs `bsps` mark, which join loaded BSPs.
+pub fn shared_seams(cache: &Cache, bsps: &[Tag]) -> Result<BTreeSet<i16>> {
+    let mut marked = BTreeMap::<i16, usize>::new();
+    for bsp in bsps {
+        for seam in material_seams(cache, bsp)?
+            .into_iter()
+            .flatten()
+            .collect::<BTreeSet<_>>()
+        {
+            *marked.entry(seam).or_default() += 1;
+        }
+    }
+    Ok(marked
+        .into_iter()
+        .filter(|&(_, count)| count >= 2)
+        .map(|(seam, _)| seam)
+        .collect())
+}
+
 /// Reads the collision of `tag`, a structure BSP. The structure's polygons come from its collision
 /// BSP or its large collision BSP, whichever the resource holds, and a structure built entirely
-/// from instanced geometry would have none.
-pub fn read(cache: &Cache, pages: &mut Pages, tag: &Tag) -> Result<Collision> {
+/// from instanced geometry would have none. The faces of the `open` seams are left out.
+pub fn read(
+    cache: &Cache,
+    pages: &mut Pages,
+    tag: &Tag,
+    open: &BTreeSet<i16>,
+) -> Result<Collision> {
     let definition = Definition::load(cache, tag, COLLISION_RESOURCE)?;
+    let material_seams = material_seams(cache, tag)?;
+    let open_materials = material_seams
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, seam)| seam.is_some_and(|seam| open.contains(&seam)))
+        .map(|(material, _)| material)
+        .collect::<BTreeSet<_>>();
     let mut structure = Vec::new();
+    let mut seams = Vec::new();
     for (root, size, layout) in [
         (ROOT_STRUCTURE, STRUCTURE_SIZE, &SMALL),
         (ROOT_LARGE_STRUCTURE, LARGE_STRUCTURE_SIZE, &LARGE),
@@ -189,7 +257,16 @@ pub fn read(cache: &Cache, pages: &mut Pages, tag: &Tag) -> Result<Collision> {
             "The structure's collision BSP block at {root:#x} holds {count} rows"
         );
         if count == 1 {
-            structure.extend(polygons(&definition, cache, pages, start, layout)?);
+            for (polygon, material) in
+                polygons(&definition, cache, pages, start, layout, &open_materials)?
+            {
+                seams.push(
+                    usize::try_from(material)
+                        .ok()
+                        .and_then(|material| material_seams.get(material).copied().flatten()),
+                );
+                structure.push(polygon);
+            }
         }
     }
     let (count, space, start) =
@@ -206,12 +283,15 @@ pub fn read(cache: &Cache, pages: &mut Pages, tag: &Tag) -> Result<Collision> {
                 pages,
                 start + index * DEFINITION_SIZE + DEFINITION_BSP,
                 &SMALL,
+                &BTreeSet::new(),
             )
+            .map(|polygons| polygons.into_iter().map(|(polygon, _)| polygon).collect())
             .with_context(|| format!("Instanced geometry definition {index}"))
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(Collision {
         structure,
+        seams,
         definitions,
     })
 }

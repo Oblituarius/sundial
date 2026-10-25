@@ -108,6 +108,7 @@ impl Assembly<'_> {
                 format,
                 width: edge as u16,
                 height: edge as u16,
+                depth: 1,
                 layers: 1,
                 mips: 5,
                 bytes,
@@ -117,14 +118,19 @@ impl Assembly<'_> {
 
     pub(super) fn equipment(&mut self, owner: &Payload, dyes: &[Value]) -> Result<Equipment> {
         let resource = owner.pointer(24)?;
-        let rows = owner.array(resource + 0x220, 56, Some(0x80801B12))?;
+        let stride = self.source.field(56, 0x30);
+        let rows = owner.array(
+            resource + self.source.field(0x220, 0x1A8),
+            stride,
+            Some(0x80801B12),
+        )?;
         ensure!(
             rows.len() <= 1,
             "Source owner needs multiple plate selection semantics"
         );
         let mut plates = [String::new(), String::new(), String::new()];
         if let Some(row) = rows.first() {
-            let set = self.source.read(owner.u32(row + 48)?)?;
+            let set = self.source.read(owner.u32(row + stride - 8)?)?;
             for (index, output) in plates.iter_mut().enumerate() {
                 let tag = set.u32(0x24 + index * 4)?;
                 if !matches!(tag, 0 | u32::MAX) {

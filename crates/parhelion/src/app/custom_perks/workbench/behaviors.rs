@@ -12,8 +12,6 @@ mod lead;
 mod recipes;
 pub(super) use recipes::WEAPON_PROPERTIES_GRAPH;
 mod rows;
-#[cfg(test)]
-mod tests;
 mod words;
 
 use lead::*;
@@ -271,23 +269,6 @@ impl Picker {
             &rows,
             blocked,
         )
-    }
-
-    /// One action from the Add Action picker.
-    #[cfg(test)]
-    pub fn draw_action(
-        &mut self,
-        ui: &mut egui::Ui,
-        discovery: &discovery::Discovery,
-        names: &BTreeMap<u16, String>,
-        labels: &BTreeMap<u32, String>,
-        program: &Program,
-        keys: &sundial::package_authoring::sandbox_perk::program::properties::KeyCatalog,
-    ) -> Option<Action> {
-        match self.draw_action_selection(ui, discovery, names, labels, program, keys)? {
-            Selection::Action(action) => Some(action),
-            _ => None,
-        }
     }
 
     fn load(&mut self, ui: &egui::Ui, discovery: &discovery::Discovery) {

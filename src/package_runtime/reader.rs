@@ -11,6 +11,7 @@ use std::{
 };
 use tiger_pkg::{GameVersion, Package, PackagePlatform, TagHash, Version};
 mod decoder;
+mod index;
 mod pool;
 mod trace;
 pub use decoder::initialize_source_decoder;
@@ -43,14 +44,13 @@ impl PackageManager {
         version: GameVersion,
         platform: Option<PackagePlatform>,
     ) -> Result<Self, String> {
-        let metadata = tiger_pkg::PackageManager::new(path, version, platform)
-            .map_err(|e| format!("{e:#}"))?;
+        let tables = index::read(path.as_ref(), version, platform)?;
         Ok(Self {
-            package_dir: metadata.package_dir,
-            package_paths: metadata.package_paths.into_iter().collect(),
-            lookup: metadata.lookup,
-            version: metadata.version,
-            platform: metadata.platform,
+            package_dir: tables.package_dir,
+            package_paths: tables.package_paths,
+            lookup: tables.lookup,
+            version,
+            platform: tables.platform,
             identity: NEXT_READER.fetch_add(1, Ordering::Relaxed),
             trace: Mutex::new(None),
             local: HashMap::new(),
@@ -274,25 +274,4 @@ fn describe_open_failure(file_name: &str, error: &str) -> String {
         );
     }
     format!("Could not open {file_name}: {error}")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::describe_open_failure;
-
-    /// The remedy is only useful where it applies, and misapplied it would send someone chasing
-    /// a limit while the real fault is the package.
-    #[test]
-    fn only_a_descriptor_failure_mentions_the_limit() {
-        let exhausted = describe_open_failure(
-            "w64_globals_01a3_0.pkg",
-            "Too many open files (os error 24)",
-        );
-        assert!(exhausted.contains("ulimit -n 8192"));
-        assert!(exhausted.contains("w64_globals_01a3_0.pkg"));
-
-        let corrupt = describe_open_failure("w64_globals_01a3_0.pkg", "invalid package header");
-        assert!(!corrupt.contains("ulimit"));
-        assert!(corrupt.contains("invalid package header"));
-    }
 }

@@ -26,8 +26,8 @@ pub(super) fn compact(code: &[u8]) -> Result<Vec<u8>> {
     dxbc::rebuild(code, &tokens(code)?, None)
 }
 
-/// Only the transparent scope's depth coefficients retain the same producer.
-/// Other vectors and relative addressing need their own translation contract.
+/// Translate checked depth and ambient irradiance vectors in the named transparent scope.
+/// A declaration can include unused rows. Every actual read must have a qualified producer.
 pub(super) fn depth(code: &[u8], binding: &super::expression::Depth) -> Result<Vec<u8>> {
     let words = tokens(code)?;
     let mut used = false;
@@ -45,7 +45,11 @@ pub(super) fn depth(code: &[u8], binding: &super::expression::Depth) -> Result<V
             }
             let row = operand.indices[1].context("Relative transparent depth vector")?;
             ensure!(
-                words[row] == u32::from(instruction.opcode == 0x59),
+                if instruction.opcode == 0x59 {
+                    (1..=6).contains(&words[row])
+                } else {
+                    words[row] < 6 && binding.vectors & (1 << words[row]) != 0
+                },
                 "Unsupported transparent scope vector"
             );
             used = true;
@@ -66,6 +70,106 @@ pub(super) fn depth(code: &[u8], binding: &super::expression::Depth) -> Result<V
         },
     )?
     .bytecode)
+}
+
+/// A mapped rigid vertex can change only the packed bone selector in POSITION0.w.
+/// Admit the checked integer recovery and refuse other uses of that lane or direct nonroot bones.
+pub(super) fn rigid_indices(code: &[u8]) -> Result<()> {
+    let signature = dxbc::signature(code, b"ISGN")?;
+    ensure!(
+        signature.iter().any(
+            |(name, index, register, mask)| name.eq_ignore_ascii_case("POSITION")
+                && *index == 0
+                && *register == 0
+                && *mask == 15
+        ) && !signature
+            .iter()
+            .any(|(name, _, _, _)| name.eq_ignore_ascii_case("BLENDINDICES")
+                || name.eq_ignore_ascii_case("BLENDWEIGHT")),
+        "Mapped weapon shader needs a rigid position input"
+    );
+    let words = tokens(code)?;
+    ensure!(
+        words[0] == 0x00010050,
+        "Mapped weapon shader is not vertex SM5"
+    );
+    for instruction in dxbc::walk(&words)? {
+        if (0x58..=0x6A).contains(&instruction.opcode) {
+            continue;
+        }
+        // Projection shaders can read a fixed texture texel. It has no vertex-dependent
+        // address, unlike a stream carrying additional per-vertex deformation indices.
+        ensure!(
+            instruction.operands.iter().all(|operand| {
+                !matches!(operand.kind, 7 | 30 | 31)
+                    || (operand.kind == 7
+                        && instruction.opcode == 0x2D
+                        && instruction
+                            .operands
+                            .get(1)
+                            .is_some_and(|address| address.kind == 4))
+            }),
+            "Mapped rigid vertex program reads indexed resource deformation"
+        );
+        for operand in &instruction.operands {
+            let token = words[operand.token_at];
+            if operand.kind == 8
+                && operand
+                    .indices
+                    .first()
+                    .copied()
+                    .flatten()
+                    .is_some_and(|at| words[at] == 10)
+                && (token >> 25) & 7 == 0
+            {
+                let row = operand
+                    .indices
+                    .get(1)
+                    .copied()
+                    .flatten()
+                    .context("Mapped bone row")?;
+                ensure!(
+                    words[row] < 3,
+                    "Mapped shader has a direct nonroot bone read"
+                );
+            }
+            if operand.kind != 1
+                || !operand
+                    .indices
+                    .first()
+                    .copied()
+                    .flatten()
+                    .is_some_and(|at| words[at] == 0)
+            {
+                continue;
+            }
+            let uses_w = match (token >> 2) & 3 {
+                0 => token & (8 << 4) != 0,
+                1 => (0..4).any(|lane| (token >> (4 + lane * 2)) & 3 == 3),
+                2 => (token >> 4) & 3 == 3,
+                _ => anyhow::bail!("Mapped position input has an unsupported lane selector"),
+            };
+            if !uses_w {
+                continue;
+            }
+            let scalar = |index: usize, value: f32| -> bool {
+                instruction.operands.get(index).is_some_and(|op| {
+                    words[op.token_at] == 0x4001
+                        && words.get(op.token_at + 1) == Some(&value.to_bits())
+                })
+            };
+            ensure!(
+                instruction.opcode == 0x32
+                    && instruction.operands.len() == 4
+                    && instruction.operands[1].token_at == operand.token_at
+                    && token == 0x0010103A
+                    && scalar(2, 32767.0)
+                    && scalar(3, 0.1),
+                "Mapped position.w has a use outside rigid bone-index recovery"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// D1 bone matrices occupy b10. Native skinning appends the same matrices after
@@ -403,21 +507,54 @@ pub(super) fn sight_depth_row(code: &[u8]) -> Result<u8> {
     u8::try_from(rows[0]).context("Sight depth row exceeds the vector table")
 }
 
+/// Whether a pixel program writes exactly the two full gbuffer targets of a D1 pass.
+fn two_targets(code: &[u8]) -> Result<bool> {
+    let signatures = dxbc::signature(code, b"OSGN")?;
+    Ok(signatures.len() == 2
+        && signatures
+            .iter()
+            .enumerate()
+            .all(|(i, (name, semantic, register, mask))| {
+                name.eq_ignore_ascii_case("SV_Target")
+                    && *semantic == i as u32
+                    && *register == i as u32
+                    && *mask == 15
+            }))
+}
+
+/// D1 decals write premultiplied color with its inverse coverage, and two-target decals a
+/// premultiplied packed normal as well, which is the target layout of native decals, so their
+/// outputs stay as they are. A replacing decal comes from an unblended source state. Its zero
+/// inverse coverage makes the native premultiplied blend replace the color.
+pub(super) fn decal(code: &[u8], replace: bool) -> Result<Vec<u8>> {
+    ensure!(two_targets(code)?, "Source decal output contract differs");
+    let words = tokens(code)?;
+    if !replace {
+        return dxbc::rebuild(code, &words, None);
+    }
+    let instructions = dxbc::walk(&words)?;
+    ensure!(
+        instructions.iter().filter(|i| i.opcode == 0x3E).count() == 1,
+        "Multiple decal returns need separate control-flow verification"
+    );
+    let mut output = words[..2].to_vec();
+    for instruction in &instructions {
+        if instruction.opcode == 0x3E {
+            // mov o0.w, l(0)
+            output.extend([0x05000036, 0x00102082, 0, 0x00004001, 0]);
+        }
+        output.extend_from_slice(&words[instruction.start..instruction.end]);
+    }
+    output[1] = u32::try_from(output.len())?;
+    dxbc::rebuild(code, &output, None)
+}
+
 /// D1's two deferred outputs encode color/AO and normal/roughness/material code.
 /// Native D2 retains the color and normal encodings in three render targets.
 /// Supported source emissive profiles need a separate native emission value.
 pub(super) fn deferred(code: &[u8], glow: &[glow::Profile]) -> Result<Vec<u8>> {
-    let signatures = dxbc::signature(code, b"OSGN")?;
     ensure!(
-        signatures.len() == 2
-            && signatures
-                .iter()
-                .enumerate()
-                .all(|(i, (name, semantic, register, mask))| name
-                    .eq_ignore_ascii_case("SV_Target")
-                    && *semantic == i as u32
-                    && *register == i as u32
-                    && *mask == 15),
+        two_targets(code)?,
         "Source deferred output contract differs"
     );
     let mut words = tokens(code)?;

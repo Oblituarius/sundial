@@ -19,6 +19,10 @@ fn inspect_source_plates(
 ) -> Result<Value, Box<dyn std::error::Error>> {
     use parhelion_import::tiger::payload::Payload;
     use std::collections::BTreeMap;
+    // The oracle reads the Xbox One texture header; PS4 headers open with a GCN descriptor.
+    if source.platform() == 7 {
+        return Ok(json!("PS4 source plates have no independent oracle"));
+    }
     let mut receipt = Vec::new();
     for node in graph["nodes"].as_array().ok_or("Graph assets")? {
         let symbol = node["symbol"].as_str().ok_or("Graph symbol")?;

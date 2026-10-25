@@ -1,11 +1,7 @@
 pub(super) use crate::account::source::{SettingsLayout, SettingsPathResolution};
 pub use crate::investment::PlugSelectionMode;
-pub(super) use crate::investment::plug_selection::draw_plug_selection_warning;
 
 pub(super) mod store;
-
-#[cfg(test)]
-mod tests;
 
 use std::{
     fs,
@@ -18,6 +14,19 @@ use serde::{Deserialize, Serialize};
 
 use super::ui::destiny_text_font_family;
 use crate::ui::ICON_FONT_FAMILY;
+
+/// Draws the warning a plug picker shows beside `mode`, in the warning color for caution and the
+/// error color for high risk.
+pub(super) fn draw_plug_selection_warning(ui: &mut egui::Ui, mode: PlugSelectionMode) {
+    use crate::investment::plug_selection::Risk;
+    if let Some((risk, text)) = mode.warning() {
+        let color = match risk {
+            Risk::Caution => ui.visuals().warn_fg_color,
+            Risk::High => ui.visuals().error_fg_color,
+        };
+        ui.colored_label(color, text);
+    }
+}
 
 const DESTINY_SYMBOL_FONTS: &[(&str, &str)] = &[
     ("Destiny Symbols PC", "Destiny_Symbols_PC.otf"),
@@ -105,6 +114,9 @@ pub(super) struct Preferences {
     pub(super) show_plug_hashes: bool,
     #[serde(default)]
     pub(super) show_preview_fps: bool,
+    /// Item tooltips name the package and hash under their band.
+    #[serde(default)]
+    pub(super) show_tooltip_source: bool,
     #[serde(default)]
     pub(super) item_card_width: ItemCardWidth,
     #[serde(default)]
@@ -114,11 +126,7 @@ pub(super) struct Preferences {
     #[serde(default)]
     pub(super) experimental_power_above_cap: bool,
     #[serde(default)]
-    pub(super) experimental_extended_fov: bool,
-    #[serde(default)]
     pub(super) experimental_cross_class_subclasses: bool,
-    #[serde(default)]
-    pub(super) experimental_package_authoring: bool,
     #[serde(default)]
     pub(super) parhelion_warning_acknowledged: bool,
     #[serde(default)]
@@ -297,13 +305,12 @@ impl Default for Preferences {
             always_open_json_editor_in_second_window: false,
             show_plug_hashes: false,
             show_preview_fps: false,
+            show_tooltip_source: false,
             item_card_width: ItemCardWidth::Standard,
             character_inventory_layout: CharacterInventoryLayout::Cards,
             experimental_progression: false,
             experimental_power_above_cap: false,
-            experimental_extended_fov: false,
             experimental_cross_class_subclasses: false,
-            experimental_package_authoring: false,
             parhelion_warning_acknowledged: false,
             show_parhelion_experimental_options: false,
             troubleshooting_logging: false,

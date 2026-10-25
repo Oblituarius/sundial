@@ -304,6 +304,7 @@ pub(super) fn asset_edits(
                 patches,
                 appends: Vec::new(),
                 remove_owners: Vec::new(),
+                programs: Vec::new(),
             }),
         }
     }
@@ -316,6 +317,7 @@ fn statuses<'a>(
 ) -> Vec<(Option<&'a Asset>, &'a HudStatus)> {
     programs
         .into_iter()
+        .flat_map(Program::owned_programs)
         .flat_map(|program| {
             program
                 .assets()
@@ -426,7 +428,7 @@ pub(super) fn author_images<'a>(
         return Ok(layers);
     }
     let stock = stock(manager)?;
-    let allocator = AppendedTagAllocator::new(crate::package_profile::window().base, 0);
+    let allocator = AppendedTagAllocator::new(crate::package_profile::window().first(), 0);
     for (asset, status) in assets {
         let Some(image) = &status.image else {
             continue;

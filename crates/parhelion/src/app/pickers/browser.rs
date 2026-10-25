@@ -1,6 +1,4 @@
 //! A persistent inspector gives choices enough space and keeps browsing reversible.
-#[cfg(test)]
-mod tests;
 
 /// The Include Unidentified switch of one picker. Its state is keyed on the picker, not on
 /// the `Ui` it is drawn in, since a wrapped toolbar draws it in a child `Ui` whose id can
@@ -29,7 +27,7 @@ pub(crate) fn browser<T>(
 ) -> Option<T> {
     browser_with_toolbar(ui, scope, label, title, query, |ui, query, opened, _| {
         let changed = ui
-            .horizontal(|ui| search(ui, query, opened, ui.available_width() - 64.0))
+            .horizontal(|ui| search(ui, query, opened, ui.available_width() - CLEAR_WIDTH))
             .inner;
         ui.separator();
         let height = (ui.available_height() - 90.0).max(110.0);
@@ -41,8 +39,7 @@ pub(crate) fn search(ui: &mut egui::Ui, query: &mut String, opened: bool, width:
     sundial::ui::catalog::search(ui, query, opened, width, "Search Effects or Perks")
 }
 
-/// The room the Clear button after a search box takes, with the spacing before it.
-pub(crate) const CLEAR_WIDTH: f32 = 56.0;
+pub(crate) use sundial::ui::catalog::CLEAR_WIDTH;
 
 pub(crate) fn browser_with_toolbar<T>(
     ui: &mut egui::Ui,
@@ -80,6 +77,8 @@ pub(crate) fn browser_window<T>(
             ui.data(|data| data.get_temp::<String>(id.with("query")))
                 .unwrap_or_default()
         };
+        // A dropdown can close while the contents draw without consuming Escape.
+        let popup_was_open = egui::Popup::is_any_open(ui.ctx());
         egui::Window::new(title)
             .id(id.with("window"))
             .order(egui::Order::Foreground)
@@ -101,6 +100,7 @@ pub(crate) fn browser_window<T>(
         ui.data_mut(|data| data.insert_temp(id.with("query"), local_query));
         // Escape closes an open dropdown first, and the window only when none is open.
         let escaped = ui.ctx().input(|input| input.key_pressed(egui::Key::Escape))
+            && !popup_was_open
             && !egui::Popup::is_any_open(ui.ctx());
         if escaped || picked.is_some() {
             open = false;

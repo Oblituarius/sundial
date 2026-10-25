@@ -98,18 +98,14 @@ pub(super) fn verify(
     recipe: &WeaponRecipe,
     graph: &Value,
     runtime: &Value,
-    directory: &Path,
+    source: &Value,
     scale: f32,
 ) -> Result<()> {
     if recipe.kind != parhelion::ItemKind::Sparrow {
         return Ok(());
     }
-    let source: Value = serde_json::from_slice(&fs::read(
-        directory
-            .parent()
-            .context("Vehicle import directory")?
-            .join("source/source.json"),
-    )?)?;
+    // Portable recipes unpack only the asset graph. The configured E2E keeps
+    // the source document independently of that graph's extraction directory.
     let contacts = &source["object"]["gameplay"]["contacts"];
     let source_wheels = contacts["wheels"].as_array().context("Source wheels")?;
     let maximum_mass = source_wheels.iter().try_fold(0f64, |maximum, wheel| {
@@ -155,7 +151,7 @@ pub(super) fn verify(
         if owner.u64(24)? == 0 {
             continue;
         }
-        let definition = owner.pointer(24)?;
+        let definition = usize::try_from(owner.u64(owner.pointer(16)? + 8)?)?;
         if owner.u32(definition - 4)? != 0x80803d65 {
             continue;
         }
@@ -229,6 +225,16 @@ pub(super) fn verify(
                 let coefficient = actual
                     * f64::from(owner.f32(settings + rolling)?)
                     * f64::from(owner.f32(definition + multiplier)?);
+                if ratio == 0x20 {
+                    let source_grip = contacts["ground_friction"]
+                        .as_f64()
+                        .context("Source ground grip")?;
+                    let expected = source_grip * mass / maximum_mass;
+                    ensure!(
+                        (coefficient - expected).abs() <= 1e-5 * expected.abs().max(1.),
+                        "Normal lateral traction does not retain the source grip target"
+                    );
+                }
                 lateral.push(json!({"ratio_field":ratio,"ratio":actual,"coefficient":coefficient}));
             }
             wheels.push(json!({"owner":format!("{tag:08X}"),"wheel":wheel,

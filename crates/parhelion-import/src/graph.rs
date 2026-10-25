@@ -8,11 +8,14 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+mod opened;
+mod presentation;
+pub use opened::forget_opened;
 
 /// The importer revision a new import records in its graph. Raise it with any change to what
-/// conversion writes. Raise [`MINIMUM_CONVERTER_REVISION`] to it as well when imports made before
+/// conversion writes. Raise `MINIMUM_CONVERTER_REVISION` to it as well when imports made before
 /// the change are unsafe or wrong to install, so Parhelion asks for those to be imported again.
-pub const CONVERTER_REVISION: u32 = 80;
+pub const CONVERTER_REVISION: u32 = 214;
 /// Imports from an earlier revision need importing again. Imports made before revisions were
 /// recorded count as revision 0.
 pub const MINIMUM_CONVERTER_REVISION: u32 = 0;
@@ -29,6 +32,9 @@ pub struct GraphReference {
     /// pinned. 0 for imports made before revisions were recorded.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub converter_revision: u32,
+    /// Authored values applied to private material copies without changing the source pin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub material_inputs: Option<crate::marathon::MaterialInputs>,
 }
 
 fn is_zero(value: &u32) -> bool {
@@ -77,6 +83,7 @@ pub fn manifest_converter_revision(directory: &Path) -> u32 {
 pub fn record_converter_revision(directory: &Path) -> Result<()> {
     let path = directory.join("asset-graph.json");
     let mut graph: Value = serde_json::from_slice(&fs::read(&path)?)?;
+    include_animation_payloads(&mut graph)?;
     graph["converter_revision"] = CONVERTER_REVISION.into();
     crate::io::write_json(&path, &graph)
 }
@@ -103,6 +110,7 @@ impl GraphReference {
         ensure!(!output.exists(), "Model output already exists");
         let mut graph: Value =
             serde_json::from_slice(&fs::read(self.directory.join("asset-graph.json"))?)?;
+        include_animation_payloads(&mut graph)?;
         ensure!(
             !matches!(
                 graph["kind"].as_str(),
@@ -114,70 +122,11 @@ impl GraphReference {
             graph.get("ornament").is_none(),
             "Choose a weapon model rather than an ornament attachment"
         );
+        let plan = copy_plan(&graph, &self.directory, &output)?;
         fs::create_dir_all(&output)?;
-        for node in graph["nodes"].as_array().context("Missing asset nodes")? {
-            let file = node["file"]
-                .as_str()
-                .context("Missing asset payload path")?;
-            let destination = output.join(file);
+        for (source, destination) in plan {
             fs::create_dir_all(destination.parent().context("Model file parent")?)?;
-            fs::copy(self.directory.join(file), destination)?;
-        }
-        if let Some(file) = graph["source_icon_png"].as_str() {
-            let destination = output.join(file);
-            fs::create_dir_all(destination.parent().context("Icon file parent")?)?;
-            fs::copy(self.directory.join(file), destination)?;
-        }
-        for first_person in graph["animation"]["first_person"]
-            .as_object()
-            .into_iter()
-            .chain(graph["animation"]["character"].as_object())
-        {
-            let files = first_person["files"]
-                .as_object()
-                .context("animation files")?;
-            let clips = first_person["clips"]
-                .as_array()
-                .context("animation clips")?;
-            for value in files.values().chain(clips.iter().map(|clip| &clip["file"])) {
-                let file = value.as_str().context("animation file")?;
-                let destination = output.join(file);
-                fs::create_dir_all(destination.parent().context("animation file parent")?)?;
-                fs::copy(self.directory.join(file), destination)?;
-            }
-        }
-        for media in graph["audio"]["transcoded_media"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .chain(
-                graph["audio"]["converted_banks"]
-                    .as_array()
-                    .into_iter()
-                    .flatten(),
-            )
-            .chain(graph["particles"]["nodes"].as_array().into_iter().flatten())
-            .chain(
-                graph["audio_assets"]["nodes"]
-                    .as_array()
-                    .into_iter()
-                    .flatten(),
-            )
-            .chain(
-                graph["projectile"]["nodes"]
-                    .as_array()
-                    .into_iter()
-                    .flatten(),
-            )
-        {
-            let file = media["file"].as_str().context("audio or particle file")?;
-            let destination = output.join(file);
-            fs::create_dir_all(
-                destination
-                    .parent()
-                    .context("audio or particle file parent")?,
-            )?;
-            fs::copy(self.directory.join(file), destination)?;
+            fs::copy(source, destination)?;
         }
         let key = |role: &str| {
             let mut hash = format!("parhelion/imported-model/{target_item:08X}/{role}")
@@ -209,7 +158,9 @@ impl GraphReference {
         }
         crate::io::write_json(&output.join("asset-graph.json"), &graph)?;
         self.validate(source_item)?;
-        Self::new(&output, target_item)
+        let mut copied = Self::new(&output, target_item)?;
+        copied.material_inputs = self.material_inputs.clone();
+        Ok(copied)
     }
 
     pub fn new(directory: &Path, item: u32) -> Result<Self> {
@@ -218,15 +169,23 @@ impl GraphReference {
             .context("Open imported asset folder")?;
         let sha256 = fingerprint(&directory, Some(item))?;
         let converter_revision = manifest_converter_revision(&directory);
+        let graph: Value = serde_json::from_slice(&fs::read(directory.join("asset-graph.json"))?)?;
+        let material_inputs = graph
+            .get("material_inputs")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?;
         Ok(Self {
             directory,
             sha256,
             attachments: Vec::new(),
             converter_revision,
+            material_inputs,
         })
     }
 
     pub fn validate(&self, item: u32) -> Result<()> {
+        self.validate_material_inputs()?;
         ensure!(
             self.directory.is_absolute(),
             "Imported asset folder must be absolute"
@@ -268,6 +227,7 @@ impl GraphReference {
     /// Model gear and shaders allocate private registrations for each authored recipe.
     /// Their immutable source graph can therefore survive a rename or a duplicate.
     pub fn validate_reusable(&self, kind: &str) -> Result<()> {
+        self.validate_material_inputs()?;
         ensure!(
             matches!(
                 kind,
@@ -316,10 +276,106 @@ impl GraphReference {
         }
         Ok(())
     }
+
+    fn validate_material_inputs(&self) -> Result<()> {
+        if let Some(inputs) = &self.material_inputs {
+            inputs.validate()?;
+            let graph: Value =
+                serde_json::from_slice(&fs::read(self.directory.join("asset-graph.json"))?)?;
+            ensure!(
+                graph["source"] == "marathon" && graph.get("material_inputs").is_some(),
+                "Imported graph has no editable material inputs. Reimport it"
+            );
+        }
+        Ok(())
+    }
 }
 
-fn hash_animation(graph: &Value, root: &Path, digest: &mut Sha256) -> Result<()> {
-    for first_person in graph["animation"]["first_person"]
+// New manifests name every animation payload in the established files map. This keeps
+// existing saved fingerprints valid while copies and newly prepared graphs pin private
+// rigs and supplemental clips as well as their state and clip banks.
+fn include_animation_payloads(graph: &mut Value) -> Result<()> {
+    for section in [
+        "/animation/first_person",
+        "/animation/character",
+        "/equipment_animation",
+    ] {
+        let Some(animation) = graph.pointer_mut(section) else {
+            continue;
+        };
+        if !animation.is_object() {
+            continue;
+        }
+        let mut additions = Vec::new();
+        for field in ["rigs", "extra_clips"] {
+            for (index, row) in animation[field]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                let file = row["file"].as_str().context("animation payload file")?;
+                additions.push((format!("{field}_{index}"), Value::from(file)));
+                for template in ["template_file", "original_file"] {
+                    if let Some(file) = row.get(template) {
+                        ensure!(file.is_string(), "Animation template file must be a path");
+                        additions.push((format!("{field}_{index}_{template}"), file.clone()));
+                    }
+                }
+            }
+        }
+        if let Some(layers) = animation.get("pose_layers").filter(|v| !v.is_null()) {
+            for field in ["file", "template_file"] {
+                let file = layers[field]
+                    .as_str()
+                    .context("animation pose layer file")?;
+                additions.push((format!("pose_layers_{field}"), Value::from(file)));
+            }
+        }
+        if additions.is_empty() {
+            continue;
+        }
+        let files = animation["files"]
+            .as_object_mut()
+            .context("animation files")?;
+        for (key, file) in additions {
+            if let Some(existing) = files.get(&key) {
+                ensure!(existing == &file, "Conflicting animation payload {key}");
+            } else {
+                if !files.values().any(|existing| existing == &file) {
+                    files.insert(key, file);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A payload must have a normal relative name and resolve inside the canonical graph root.
+fn checked_payload(root: &Path, name: &str, role: &str) -> Result<PathBuf> {
+    let path = Path::new(name);
+    ensure!(
+        !path.as_os_str().is_empty()
+            && path
+                .components()
+                .all(|part| matches!(part, Component::Normal(_))),
+        "{role} payload path must stay inside its graph folder"
+    );
+    let resolved = root
+        .join(path)
+        .canonicalize()
+        .with_context(|| format!("Locate {role} payload {}", root.join(path).display()))?;
+    ensure!(
+        resolved.starts_with(root),
+        "{role} payload escapes its graph folder"
+    );
+    ensure!(resolved.is_file(), "{role} payload is not a file");
+    Ok(resolved)
+}
+
+fn animation_files(graph: &Value) -> Result<Vec<&str>> {
+    let mut files = Vec::new();
+    for animation in graph["animation"]["first_person"]
         .as_object()
         .into_iter()
         .chain(graph["animation"]["character"].as_object())
@@ -330,37 +386,69 @@ fn hash_animation(graph: &Value, root: &Path, digest: &mut Sha256) -> Result<()>
                 .and_then(Value::as_object),
         )
     {
-        let mut files = Vec::new();
-        for (_, file) in first_person["files"]
+        for file in animation["files"]
             .as_object()
             .context("animation files")?
+            .values()
         {
             files.push(file.as_str().context("animation file")?);
         }
-        for clip in first_person["clips"]
-            .as_array()
-            .context("animation clips")?
-        {
+        for clip in animation["clips"].as_array().context("animation clips")? {
             files.push(clip["file"].as_str().context("animation clip file")?);
         }
-        for name in files {
-            let path = Path::new(name);
-            ensure!(
-                !path.as_os_str().is_empty()
-                    && path
-                        .components()
-                        .all(|part| matches!(part, Component::Normal(_))),
-                "Animation payload path must stay inside its graph folder"
-            );
-            let resolved = root.join(path).canonicalize()?;
-            ensure!(
-                resolved.starts_with(root),
-                "Animation payload escapes its graph folder"
-            );
-            let payload = fs::read(resolved)?;
-            digest.update((payload.len() as u64).to_le_bytes());
-            digest.update(payload);
+    }
+    Ok(files)
+}
+
+/// Resolve the complete augmented graph before creating any destination directory.
+fn copy_plan(graph: &Value, root: &Path, output: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
+    let mut files = BTreeSet::new();
+    for node in graph["nodes"].as_array().context("Missing asset nodes")? {
+        files.insert(
+            node["file"]
+                .as_str()
+                .context("Missing asset payload path")?,
+        );
+    }
+    if let Some(file) = graph["source_icon_png"].as_str() {
+        files.insert(file);
+    }
+    files.extend(animation_files(graph)?);
+    for pointer in [
+        "/audio/transcoded_media",
+        "/audio/converted_banks",
+        "/particles/nodes",
+        "/audio_assets/nodes",
+        "/projectile/nodes",
+    ] {
+        for node in graph
+            .pointer(pointer)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            files.insert(node["file"].as_str().context("audio or particle file")?);
         }
+    }
+    files
+        .into_iter()
+        .map(|file| {
+            let source = checked_payload(root, file, "Model")?;
+            let destination = crate::io::resolved(&output.join(file))?;
+            ensure!(
+                destination.starts_with(output),
+                "Model payload escapes its output folder"
+            );
+            Ok((source, destination))
+        })
+        .collect()
+}
+
+fn hash_animation(graph: &Value, root: &Path, digest: &mut Sha256) -> Result<()> {
+    for name in animation_files(graph)? {
+        let payload = fs::read(checked_payload(root, name, "Animation")?)?;
+        digest.update((payload.len() as u64).to_le_bytes());
+        digest.update(payload);
     }
     Ok(())
 }
@@ -411,20 +499,10 @@ fn fingerprint(directory: &Path, item: Option<u32>) -> Result<String> {
         let name = node["file"]
             .as_str()
             .context("Missing asset payload path")?;
-        let path = Path::new(name);
-        ensure!(
-            !path.as_os_str().is_empty()
-                && path
-                    .components()
-                    .all(|part| matches!(part, Component::Normal(_))),
-            "Asset payload path must stay inside its graph folder"
-        );
-        let resolved = root.join(path).canonicalize()?;
-        ensure!(
-            resolved.starts_with(&root),
-            "Asset payload escapes its graph folder"
-        );
-        let payload = fs::read(resolved)?;
+        let payload = fs::read(checked_payload(&root, name, "Asset")?)?;
+        if graph["source"] == "d1_roi" && graph.get("gear_art").is_some() {
+            presentation::validate(&payload).with_context(|| format!("Asset {symbol}"))?;
+        }
         digest.update((payload.len() as u64).to_le_bytes());
         digest.update(payload);
     }
@@ -492,12 +570,18 @@ fn fingerprint(directory: &Path, item: Option<u32>) -> Result<String> {
                     .all(|part| matches!(part, Component::Normal(_))),
             "Audio payload path must stay inside its graph folder"
         );
-        let resolved = root.join(path).canonicalize()?;
+        let resolved = root.join(path).canonicalize().with_context(|| {
+            format!(
+                "Locate prepared audio payload {}",
+                root.join(path).display()
+            )
+        })?;
         ensure!(
             resolved.starts_with(&root),
             "Audio payload escapes its graph folder"
         );
-        let payload = fs::read(resolved)?;
+        let payload = fs::read(&resolved)
+            .with_context(|| format!("Read prepared audio payload {}", resolved.display()))?;
         digest.update((payload.len() as u64).to_le_bytes());
         digest.update(payload);
     }
@@ -680,6 +764,89 @@ fn validate_gear(graph: &Value, symbols: &BTreeSet<&str>) -> Result<()> {
     Ok(())
 }
 
+/// The namespace an import takes, which names its authored identity: the source family, the
+/// source item's name, and its hash, which tells apart items that share a name, such as
+/// `parhelion.d2_mot.zephyr-c223445e`.
+pub(crate) fn import_namespace(family: &str, name: &str, source: u32) -> String {
+    let mut slug = String::new();
+    for c in name.to_lowercase().chars() {
+        if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            slug.push(c);
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_end_matches('-');
+    if slug.is_empty() {
+        format!("parhelion.{family}.{source:08x}")
+    } else {
+        format!("parhelion.{family}.{slug}-{source:08x}")
+    }
+}
+
+/// The authored hashes an import's namespace names: its item, collectible, unlock, pattern and
+/// strings. Each role hashes `parhelion/<namespace>/<role>` with FNV-1, adding a nonce until the
+/// hash is free, and the string roles stay above the reserved stock range.
+pub(crate) fn import_identity(namespace: &str) -> Result<Value> {
+    let mut values = serde_json::Map::new();
+    let mut occupied = BTreeSet::from([0x2DF71B81u32, 0x304D56FE]);
+    for (i, role) in [
+        "item",
+        "collectible",
+        "unlock",
+        "pattern_global",
+        "name",
+        "type",
+        "flavor",
+        "source",
+        "collection_name",
+        "collection_description",
+        "inventory_hint",
+        "collection_requirement",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let mut allocated = None;
+        for nonce in 0..65536 {
+            let key = format!(
+                "parhelion/{namespace}/{role}{}",
+                if nonce == 0 {
+                    String::new()
+                } else {
+                    format!("/{nonce}")
+                }
+            );
+            let hash = key.bytes().fold(0x811C9DC5u32, |h, b| {
+                h.wrapping_mul(16777619) ^ u32::from(b)
+            });
+            if hash == 0
+                || hash == 0x811C9DC5
+                || occupied.contains(&hash)
+                || (i >= 4 && hash <= 0x304D56FE)
+            {
+                continue;
+            }
+            occupied.insert(hash);
+            allocated = Some(hash);
+            break;
+        }
+        let field = if *role == "pattern_global" {
+            "pattern_global_id_hash".to_owned()
+        } else {
+            format!("{role}_hash")
+        };
+        values.insert(
+            field,
+            json!(format!(
+                "0x{:08X}",
+                allocated.context("private identity exhausted")?
+            )),
+        );
+    }
+    Ok(Value::Object(values))
+}
+
 pub fn hash(p: &Value, key: &str) -> Result<u32> {
     let v = &p[key];
     let n = if let Some(s) = v.as_str() {
@@ -708,6 +875,13 @@ pub(crate) fn add(
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod copy;
+
+    #[test]
+    fn identity_matches_existing_imported_chroma_recipe() {
+        let id = import_identity("parhelion.bulk.42bdcc00").unwrap();
+        assert_eq!(id["item_hash"], "0x39A0CE76");
+    }
 
     #[test]
     fn copying_a_model_preserves_payloads_and_allocates_independent_identity_keys() {

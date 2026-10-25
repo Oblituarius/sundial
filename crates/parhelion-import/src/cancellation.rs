@@ -85,6 +85,90 @@ pub(crate) fn mutex<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>> {
     }
 }
 
+/// Pure conversion batches leave capacity for the UI and game. The override also permits
+/// end-to-end qualification of serial and parallel output using the same source inputs.
+pub(crate) fn workers() -> Result<usize> {
+    if let Some(value) = std::env::var_os("PARHELION_BUILD_WORKERS") {
+        let count = value
+            .to_str()
+            .context("Build worker count is not UTF-8")?
+            .parse::<usize>()?;
+        anyhow::ensure!(
+            (1..=16).contains(&count),
+            "Build worker count must be between 1 and 16"
+        );
+        return Ok(count);
+    }
+    Ok((std::thread::available_parallelism().map_or(1, usize::from) / 2).clamp(1, 8))
+}
+
+/// Evaluate pure `work` over any number of `items` on [`workers`] threads and retain input order.
+/// Each worker takes the next item no worker has taken, so items of uneven cost balance.
+pub(crate) fn parallel_map<T: Sync, R: Send>(
+    items: &[T],
+    work: impl Fn(&T) -> R + Sync,
+) -> Result<Vec<R>> {
+    let workers = workers()?.min(items.len()).max(1);
+    let lanes = (0..workers).collect::<Vec<_>>();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut done = parallel(&lanes, |_| {
+        let mut done = Vec::new();
+        loop {
+            check()?;
+            let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let Some(item) = items.get(index) else {
+                return Ok(done);
+            };
+            done.push((index, work(item)));
+        }
+    })?
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    done.sort_by_key(|(index, _)| *index);
+    Ok(done.into_iter().map(|(_, result)| result).collect())
+}
+
+/// Evaluate a bounded pure batch with the caller's cancellation scope and retain input order.
+/// Callers commit graph mutations only after all workers have joined successfully.
+pub(crate) fn parallel<T: Sync, R: Send>(
+    inputs: &[T],
+    work: impl Fn(&T) -> Result<R> + Sync,
+) -> Result<Vec<R>> {
+    check()?;
+    anyhow::ensure!(
+        inputs.len() <= 16,
+        "Conversion batch exceeds its worker bound"
+    );
+    if inputs.len() <= 1 {
+        return inputs.iter().map(work).collect();
+    }
+    let token = ACTIVE.with(|active| active.borrow().clone());
+    let result = std::thread::scope(|scope| {
+        let handles = inputs
+            .iter()
+            .map(|input| {
+                let token = token.clone();
+                let work = &work;
+                scope.spawn(move || match token {
+                    Some(token) => run(token, || work(input)),
+                    None => work(input),
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("Conversion worker stopped"))?
+            })
+            .collect::<Result<Vec<_>>>()
+    });
+    check()?;
+    result
+}
+
 fn wait(child: &mut Child) -> Result<ExitStatus> {
     loop {
         if let Err(error) = check() {

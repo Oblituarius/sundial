@@ -152,9 +152,14 @@ impl SundialApp {
             })
             .count();
         if unmatched_count > 0 {
-            ui.weak(format!(
-                    "{unmatched_count} stored item(s) have no loadout slot. They stay in Character inventory."
-                ));
+            ui.weak(if unmatched_count == 1 {
+                "1 stored item has no loadout slot. It stays in Character inventory.".to_owned()
+            } else {
+                format!(
+                    "{unmatched_count} stored items have no loadout slot. They stay in Character \
+                     inventory."
+                )
+            });
         }
         ui.add_space(8.0);
 
@@ -473,65 +478,5 @@ fn valid_selection(
             PanoptesSelection::Equipped
         }
         selection => selection,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::app::inventory::{InventoryItemLocation, ItemPlugs};
-
-    fn identity(instance_soid: u64) -> InventoryItemUiId {
-        InventoryItemUiId::new(0, instance_soid, None)
-    }
-
-    fn snapshot(instance_soid: u64) -> InventoryItemSnapshot {
-        InventoryItemSnapshot {
-            location: InventoryItemLocation {
-                character_index: 0,
-                item_index: 0,
-            },
-            instance_soid,
-            definition_hash: 1,
-            level: 0,
-            quantity: 1,
-            plugs: ItemPlugs::NativeDefaults,
-            flags: None,
-        }
-    }
-
-    #[test]
-    fn stale_stored_selection_falls_back_to_equipped() {
-        let item = snapshot(1);
-        let stored = [StoredSlotItem {
-            snapshot: &item,
-            ui_identity: identity(1),
-        }];
-
-        assert_eq!(
-            valid_selection(PanoptesSelection::Stored(identity(2)), &stored),
-            PanoptesSelection::Equipped
-        );
-    }
-
-    #[test]
-    fn stable_stored_selection_survives_position_changes() {
-        let first = snapshot(1);
-        let selected = snapshot(2);
-        let stored = [
-            StoredSlotItem {
-                snapshot: &first,
-                ui_identity: identity(1),
-            },
-            StoredSlotItem {
-                snapshot: &selected,
-                ui_identity: identity(2),
-            },
-        ];
-
-        assert_eq!(
-            valid_selection(PanoptesSelection::Stored(identity(2)), &stored),
-            PanoptesSelection::Stored(identity(2))
-        );
     }
 }

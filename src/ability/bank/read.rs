@@ -209,6 +209,26 @@ pub fn validate(payload: &[u8]) -> Result<(), String> {
     layout(payload).map(|_| ())
 }
 
+/// Prepared owners must carry a registered native bank class pair as well as valid rows.
+/// A package storage template alone does not establish the behavior of replacement bytes.
+pub fn validate_native_owner(payload: &[u8]) -> Result<(), String> {
+    let layout = layout(payload)?;
+    let (runtime, definition) = (layout.definition, layout.instance);
+    if runtime < 4 || runtime >= definition {
+        return Err("Native bank roots have incompatible boundaries".into());
+    }
+    let runtime_class = u32_at(payload, runtime - 4)?;
+    let definition_class = u32_at(payload, definition - 4)?;
+    if u32_at(payload, runtime + BLOCK_CLASS)? != definition_class
+        || u32_at(payload, definition + BLOCK_CLASS)? != runtime_class
+        || !crate::runtime::native_type_inherits(runtime_class, 0x8080_44FC)
+        || !crate::runtime::native_type_inherits(definition_class, 0x8080_44FD)
+    {
+        return Err("Prepared ability has no registered native bank class pair".into());
+    }
+    Ok(())
+}
+
 fn parameter_at(payload: &[u8], row: usize) -> Result<Parameter, String> {
     Ok(Parameter {
         name: u32_at(payload, row)?,
@@ -296,6 +316,9 @@ pub(super) fn handler_slot_in(
         return Ok(Some(HandlerIndex::new(next)));
     }
     let (class, kind) = match modifier {
+        Modifier::Attack(_) => (attack::CLASS, "movement attack"),
+        Modifier::Group(_) => (group::CLASS, "grouped ability property"),
+        Modifier::Fixed(body) => (body.class, "fixed ability property"),
         Modifier::Charges(_) => (CHARGE_DEFINITION_CLASS, "charge"),
         Modifier::Parameter { .. } => (SCRIPT_DEFINITION_CLASS, "script parameter"),
         Modifier::Melee { .. } => (ATTACK_DEFINITION_CLASS, "melee attack"),
@@ -306,6 +329,42 @@ pub(super) fn handler_slot_in(
         .filter(|row| row.modifier_class == class)
         .collect();
     let reading: BTreeSet<HandlerIndex> = match modifier {
+        Modifier::Attack(body) => {
+            body.validate()?;
+            let witnesses = same_class
+                .iter()
+                .filter(|r| r.key == body.template_key)
+                .collect::<Vec<_>>();
+            if witnesses.len() != 1 {
+                return Err("Movement attack has no unique handler witness".into());
+            }
+            witnesses.iter().map(|r| r.handler).collect()
+        }
+        Modifier::Group(body) => {
+            body.validate()?;
+            let matches = same_class
+                .iter()
+                .filter(|r| r.key == body.template_key)
+                .map(|r| r.handler)
+                .collect::<BTreeSet<_>>();
+            if matches.len() != 1 {
+                return Err("Grouped ability property has no unique handler witness".into());
+            }
+            matches
+        }
+        Modifier::Fixed(body) => {
+            body.validate()?;
+            let matches = same_class
+                .iter()
+                .filter(|r| r.key == body.template_key)
+                .collect::<Vec<_>>();
+            if matches.is_empty() || (body.selection.is_none() && matches.len() != 1) {
+                return Err("Fixed ability property has no unique handler witness".into());
+            }
+            // Conditional alternatives may share a key and class. The checked template
+            // selects one row, and all such alternatives must agree on their local handler.
+            matches.iter().map(|r| r.handler).collect()
+        }
         Modifier::Parameter { name, .. } => same_class
             .iter()
             .filter(|row| {

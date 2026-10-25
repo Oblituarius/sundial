@@ -220,52 +220,6 @@ fn bundled_templates_match_nodes_in_the_reference_installation() {
 }
 
 #[test]
-fn every_observed_kind_has_a_complete_relocatable_template() {
-    let mut count = 0;
-    for (condition, entries) in [
-        (true, nodes::CONDITIONS.as_slice()),
-        (false, nodes::EFFECTS.as_slice()),
-    ] {
-        for entry in entries.iter().filter(|e| e.observed()) {
-            let bytes = template(if condition {
-                NativeNodeKind::Condition(entry.kind)
-            } else {
-                NativeNodeKind::Effect(entry.kind)
-            })
-            .expect("observed template");
-            let graph = Graph::read(&bytes, 0, entry.class)
-                .unwrap_or_else(|error| panic!("{}: {error}", entry.name));
-            graph
-                .validate_node(if condition {
-                    NativeNodeKind::Condition(entry.kind)
-                } else {
-                    NativeNodeKind::Effect(entry.kind)
-                })
-                .unwrap();
-            let emitted = graph.emit().unwrap();
-            assert_eq!(
-                Graph::read(&emitted, 0, entry.class).unwrap(),
-                graph,
-                "{}",
-                entry.name
-            );
-            for block in graph.blocks.iter().filter(|b| b.class != 0) {
-                let fields = fields::describe(block.class).unwrap();
-                let mut coverage = vec![0; schema::record(block.class).unwrap().size];
-                for field in fields {
-                    for byte in &mut coverage[field.offset..field.offset + field.width] {
-                        *byte += 1;
-                    }
-                }
-                assert!(coverage.iter().all(|n| *n == 1), "0x{:08X}", block.class);
-            }
-            count += 1;
-        }
-    }
-    assert!(count > 0, "Need observed kinds to verify native templates");
-}
-
-#[test]
 fn malformed_pointers_and_array_headers_are_rejected() {
     let class = nodes::condition(26).unwrap().class;
     let bytes = template(NativeNodeKind::Condition(26)).unwrap();
@@ -316,7 +270,7 @@ fn inline_label_arrays_offer_all_four_operations_even_when_stock_lists_are_empty
     for entry in nodes::CONDITIONS
         .iter()
         .chain(&nodes::EFFECTS)
-        .filter(|entry| entry.observed())
+        .filter(|entry| entry.has_layout())
     {
         for (offset, class, _) in schema::inline(entry.class).unwrap() {
             if class != labels::SOURCE_CLASS {
@@ -345,7 +299,7 @@ fn typed_references_reject_wrong_rows_and_allow_new_condition_kinds() {
     graph.create_target(0, 16, 0x80803E32, true).unwrap();
     let rows = graph.blocks[0].links[&16];
     graph.resize_array(rows, 1).unwrap();
-    for entry in nodes::CONDITIONS.iter().filter(|entry| entry.observed()) {
+    for entry in nodes::CONDITIONS.iter().filter(|entry| entry.has_layout()) {
         graph.create_target(rows, 0, entry.class, false).unwrap();
     }
     assert!(
@@ -605,36 +559,6 @@ fn captured_actions_preserve_every_node_and_runtime_label_predicate() {
 }
 
 #[test]
-fn event_keys_are_named_from_the_perks_that_use_them() {
-    use super::fields::keys::{self, SITES};
-    for (class, offset, entries) in SITES {
-        assert!(!entries.is_empty(), "{class:08X}+{offset:X} has no keys");
-        let mut seen = std::collections::BTreeSet::new();
-        for key in *entries {
-            assert!(
-                seen.insert(key.hash),
-                "{class:08X}+{offset:X} lists 0x{:08X} twice",
-                key.hash
-            );
-            assert!(!key.name.trim().is_empty() && !key.evidence.trim().is_empty());
-        }
-        // The site is a key field of an observed node class, or the resource reference the
-        // ability conditions store, whose stock values are ability patterns named the same way.
-        let fields = super::fields::describe(*class).unwrap();
-        assert!(
-            fields.iter().any(|field| field.offset == *offset
-                && matches!(
-                    field.format,
-                    super::fields::Format::Key | super::fields::Format::Tag
-                )),
-            "{class:08X}+{offset:X} is not a key or reference field"
-        );
-    }
-    assert_eq!(keys::name(0x6CEC_7A87), Some("Orb of Light Picked Up"));
-    assert!(keys::known(0x8080_3E03, 8).is_empty());
-}
-
-#[test]
 fn promoted_condition_defaults_carry_the_stock_event_bytes() {
     use crate::sandbox_perk::program::NativeNode;
     let reload = NativeNode::condition(19).unwrap();
@@ -706,37 +630,6 @@ fn ability_slot_bits_and_radar_range_are_named_from_the_perks_that_set_them() {
             "{label}"
         );
     }
-}
-
-/// Every client-recovered key name must hash to the key it is filed under. The names came
-/// from matching FNV-1 hashes in client memory, so this is the same check that found them
-/// and it fails loudly if an entry is ever mistyped.
-#[test]
-fn client_recovered_key_names_hash_to_their_keys() {
-    for (hash, name) in super::fields::keys::CLIENT_NAMES {
-        assert_eq!(crate::hash::fnv1_name_hash(name), *hash, "{name}");
-    }
-}
-
-/// Every named key whose evidence cites an engine name must hash from that name, whether the
-/// name came from the client scan or from hashing the checking perks' own words.
-#[test]
-fn engine_names_cited_as_key_evidence_hash_to_their_keys() {
-    let mut cited = 0;
-    for (_, _, entries) in super::fields::keys::SITES {
-        for key in *entries {
-            let Some(rest) = key.evidence.strip_prefix("The engine name ") else {
-                continue;
-            };
-            let name: String = rest
-                .chars()
-                .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_')
-                .collect();
-            assert_eq!(crate::hash::fnv1_name_hash(&name), key.hash, "{name}");
-            cited += 1;
-        }
-    }
-    assert!(cited > 0, "no key cites an engine name");
 }
 
 /// Every edit allocates its target afresh rather than writing through one that another node

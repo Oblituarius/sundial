@@ -1,9 +1,11 @@
 use super::*;
-use parhelion_import::d2_mot::{icon, reader::Reader};
+use parhelion_import::d2_mot::icon;
+mod reader;
+use reader::Reader;
 
 // Older thumbnails contain only the primary artwork. The package stamp cannot
 // invalidate those when our layer composition changes.
-const CACHE_VERSION: &str = "v2";
+const CACHE_VERSION: &str = "v3";
 
 #[cfg(test)]
 mod tests;
@@ -73,7 +75,19 @@ impl Icons {
         }
     }
 
-    pub fn request(&mut self, ctx: &egui::Context, modern: &Path, visible: &[usize]) {
+    pub fn request(
+        &mut self,
+        ctx: &egui::Context,
+        source: Source,
+        settings: &Settings,
+        visible: &[usize],
+    ) {
+        let folder = match source {
+            Source::Modern => settings.modern_packages.as_deref(),
+            Source::Roi => settings.d1_roi.as_deref(),
+            _ => None,
+        };
+        let Some(folder) = folder else { return };
         let missing: Vec<_> = visible
             .iter()
             .copied()
@@ -88,16 +102,23 @@ impl Icons {
         }
         if self.requests.is_none() {
             let Ok(root) = data_root() else { return };
-            let modern = modern.to_owned();
+            let folder = folder.to_owned();
+            let xg = settings.d1_xg_library.clone();
             let ctx = ctx.clone();
             let (requests, incoming) = mpsc::sync_channel::<Vec<usize>>(1);
             let (sender, results) = mpsc::channel();
             self.requests = Some(requests);
             self.results = Some(results);
             thread::spawn(move || {
-                let generation = service::package_stamp(&modern).ok().and_then(|stamp| {
+                let generation = service::package_stamp(&folder).ok().and_then(|stamp| {
                     parhelion_import::cache::Generation::directory(
-                        &root.join("importer/icons").join(CACHE_VERSION),
+                        &root.join("importer/icons").join(CACHE_VERSION).join(
+                            if source == Source::Roi {
+                                "d1-roi"
+                            } else {
+                                "d2-mot"
+                            },
+                        ),
                         &stamp,
                     )
                 });
@@ -139,21 +160,12 @@ impl Icons {
                             continue;
                         }
                         let reader = reader.get_or_insert_with(|| {
-                            Reader::discovery(&modern, &root.join("importer/icons"), true)
-                                .map_err(|error| format!("{error:#}"))
+                            Reader::open(source, &folder, &root.join("importer/icons"), xg.clone())
                         });
                         let result = reader
                             .as_mut()
                             .map_err(|error| error.clone())
-                            .and_then(|reader| {
-                                icon::read_layers(reader, index)
-                                    .map_err(|error| format!("{error:#}"))
-                            })
-                            .and_then(|layers| composite(&layers))
-                            .and_then(|(size, rgba)| {
-                                image::RgbaImage::from_raw(size[0] as u32, size[1] as u32, rgba)
-                                    .ok_or_else(|| "Invalid icon pixel buffer".to_owned())
-                            })
+                            .and_then(|reader| reader.read(index))
                             .map(|image| {
                                 let image = thumbnail(&image);
                                 if let Some(path) = &path
@@ -222,62 +234,11 @@ fn thumbnail(image: &image::RgbaImage) -> image::RgbaImage {
     crate::image_import::resize(image, width, height)
 }
 
-/// Blends the layers bottom-up at their native size, anchored top-left, on a canvas as large
-/// as the largest layer.
+/// Use the source-independent browser composition, while native exports remain primary-only.
 pub(super) fn composite(layers: &[icon::Layer]) -> Result<([usize; 2], Vec<u8>), String> {
-    let size = [
-        layers
-            .iter()
-            .map(|layer| usize::from(layer.width))
-            .max()
-            .unwrap_or(0),
-        layers
-            .iter()
-            .map(|layer| usize::from(layer.height))
-            .max()
-            .unwrap_or(0),
-    ];
-    if size[0] == 0 || size[1] == 0 {
-        return Err("No icon layers".into());
-    }
-    if size
-        .iter()
-        .any(|edge| *edge > crate::image_import::MAX_SOURCE_EDGE as usize)
-    {
-        return Err("Icon dimensions exceed the supported limit".into());
-    }
-    if !layers.iter().any(|layer| layer.slot == 0x14) {
-        return Err("The icon has no primary artwork".into());
-    }
-    let mut rgba = vec![0_u8; size[0] * size[1] * 4];
-    for layer in layers {
-        let (width, height) = (usize::from(layer.width), usize::from(layer.height));
-        let pixels = match decode(layer) {
-            Ok(pixels) => pixels,
-            Err(error) if layer.slot == 0x14 => {
-                return Err(format!("Could not decode primary icon artwork: {error}"));
-            }
-            Err(_) => continue,
-        };
-        for y in 0..height.min(size[1]) {
-            for x in 0..width.min(size[0]) {
-                let from = (y * width + x) * 4;
-                let to = (y * size[0] + x) * 4;
-                sundial::image_processing::blend_rgba_pixel(
-                    &mut rgba[to..to + 4],
-                    [
-                        pixels[from],
-                        pixels[from + 1],
-                        pixels[from + 2],
-                        pixels[from + 3],
-                    ],
-                );
-            }
-        }
-    }
-    Ok((size, rgba))
-}
-
-pub(super) fn decode(layer: &icon::Layer) -> Result<Vec<u8>, String> {
-    icon::decode(layer).map_err(|error| error.to_string())
+    let image = icon::composite(layers).map_err(|error| format!("{error:#}"))?;
+    Ok((
+        [usize::from(image.width), usize::from(image.height)],
+        image.rgba,
+    ))
 }

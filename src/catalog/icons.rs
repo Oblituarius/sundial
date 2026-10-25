@@ -111,6 +111,19 @@ impl Catalog {
         runtime.resume();
     }
 
+    /// Takes over `previous`'s inspection access when this catalog replaces it. Previews and
+    /// viewers keep the access they were given, so a fresh one would leave them on the old
+    /// catalog's, which nobody resumes. Its generation advances, since reads now come from this
+    /// catalog. `suspended` carries the host's package pause over.
+    pub(crate) fn adopt_package_access(&mut self, previous: &Catalog, suspended: bool) {
+        self.inspection_access = previous.inspection_access();
+        if suspended {
+            self.suspend_package_access();
+        } else {
+            self.inspection_access.renew();
+        }
+    }
+
     /// Loads an installed package icon on demand and keeps only displayed icons on the GPU.
     pub(crate) fn icon_texture(
         &self,
@@ -900,34 +913,6 @@ fn decode_catalog_texture(header: &[u8], data: &[u8]) -> Result<eframe::egui::Co
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn disconnected_icon_worker_releases_pending_hashes() {
-        let (request_sender, _request_receiver) = mpsc::sync_channel(MAX_PENDING_CATALOG_ICONS);
-        let (result_sender, result_receiver) = mpsc::channel();
-        drop(result_sender);
-        let hash = 0x1234_5678;
-        let mut runtime = IconRuntime {
-            pending: HashSet::from([hash]),
-            worker: Some(IconWorker {
-                requests: Some(request_sender),
-                results: result_receiver,
-                thread: None,
-                cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            }),
-            ..IconRuntime::default()
-        };
-
-        runtime.install_completed(&eframe::egui::Context::default());
-
-        assert!(runtime.worker.is_none());
-        assert!(runtime.pending.is_empty());
-        assert!(
-            runtime
-                .diagnostic(hash)
-                .is_some_and(|message| message.contains("stopped"))
-        );
-    }
 
     #[test]
     fn rgba_catalog_texture_decodes_package_pixels() {

@@ -292,6 +292,23 @@ pub(super) fn decode(
                 })
                 .collect());
         }
+        84 => {
+            // Inspection bytes use an unsigned normal visualization. Shader sampling
+            // keeps the signed channels in Texture::linear through filtering and upload.
+            let pixels =
+                float::decode(bytes, format, width, height)?.ok_or("Missing signed BC5 pixels")?;
+            return Ok(pixels
+                .iter()
+                .flat_map(|p| {
+                    [
+                        ((p[0] * 0.5 + 0.5) * 255.0).round() as u8,
+                        ((p[1] * 0.5 + 0.5) * 255.0).round() as u8,
+                        255,
+                        255,
+                    ]
+                })
+                .collect());
+        }
         71 | 72 => return crate::image_processing::decode_bc1(bytes, width, height),
         74 | 75 | 77 | 78 | 80 | 83 | 98 | 99 => {}
         _ => return Err(format!("Unsupported base-color texture format {format}")),
@@ -514,7 +531,7 @@ pub(in crate::model_preview) fn stage_samplers(
         .collect()
 }
 
-fn sampler(manager: &PackageManager, tag: u32) -> Option<Sampler> {
+pub(in crate::model_preview) fn sampler(manager: &PackageManager, tag: u32) -> Option<Sampler> {
     let entry = manager.get_entry(tag)?;
     if entry.file_type != 34 || entry.file_subtype != 1 {
         return None;
@@ -607,12 +624,6 @@ impl Texture {
                 .as_ref()
                 .map_or(0, |levels| levels.iter().map(Self::memory).sum())
     }
-    #[cfg(test)]
-    pub(super) fn sample(&self, uv: [f32; 2]) -> [f32; 3] {
-        let rgba = self.sample_rgba(uv);
-        [rgba[0], rgba[1], rgba[2]]
-    }
-
     pub(super) fn sample_rgba(&self, uv: [f32; 2]) -> [f32; 4] {
         self.sample_with_sampler(
             uv,

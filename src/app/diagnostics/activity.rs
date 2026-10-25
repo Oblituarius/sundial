@@ -8,7 +8,12 @@ const MAX_ACTIVITY_BYTES: u64 = 256 * 1024;
 
 pub(super) fn append_parhelion_log(report: &mut String) {
     if let Some(path) = crate::activity_log::Product::Parhelion.log_path() {
-        append_log(report, &path, "Parhelion Activity", "Parhelion Activity Unavailable");
+        append_log(
+            report,
+            &path,
+            "Parhelion Activity",
+            "Parhelion Activity Unavailable",
+        );
     }
 }
 
@@ -27,9 +32,7 @@ fn append_log(report: &mut String, path: &Path, section: &str, unavailable: &str
     let separator = "-".repeat(section.len());
     match read_tail(path) {
         Ok((text, truncated)) if !text.trim().is_empty() => {
-            report.push_str(&format!(
-                "Recent {section} (Oldest First)\n{separator}\n"
-            ));
+            report.push_str(&format!("Recent {section} (Oldest First)\n{separator}\n"));
             report.push_str(&format!("source = {}\n", path.display()));
             if truncated {
                 report.push_str("Earlier entries omitted. Showing the latest 256 KiB.\n");

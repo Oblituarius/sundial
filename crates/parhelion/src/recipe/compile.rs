@@ -257,6 +257,7 @@ impl WeaponRecipeOverrides {
                                     operand: instruction.operand,
                                 })
                                 .collect(),
+                            reusable_choices: column.reusable_choices,
                         })
                     })
                     .transpose()
@@ -334,6 +335,7 @@ impl WeaponRecipeOverrides {
             badge: self.badge.clone(),
             exclude_from_sunrise_badge: self.exclude_from_sunrise_badge,
             collection_destination: self.collection_destination,
+            collection_position: self.collection_position,
             corner_icon: self.corner_icon.clone(),
             lore: self.lore.clone(),
             investment_stats,

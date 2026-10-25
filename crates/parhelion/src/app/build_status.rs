@@ -13,6 +13,33 @@ struct BuildBlocker {
     open: bool,
 }
 
+fn draw_mods(ui: &mut egui::Ui, mods: &[crate::ModReport]) {
+    if mods.is_empty() {
+        return;
+    }
+    ui.strong("Managed Mods");
+    ui.label("Imported resources belong to their importer mods. Parhelion holds the records, native assets and stock patches. Changed folders are backed up together.");
+    if mods.iter().any(|member| {
+        member.id == sundial::package_authoring::mod_content::ID
+            && member.status == crate::ModStatus::Updated
+    }) && mods.iter().any(|member| {
+        member.id != sundial::package_authoring::mod_content::ID
+            && member.status == crate::ModStatus::Installed
+    }) {
+        ui.label("Imported resources move into the new importer mods listed below. Parhelion and the importer mods change in one transaction.");
+    }
+    for member in mods {
+        ui.collapsing(
+            format!("{}: {}", member.name, member.status.label()),
+            |ui| {
+                for package in &member.packages {
+                    ui.monospace(package);
+                }
+            },
+        );
+    }
+}
+
 impl PackageAuthoringApp {
     pub(super) fn draw_build_status_window(&mut self, ctx: &egui::Context) {
         if !self.build_status_open {
@@ -212,7 +239,7 @@ impl PackageAuthoringApp {
 
     pub(super) fn draw_install_confirmation(&mut self, ui: &mut egui::Ui) {
         self.poll_replacement_review();
-        if !matches!(self.latest_build, Some(Ok(_))) {
+        if self.install_candidate().is_none() {
             self.build_dialog_step = BuildDialogStep::Build;
             return;
         }
@@ -256,14 +283,25 @@ impl PackageAuthoringApp {
                         )
                         .clicked();
                     if ui.button("Back to Build").clicked() {
+                        self.restore = None;
                         self.build_dialog_step = BuildDialogStep::Build;
                     }
                 });
             });
-        let Some(Ok(build)) = self.latest_build.as_ref() else {
+        let restoring = self.restore.is_some();
+        let Some(build) = self.install_candidate() else {
             return;
         };
-        ui.heading("Review Installation");
+        ui.heading(if restoring {
+            "Review Restore"
+        } else {
+            "Review Installation"
+        });
+        if restoring {
+            ui.label(
+                "Installs the build you last installed for this runtime again, without a rebuild.",
+            );
+        }
         egui::ScrollArea::vertical()
             .id_salt("install-review-contents")
             .max_height(ui.available_height().max(0.0))
@@ -301,7 +339,15 @@ impl PackageAuthoringApp {
                 }
                 ui.add_space(8.0);
                 egui::CollapsingHeader::new("Installation Details").show(ui, |ui| {
-                    reports::path_row(ui, "Staged Run", &build.run_directory);
+                    reports::path_row(
+                        ui,
+                        if restoring {
+                            "Kept Build"
+                        } else {
+                            "Staged Run"
+                        },
+                        &build.run_directory,
+                    );
                     reports::path_row(ui, "Target Packages", &self.packages);
                     reports::path_row(ui, "Backup Folder", Path::new(self.backup_root.trim()));
                     ui.add_space(5.0);
@@ -351,6 +397,7 @@ impl PackageAuthoringApp {
             }
             None => return,
         };
+        draw_mods(ui, review.mods());
         if !review.changes_account() {
             ui.label("No account changes needed.");
             return;

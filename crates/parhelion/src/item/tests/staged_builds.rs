@@ -14,6 +14,8 @@ mod collection_conditions;
 mod companions;
 mod component_rewire;
 mod component_shapes;
+#[cfg(feature = "d2-model-importer")]
+mod d1_ability;
 mod donors;
 #[cfg(feature = "d2-model-importer")]
 mod eager_private_dependencies;
@@ -21,7 +23,13 @@ mod effect_length;
 mod glow;
 mod hud;
 #[cfg(feature = "d2-model-importer")]
+mod imported_ability;
+#[cfg(feature = "d2-model-importer")]
 mod imported_attachments;
+#[cfg(feature = "d2-model-importer")]
+mod imported_subclass;
+#[cfg(feature = "d2-model-importer")]
+mod importer_mods;
 #[cfg(feature = "d2-model-importer")]
 mod kinetic_import;
 mod mod_loader_layout;
@@ -36,9 +44,11 @@ mod programs;
 mod projectiles;
 mod projects;
 mod rebuild;
+mod rolled_columns;
 mod socket_expansion;
 mod stock;
 mod subclass_hud;
+mod tooltip;
 mod weapon_properties;
 
 /// Whether a stock view must carry the Oodle runtime, or links it only when the install has one.

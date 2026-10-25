@@ -140,4 +140,21 @@ impl Layouts {
             .map(|(index, _)| *index)
             .context("Source stream declaration has no byte-compatible native layout")
     }
+
+    /// Whether two native layouts declare the same elements, whatever their stream split.
+    /// A vertex program binds its inputs by semantic, so either layout feeds it.
+    pub fn same_elements(&self, a: u16, b: u16) -> bool {
+        let elements = |layout| {
+            self.native.get(&layout).map(|streams: &Streams| {
+                let mut all = streams
+                    .iter()
+                    .flatten()
+                    .map(|e| (e.semantic, e.index, e.format))
+                    .collect::<Vec<_>>();
+                all.sort_unstable();
+                all
+            })
+        };
+        elements(a).is_some_and(|a| Some(a) == elements(b))
+    }
 }

@@ -100,6 +100,7 @@ const AREA_FADE: f32 = 6.;
 
 /// The donor's sound point table, whose first row and point the map's points copy, and the
 /// decoder for the level's sounds, which Reach keeps in `fmod/pc/sfx.fsb` beside its maps.
+#[derive(serde::Serialize)]
 pub struct Templates {
     pub points: u32,
     pub decoder: PathBuf,
@@ -226,12 +227,18 @@ fn layers(cache: &Cache, tag: &Tag) -> Result<(Vec<Layer>, Option<u16>)> {
     Ok((layers, limit))
 }
 
-/// The level's sounds and where each plays: area loops at their clusters, and placed loops.
-#[allow(clippy::type_complexity)]
-fn placements(cache: &Cache, offset: [f32; 3]) -> Result<(Vec<Sound>, Vec<(usize, [f32; 3])>)> {
+/// A placed sound: its index in the level's sounds, its position and its structure BSP mask.
+type Emitter = (usize, [f32; 3], u32);
+
+/// The level's sounds and where each plays, with the structure BSPs each place belongs to (zero
+/// for every one): area loops at the clusters of `bsps`, and the loops of the sound scenery
+/// placed in them ([`super::objects::placed_in`]). Winter Contingency's
+/// `zoneset_insert` loads three of its BSPs, and 190 of its looping sound placements, such as the
+/// windmills in its fifth, belong to others.
+fn placements(cache: &Cache, bsps: &[Tag], offset: [f32; 3]) -> Result<(Vec<Sound>, Vec<Emitter>)> {
     let mut sounds = Vec::<Sound>::new();
     let mut emitters = Vec::new();
-    let mut add = |sound: Sound, position: [f32; 3]| {
+    let mut add = |sound: Sound, position: [f32; 3], bsps: u32| {
         let index = match sounds.iter().position(|known| *known == sound) {
             Some(index) => index,
             None => {
@@ -239,10 +246,15 @@ fn placements(cache: &Cache, offset: [f32; 3]) -> Result<(Vec<Sound>, Vec<(usize
                 sounds.len() - 1
             }
         };
-        emitters.push((index, std::array::from_fn(|k| position[k] + offset[k])));
+        emitters.push((
+            index,
+            std::array::from_fn(|k| position[k] + offset[k]),
+            bsps,
+        ));
     };
-    for bsp in super::bsps(cache)? {
-        let at = bsp.tag.address()?;
+    for bsp in bsps {
+        let at = bsp.address()?;
+        let bit = super::bsp_mask(cache, std::slice::from_ref(bsp))?;
         let areas = cache
             .block(at + AREAS.0, AREAS.1)?
             .into_iter()
@@ -308,6 +320,7 @@ fn placements(cache: &Cache, offset: [f32; 3]) -> Result<(Vec<Sound>, Vec<(usize
                             reach: EVERYWHERE,
                         },
                         middle(&inner),
+                        bit,
                     );
                 }
                 continue;
@@ -330,10 +343,12 @@ fn placements(cache: &Cache, offset: [f32; 3]) -> Result<(Vec<Sound>, Vec<(usize
                     reach: radius + AREA_FADE,
                 },
                 center,
+                bit,
             );
         }
     }
     let scenario = cache.only("scnr")?.address()?;
+    let loaded = super::bsp_mask(cache, bsps)?;
     let palette = cache
         .block(scenario + SCENERY_PALETTE.0, SCENERY_PALETTE.1)?
         .into_iter()
@@ -352,6 +367,9 @@ fn placements(cache: &Cache, offset: [f32; 3]) -> Result<(Vec<Sound>, Vec<(usize
         })
         .collect::<Result<Vec<_>>>()?;
     for row in cache.block(scenario + SCENERY.0, SCENERY.1)? {
+        if !super::objects::placed_in(cache, row, loaded)? {
+            continue;
+        }
         let Some(source) = usize::try_from(cache.i16(row)?)
             .ok()
             .and_then(|index| palette.get(index))
@@ -378,6 +396,7 @@ fn placements(cache: &Cache, offset: [f32; 3]) -> Result<(Vec<Sound>, Vec<(usize
             cache
                 .floats::<3>(row + SCENERY_POSITION)?
                 .map(|value| value * METRES_PER_UNIT),
+            super::objects::placement_bsps(cache, row)?,
         );
     }
     Ok((sounds, emitters))
@@ -471,22 +490,31 @@ fn fnv1a64(text: &str) -> u64 {
 }
 
 /// Adds the level's ambience to `graph`: media, banks, attenuations and sound records for its
-/// sounds, and a copy of the donor's sound point table placing them. Returns the table's symbol,
-/// or none when the level places no looping sound, and a report.
+/// sounds, and for each area a copy of the donor's sound point table placing the sounds of its
+/// structure BSPs. Returns each area's table symbol, none for an area that places no looping
+/// sound, and a report. `bsps` are the structure BSPs the level loads, and `areas` each area's
+/// scenario BSP mask. Every sound point is a world object of the area that places it, so an area
+/// places only its own. One table of every area's sounds took 241 of Nightfall's 292 objects.
+#[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
 pub(super) fn add(
     cache: &Cache,
+    pages: &mut crate::halo_reach::resource::Pages,
+    bsps: &[Tag],
     maps: &Path,
     map: &str,
     native: &mut Reader,
     graph: &mut Graph,
     templates: &Templates,
     offset: [f32; 3],
-) -> Result<(Option<String>, Value)> {
-    let (sounds, emitters) = placements(cache, offset)?;
+    areas: &[u32],
+) -> Result<(Vec<Option<String>>, Value)> {
+    let (sounds, emitters) = placements(cache, bsps, offset)?;
     if emitters.is_empty() {
-        return Ok((None, json!({"points": 0})));
+        return Ok((vec![None; areas.len()], json!({"points": 0})));
     }
-    let table = native.tag(templates.points, None)?;
+    let table = native
+        .tag(templates.points, None)
+        .context("Ambience sound point template")?;
     let rows = table.array(0x08, ROW_SIZE, Some(TABLE_ROW_CLASS))?;
     let row = *rows.first().context("Donor sound point table is empty")?;
     let resource = table.pointer(row + ROW_RESOURCE)?;
@@ -497,15 +525,24 @@ pub(super) fn add(
     let row_template = table.0[row..row + ROW_SIZE].to_vec();
     let point_template = table.0[resource..resource + POINT_SIZE].to_vec();
     let record_tag = table.u32(resource + POINT_SOUND)?;
-    let record = native.tag(record_tag, Some(SOUND_CLASS))?;
+    let record = native
+        .tag(record_tag, Some(SOUND_CLASS))
+        .with_context(|| format!("Ambience sound record {record_tag:08X}"))?;
     ensure!(
         record.0.len() >= SOUND_MEDIA && record.pointer(0x20)? == 0x40,
         "Donor sound record envelope differs"
     );
     let attenuation_tag = record.u32(SOUND_ATTENUATION)?;
-    let attenuation = native.tag(attenuation_tag, Some(ATTENUATION_CLASS))?;
+    let attenuation = native
+        .tag(attenuation_tag, Some(ATTENUATION_CLASS))
+        .with_context(|| format!("Ambience attenuation {attenuation_tag:08X}"))?;
     let bank_tag = record.u32(SOUND_BANK)?;
-    let bus = output_bus(&native.tag(bank_tag, None)?.0)?;
+    let bus = output_bus(
+        &native
+            .tag(bank_tag, None)
+            .with_context(|| format!("Ambience bank {bank_tag:08X}"))?
+            .0,
+    )?;
     let media_template = record.u32(SOUND_MEDIA)?;
 
     // Every sample the sounds play, decoded once. A sample the bank lacks leaves its layer, and a
@@ -522,6 +559,8 @@ pub(super) fn add(
         .flat_map(|layer| layer.media.iter().copied())
         .collect::<BTreeSet<_>>();
     let fsb = maps.join("../fmod/pc/sfx.fsb");
+    pages.record(&fsb.canonicalize()?)?;
+    pages.record(&templates.decoder.canonicalize()?)?;
     let (decoded, missing) = audio::decode(
         &fsb,
         &templates.decoder,
@@ -556,7 +595,7 @@ pub(super) fn add(
     }
     let emitters = emitters
         .into_iter()
-        .filter_map(|(sound, position)| index[sound].map(|sound| (sound, position)))
+        .filter_map(|(sound, position, bsps)| index[sound].map(|sound| (sound, position, bsps)))
         .collect::<Vec<_>>();
     let (sounds, sound_layers): (Vec<_>, Vec<_>) = sounds
         .into_iter()
@@ -645,50 +684,72 @@ pub(super) fn add(
         records.push(symbol);
     }
 
-    // The table: its rows, then each row's point behind its class word, 8-aligned.
-    let mut bytes = vec![0u8; 0x30];
-    let count = emitters.len() as u64;
-    put(&mut bytes, 0x08, &count.to_le_bytes())?;
-    put(&mut bytes, 0x10, &0x10u64.to_le_bytes())?;
-    put(&mut bytes, 0x1C, &ARRAY_MARKER.to_le_bytes())?;
-    put(&mut bytes, 0x20, &count.to_le_bytes())?;
-    put(&mut bytes, 0x28, &TABLE_ROW_CLASS.to_le_bytes())?;
-    let first_row = bytes.len();
-    for (index, &(_, position)) in emitters.iter().enumerate() {
-        let mut row = row_template.clone();
-        for (k, value) in [0f32, 0., 0., 1.].into_iter().enumerate() {
-            put(&mut row, ROW_ROTATION + k * 4, &value.to_le_bytes())?;
+    // Each area's table: its rows, then each row's point behind its class word, 8-aligned. A place
+    // keeps its level-wide index in its identity, whichever areas place it.
+    let mut tables = Vec::with_capacity(areas.len());
+    let mut area_points = Vec::with_capacity(areas.len());
+    for (area, &loaded) in areas.iter().enumerate() {
+        let placed = emitters
+            .iter()
+            .enumerate()
+            .filter(|(_, emitter)| emitter.2 == 0 || emitter.2 & loaded != 0)
+            .collect::<Vec<_>>();
+        area_points.push(placed.len());
+        if placed.is_empty() {
+            tables.push(None);
+            continue;
         }
-        for (k, value) in position.into_iter().enumerate() {
-            put(&mut row, ROW_TRANSLATION + k * 4, &value.to_le_bytes())?;
+        let mut bytes = vec![0u8; 0x30];
+        let count = placed.len() as u64;
+        put(&mut bytes, 0x08, &count.to_le_bytes())?;
+        put(&mut bytes, 0x10, &0x10u64.to_le_bytes())?;
+        put(&mut bytes, 0x1C, &ARRAY_MARKER.to_le_bytes())?;
+        put(&mut bytes, 0x20, &count.to_le_bytes())?;
+        put(&mut bytes, 0x28, &TABLE_ROW_CLASS.to_le_bytes())?;
+        let first_row = bytes.len();
+        for &(index, &(_, position, _)) in &placed {
+            let mut row = row_template.clone();
+            for (k, value) in [0f32, 0., 0., 1.].into_iter().enumerate() {
+                put(&mut row, ROW_ROTATION + k * 4, &value.to_le_bytes())?;
+            }
+            for (k, value) in position.into_iter().enumerate() {
+                put(&mut row, ROW_TRANSLATION + k * 4, &value.to_le_bytes())?;
+            }
+            let identity = fnv1a64(&format!("parhelion/map/{map}/ambience/{index}")) | 1;
+            put(&mut row, ROW_IDENTITY, &identity.to_le_bytes())?;
+            bytes.extend_from_slice(&row);
         }
-        let identity = fnv1a64(&format!("parhelion/map/{map}/ambience/{index}")) | 1;
-        put(&mut row, ROW_IDENTITY, &identity.to_le_bytes())?;
-        bytes.extend_from_slice(&row);
+        let mut patches = Vec::with_capacity(placed.len());
+        for (row, &(_, &(sound, _, _))) in placed.iter().enumerate() {
+            bytes.resize(bytes.len() + 4, 0);
+            bytes.extend_from_slice(&POINT_CLASS.to_le_bytes());
+            let body = bytes.len();
+            bytes.extend_from_slice(&point_template);
+            put(&mut bytes, body + POINT_SOUND, &u32::MAX.to_le_bytes())?;
+            patches.push(json!({"offset": body + POINT_SOUND, "symbol": records[sound]}));
+            let field = first_row + row * ROW_SIZE + ROW_RESOURCE;
+            put(&mut bytes, field, &((body - field) as u64).to_le_bytes())?;
+        }
+        let size = bytes.len() as u64;
+        put(&mut bytes, 0, &size.to_le_bytes())?;
+        let symbol = if area == 0 {
+            "ambience-points".to_owned()
+        } else {
+            format!("ambience-points-{area}")
+        };
+        graph.add(&symbol, templates.points, &bytes, None, patches)?;
+        tables.push(Some(symbol));
     }
-    let mut patches = Vec::with_capacity(emitters.len());
-    for (index, &(sound, _)) in emitters.iter().enumerate() {
-        bytes.resize(bytes.len() + 4, 0);
-        bytes.extend_from_slice(&POINT_CLASS.to_le_bytes());
-        let body = bytes.len();
-        bytes.extend_from_slice(&point_template);
-        put(&mut bytes, body + POINT_SOUND, &u32::MAX.to_le_bytes())?;
-        patches.push(json!({"offset": body + POINT_SOUND, "symbol": records[sound]}));
-        let field = first_row + index * ROW_SIZE + ROW_RESOURCE;
-        put(&mut bytes, field, &((body - field) as u64).to_le_bytes())?;
-    }
-    let size = bytes.len() as u64;
-    put(&mut bytes, 0, &size.to_le_bytes())?;
-    graph.add("ambience-points", templates.points, &bytes, None, patches)?;
     Ok((
-        Some("ambience-points".into()),
+        tables,
         json!({
             "points": emitters.len(),
+            "area_points": area_points,
             "sounds": sounds.iter().enumerate().map(|(index, sound)| json!({
                 "loop": sound.source.path,
                 "spatial": sound.curve.is_some(),
                 "reach_m": sound.reach,
-                "points": emitters.iter().filter(|(placed, _)| *placed == index).count(),
+                "points": emitters.iter().filter(|(placed, _, _)| *placed == index).count(),
             })).collect::<Vec<_>>(),
             "samples": decoded.len(),
             "missing_samples": missing.iter().map(|id| format!("{id:08X}")).collect::<Vec<_>>(),

@@ -23,7 +23,7 @@ pub(in crate::item::build) struct Payloads {
     runtime_asset_tags: Vec<TagHash>,
     /// The badge artwork's entries in the primary asset package, which the HUD icons end.
     badge_tag_count: usize,
-    private_perk_allocator: AppendedTagAllocator,
+    pub(in crate::item::build) private_perk_allocator: AppendedTagAllocator,
 }
 
 fn label_dictionaries(
@@ -132,6 +132,17 @@ pub(in crate::item::build) fn author(
         &mut weapon_runtime_new_tags,
         progress,
     )?;
+    #[cfg(feature = "d2-model-importer")]
+    super::attachments::author_subclasses(
+        &sources.manager,
+        resolved,
+        &mut super::RuntimeAssets {
+            packages: &mut asset_packages,
+            placed: &mut runtime_asset_tags,
+            impacts: &mut impacts,
+            particle_symbols: &mut particle_symbols,
+        },
+    )?;
     // Cache replay has already placed and linked every weapon's imported assets.
     // Perk actions can live in a different package from their label dictionary.
     let label_dictionaries = label_dictionaries(&sources.manager, &asset_packages)?;
@@ -173,7 +184,9 @@ pub(in crate::item::build) fn author(
     let subclass_entries = resolved
         .iter()
         .zip(entry_plans)
-        .map(|(donor, plans)| {
+        .enumerate()
+        .map(|(ordinal, (donor, plans))| {
+            catalog.weapon = Some(ordinal);
             let mut compiler = custom_plugs::RecordCompiler {
                 manager: &sources.manager,
                 catalog: &mut catalog,
@@ -232,13 +245,29 @@ pub(in crate::item::build) fn author(
     ))
 }
 
+/// Where [`Payloads::dependencies`] spent its time, and how much it handled.
+#[derive(Default)]
+pub(in crate::item::build) struct DependencyTimings {
+    /// Reading and checking the loading root and its dependency index.
+    pub roots: std::time::Duration,
+    /// The native prerequisites of the graphs the build references, with their closure walk.
+    pub prerequisites: std::time::Duration,
+    pub graphs: usize,
+    pub prerequisite_count: usize,
+    /// Adding every new dependency to the index and checking it round-trips.
+    pub enrollment: std::time::Duration,
+    pub additions: usize,
+}
+
 impl Payloads {
     pub(in crate::item::build) fn dependencies(
         &self,
         manager: &PackageManager,
         assets: &assets::Plan,
         entity_assignment_tag: TagHash,
+        timings: &mut DependencyTimings,
     ) -> AuthoringResult<Option<Vec<u8>>> {
+        let started = std::time::Instant::now();
         if self.private_perk_tags.is_empty()
             && self.weapon_tags.is_empty()
             && self.runtime_asset_tags.is_empty()
@@ -276,11 +305,8 @@ impl Payloads {
         let mut additions = assets.perk_icon_dependencies.clone();
         for index in assets.hud_asset_start..self.badge_tag_count {
             additions.push(
-                AppendedTagAllocator::new(crate::package_profile::window().base, 0).assigned_tag(
-                    index,
-                    "HUD dependency",
-                    "HUD icon",
-                )?,
+                AppendedTagAllocator::new(crate::package_profile::window().first(), 0)
+                    .assigned_tag(index, "HUD dependency", "HUD icon")?,
             );
         }
         for index in 0..self.private_perk_tags.len() {
@@ -298,7 +324,9 @@ impl Payloads {
             )?);
         }
         additions.extend(self.runtime_asset_tags.iter().copied());
-        additions.extend(super::dependencies::native_prerequisites(
+        timings.roots = started.elapsed();
+        let started = std::time::Instant::now();
+        let (prerequisites, graphs) = super::dependencies::native_prerequisites(
             manager,
             [
                 (
@@ -315,14 +343,20 @@ impl Payloads {
                 )
             })),
             &self.grafted_graphs,
-        )?);
-        Ok(Some(
-            crate::shared_tag_dependency_index::enroll_dependencies(
-                &source,
-                RUNTIME_DEPENDENCY_COMPANION,
-                RUNTIME_DEPENDENCY_ROOT,
-                &additions,
-            )?,
-        ))
+        )?;
+        timings.prerequisites = started.elapsed();
+        timings.graphs = graphs;
+        timings.prerequisite_count = prerequisites.len();
+        additions.extend(prerequisites);
+        timings.additions = additions.len();
+        let started = std::time::Instant::now();
+        let index = crate::shared_tag_dependency_index::enroll_dependencies(
+            &source,
+            RUNTIME_DEPENDENCY_COMPANION,
+            RUNTIME_DEPENDENCY_ROOT,
+            &additions,
+        )?;
+        timings.enrollment = started.elapsed();
+        Ok(Some(index))
     }
 }

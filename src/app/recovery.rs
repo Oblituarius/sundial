@@ -39,21 +39,17 @@ impl SundialApp {
         let Some(backup) = self.pending_sqlite_restore.take() else {
             return;
         };
-        match platform::destiny_is_running() {
-            Ok(true) => {
-                self.set_status(
-                    "Not restored: close Destiny 2 before replacing investment.sqlite3, then try again",
-                    true,
-                );
-                return;
-            }
-            Ok(false) => {}
-            Err(error) => {
-                self.set_status(format!("Not restored: {error}"), true);
-                return;
-            }
-        }
-        match self.document.restore_sqlite_backup_safely(&backup) {
+        let require_closed = || match platform::destiny_is_running() {
+            Ok(true) => Err(
+                "close Destiny 2 before replacing investment.sqlite3, then try again".to_owned(),
+            ),
+            Ok(false) => Ok(()),
+            Err(error) => Err(error),
+        };
+        match self
+            .document
+            .restore_sqlite_backup_safely(&backup, require_closed)
+        {
             Ok(safety_backup) => {
                 if self.reload() {
                     let warning = self
@@ -135,12 +131,8 @@ impl SundialApp {
             Ok(result) => {
                 let size_note = settings_save_note(&result);
                 let (retention_note, retention_failed) = self.apply_backup_retention();
-                let dawn = self.dawn_account_runtime();
-                self.replace_loaded_document(account::WorkspaceDocument::load(
-                    default_document,
-                    &self.settings_path,
-                    dawn,
-                ));
+                let document = self.load_workspace_document(default_document);
+                self.replace_loaded_document(document);
                 self.set_status(
                     format!(
                         "Restored the defaults bundled with the installed Project Sunrise.{size_note} Original: {}. Backup: {}.{retention_note}",

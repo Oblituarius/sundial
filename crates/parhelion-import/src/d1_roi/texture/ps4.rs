@@ -1,91 +1,134 @@
-//! PS4 GCN Morton-tiled texture detile via swizzleinator.
-use anyhow::{Result, ensure};
+//! PS4 GCN texture descriptors and 1D-thin (8x8 Morton micro-tile) detiling.
+use anyhow::{Result, bail, ensure};
 use swizzleinator::{
-    format::{DxgiFormat, GcnSurfaceFormat},
+    format::DxgiFormat,
     swizzle::{Deswizzler, ps::Ps4},
 };
 
-/// GCN T# surface format (bits [25:20] of dword 1) → DXGI format number.
-///
-/// Only the subset parhelion's surface() helper handles is listed; any format
-/// not in this table is rejected as unsupported.
-pub(super) fn gcn_to_dxgi(gcn: GcnSurfaceFormat) -> Option<u32> {
-    Some(match gcn {
-        GcnSurfaceFormat::Format8_8_8_8 => 28,  // R8G8B8A8_UNORM
-        GcnSurfaceFormat::BC1 => 71,             // BC1_UNORM
-        GcnSurfaceFormat::BC3 => 77,             // BC3_UNORM
-        GcnSurfaceFormat::BC4 => 80,             // BC4_UNORM
-        GcnSurfaceFormat::BC5 => 83,             // BC5_UNORM
-        GcnSurfaceFormat::BC6 => 95,             // BC6H_UF16
-        GcnSurfaceFormat::BC7 => 98,             // BC7_UNORM
-        _ => return None,
+const TILE_THIN_1D: u32 = 13;
+
+/// Fields of the 32-byte GCN T# at the start of a PS4 texture header.
+pub(super) struct Descriptor {
+    data_format: u32,
+    num_format: u32,
+    tiling: u32,
+    pow2pad: bool,
+    kind: u32,
+}
+
+pub(super) fn descriptor(header: &[u8]) -> Result<Descriptor> {
+    ensure!(header.len() >= 0x20, "PS4 texture header too short for T#");
+    let dword = |i: usize| u32::from_le_bytes(header[i * 4..i * 4 + 4].try_into().unwrap());
+    let (d1, d3) = (dword(1), dword(3));
+    Ok(Descriptor {
+        data_format: (d1 >> 20) & 0x3F,
+        num_format: (d1 >> 26) & 0xF,
+        tiling: (d3 >> 20) & 0x1F,
+        pow2pad: (d3 >> 25) & 1 == 1,
+        kind: (d3 >> 28) & 0xF,
     })
 }
 
-/// Extract the GCN surface format from a PS4 texture descriptor (T#) header.
-///
-/// The T# is the first 32 bytes of the header. Bits [25:20] of dword 1 hold
-/// the DATA_FORMAT / surface format field.
-pub(super) fn gcn_format(hdr: &[u8]) -> Result<GcnSurfaceFormat> {
-    ensure!(hdr.len() >= 8, "PS4 texture header too short for T#");
-    let dword1 = u32::from_le_bytes(hdr[4..8].try_into().unwrap());
-    let raw = ((dword1 >> 20) & 0x3F) as u16;
-    GcnSurfaceFormat::try_from(raw).map_err(|_| anyhow::anyhow!("Unknown PS4 GCN format {raw:#X}"))
+impl Descriptor {
+    /// DXGI number for the formats the native writer accepts. The channel type (num format,
+    /// 9 = SRGB) decides the sRGB variant.
+    pub(super) fn dxgi(&self) -> Result<u32> {
+        Ok(match (self.data_format, self.num_format) {
+            (10, 0) => 28,
+            (10, 9) => 29,
+            (35, 0) => 71,
+            (35, 9) => 72,
+            (37, 0) => 77,
+            (37, 9) => 78,
+            (38, 0) => 80,
+            (38, 1) => 81,
+            (39, 0) => 83,
+            (39, 1) => 84,
+            (41, 0) => 98,
+            (41, 9) => 99,
+            (format, channel) => {
+                bail!("Unsupported PS4 texture format {format} with channel type {channel}")
+            }
+        })
+    }
+
+    pub(super) fn is_cube(&self) -> bool {
+        self.kind == 11
+    }
 }
 
-/// Deswizzle one mip surface from a PS4 texture.
-///
-/// `src` must be exactly the Morton-tiled bytes for this mip.
-/// Returns the linear destination bytes.
-pub(super) fn deswizzle_mip(
-    src: &[u8],
-    width: usize,
-    height: usize,
-    fmt: DxgiFormat,
-) -> Result<Vec<u8>> {
-    let (_, surface_bytes) = fmt.calculate_pitch(width, height);
-    ensure!(
-        surface_bytes > 0,
-        "PS4 deswizzle: zero-size surface ({width}x{height})"
-    );
-    let mut src_owned = src.to_vec();
-    let mut dest = vec![0u8; surface_bytes];
-    // PS4 GCN uses 8x8 Morton macro-tiles; no pow2 source padding for D1 ROI data.
-    Ps4::deswizzle(&mut src_owned, &mut dest, (width, height, 1), fmt, false)
-        .map_err(|e| anyhow::anyhow!("PS4 deswizzle error: {e:?}"))?;
-    Ok(dest)
-}
-
-/// Deswizzle the full mip chain (all mips concatenated, mip 0 first) for a PS4
-/// texture.  Returns the linearised bytes in the same mip-major order.
-pub(super) fn deswizzle_chain(
+/// Linear mip chain (mip 0 first). Tiled storage pads each mip to a power of two when the T#
+/// requests it, then to whole 8x8 micro tiles of texels or blocks. Some textures, such as
+/// plate sources, are stored linear although their T# names a tile mode; the storage size
+/// decides, and `linear_hint` (Charm's rule) breaks a tie when both layouts have one size.
+pub(super) fn linear_chain(
     raw: &[u8],
+    descriptor: &Descriptor,
+    format: u32,
     width: u16,
     height: u16,
     mips: u8,
-    fmt: DxgiFormat,
+    linear_hint: bool,
 ) -> Result<Vec<u8>> {
     ensure!(mips > 0 && mips <= 16, "Invalid PS4 mip count {mips}");
-    let mut result = Vec::new();
-    let mut offset = 0usize;
-    for mip in 0..mips {
-        let w = usize::from(width >> mip).max(1);
-        let h = usize::from(height >> mip).max(1);
-        let (_, mip_bytes) = fmt.calculate_pitch(w, h);
-        ensure!(
-            offset + mip_bytes <= raw.len(),
-            "PS4 texture data truncated at mip {mip} (need {mip_bytes}, have {})",
-            raw.len() - offset
-        );
-        let linear = deswizzle_mip(&raw[offset..offset + mip_bytes], w, h, fmt)?;
-        result.extend_from_slice(&linear);
-        offset += mip_bytes;
+    let dxgi = DxgiFormat::try_from(format)
+        .map_err(|_| anyhow::anyhow!("Unsupported PS4 DXGI format {format}"))?;
+    let edge = if format >= 70 { 4 } else { 1 };
+    let levels = (0..mips)
+        .map(|mip| {
+            let w = usize::from(width >> mip).max(1);
+            let h = usize::from(height >> mip).max(1);
+            let (pw, ph) = if descriptor.pow2pad {
+                (w.next_power_of_two(), h.next_power_of_two())
+            } else {
+                (w, h)
+            };
+            let tiled_w = pw.div_ceil(edge).div_ceil(8) * 8 * edge;
+            let tiled_h = ph.div_ceil(edge).div_ceil(8) * 8 * edge;
+            let (_, linear) = super::surface(format, w, h)?;
+            Ok((
+                w,
+                h,
+                tiled_w,
+                tiled_h,
+                dxgi.calculate_pitch(tiled_w, tiled_h).1,
+                linear,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let tiled_total = levels.iter().map(|l| l.4).sum::<usize>();
+    let linear_total = levels.iter().map(|l| l.5).sum::<usize>();
+    let linear = match (raw.len() == tiled_total, raw.len() == linear_total) {
+        (true, true) => linear_hint,
+        (true, false) => false,
+        (false, true) => true,
+        _ => anyhow::bail!(
+            "PS4 texture storage of {} bytes is neither tiled ({tiled_total}) nor linear ({linear_total})",
+            raw.len()
+        ),
+    };
+    if linear {
+        return Ok(raw.to_vec());
+    }
+    ensure!(
+        descriptor.tiling == TILE_THIN_1D,
+        "Unsupported PS4 texture tile mode {}",
+        descriptor.tiling
+    );
+    let mut result = Vec::with_capacity(linear_total);
+    let mut offset = 0;
+    for (w, h, tiled_w, tiled_h, tiled_bytes, _) in levels {
+        let mut source = raw[offset..offset + tiled_bytes].to_vec();
+        let mut padded = vec![0; tiled_bytes];
+        Ps4::deswizzle(&mut source, &mut padded, (tiled_w, tiled_h, 1), dxgi, false)
+            .map_err(|e| anyhow::anyhow!("PS4 detile failed: {e:?}"))?;
+        let (padded_row, _) = super::surface(format, tiled_w, tiled_h)?;
+        let (row, length) = super::surface(format, w, h)?;
+        for line in 0..length / row {
+            let at = line * padded_row;
+            result.extend_from_slice(&padded[at..at + row]);
+        }
+        offset += tiled_bytes;
     }
     Ok(result)
-}
-
-/// Map a parhelion DXGI format number to the swizzleinator `DxgiFormat` used
-/// when calling the PS4 detiler.
-pub(super) fn dxgi_fmt(format: u32) -> Result<DxgiFormat> {
-    DxgiFormat::try_from(format).map_err(|_| anyhow::anyhow!("Unsupported PS4 DXGI format {format}"))
 }

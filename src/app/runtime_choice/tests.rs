@@ -3,9 +3,7 @@ use crate::app::*;
 use crate::{game_settings::dawn::Runtime, package_runtime::installation::RuntimeInspection};
 use serde_json::{Value, json};
 
-mod selection;
 mod switching;
-mod ui;
 
 fn setup() -> (TestDirectory, SundialApp, RuntimeInspection) {
     let directory = TestDirectory::new("dawn-validation");

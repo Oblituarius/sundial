@@ -2,7 +2,7 @@
 //!
 //! The runtime resolves named aim, muzzle and grip points through a part's marker
 //! component and its resource registrations. Final authoring selects the source
-//! set by art selector and position, writes its exact transforms, and relocates
+//! set by art selector and position, compared in native numbering, writes its exact transforms, and relocates
 //! the component's header, data, entity aliases and event connection together.
 //! Missing components acquire validated native registrations and lookup metadata.
 //!
@@ -16,6 +16,26 @@ pub(crate) mod bindings;
 pub(crate) mod optics;
 pub use author::author;
 pub use author::replace;
+
+/// Maps a source art selector to the native one. Source and native selectors are separate
+/// numberings, and a source selector without a validated native counterpart is an error.
+pub type Selector = fn(u64) -> Result<u64>;
+
+/// A source placement in native numbering, or `None` for a selector with no native counterpart,
+/// which no native part can share.
+fn native_placement(
+    placement: &serde_json::Value,
+    selector: Selector,
+) -> Result<Option<(u64, u64)>> {
+    use anyhow::Context;
+    let source = placement["selector"]
+        .as_u64()
+        .context("source placement selector")?;
+    let position = placement["position"]
+        .as_u64()
+        .context("source placement position")?;
+    Ok(selector(source).ok().map(|native| (native, position)))
+}
 
 /// Where a marker row keeps its transform and its name, and how far apart the rows are.
 #[derive(Clone, Copy, Debug)]
@@ -78,10 +98,11 @@ pub fn read(payload: &Payload, descriptor: usize, layout: Layout) -> Result<Vec<
             for (index, value) in position.iter_mut().enumerate() {
                 *value = payload.f32(row + layout.position + index * 4)?;
             }
-            // Every marker row observed carries a point, never a direction.
+            // D1 marker rows carry positive nonunit fourth lanes. Preserve them verbatim,
+            // while keeping zero or negative lanes outside the supported contract.
             ensure!(
-                (position[3] - 1.0).abs() < 1e-3,
-                "marker row at {row:X} is not a position"
+                position[3] > 0.0,
+                "marker row at {row:X} has an unsupported fourth transform lane"
             );
             let mut orientation = [0.0; 4];
             for (index, value) in orientation.iter_mut().enumerate() {
@@ -114,6 +135,38 @@ pub fn read_native(payload: &Payload) -> Result<Vec<Marker>> {
     let data = payload.pointer(0x18)?;
     ensure!(data >= 4, "marker component has no data struct");
     read(payload, data + NATIVE_DESCRIPTOR, NATIVE)
+}
+
+/// The native runtime marker component's envelope: its own length word, then an instance of
+/// [`NATIVE_COMPONENT`] and a runtime marker resource.
+pub(crate) fn check_component(p: &Payload) -> Result<()> {
+    let instance = p.pointer(16)?;
+    let resource = p.pointer(24)?;
+    ensure!(
+        p.u64(0)? == p.0.len() as u64
+            && instance >= 4
+            && resource >= 4
+            && p.u32(instance - 4)? == NATIVE_COMPONENT
+            && p.u32(resource - 4)? == 0x80808507,
+        "runtime marker component layout differs"
+    );
+    Ok(())
+}
+
+/// Check the native runtime marker component and every marker before package allocation.
+pub fn validate(bytes: &[u8]) -> Result<()> {
+    let p = Payload(bytes.to_vec());
+    check_component(&p)?;
+    for marker in read_native(&p)? {
+        ensure!(
+            marker.binding[0] == 0
+                && marker.binding[1] <= 2
+                && marker.position.iter().all(|x| x.is_finite())
+                && marker.orientation.iter().all(|x| x.is_finite()),
+            "runtime marker transform or root binding differs"
+        );
+    }
+    Ok(())
 }
 
 /// The markers of a source marker-set payload. Unlike the native component, the descriptor's
@@ -276,8 +329,10 @@ pub fn append_skeletal(payload: &Payload, source: &[Marker], bones: usize) -> Re
 }
 
 fn write_binding(row: &mut [u8], binding: [u32; 2]) -> Result<()> {
+    // Root pairs through (0, 2) occur in paired modern and Shadowkeep weapon
+    // marker sets. Preserve the pair without treating its second word as a bone.
     ensure!(
-        binding[0] == 0 && binding[1] <= 1,
+        binding[0] == 0 && binding[1] <= 2,
         "source marker has an unsupported root binding"
     );
     ensure!(
@@ -650,10 +705,9 @@ mod tests {
         );
     }
 
-    /// A row whose fourth component is not one is a direction or something else again, and
-    /// carrying a position onto it would be meaningless.
+    /// Zero in the fourth transform lane is outside the supported marker contract.
     #[test]
-    fn a_row_that_is_not_a_position_is_refused() {
+    fn a_zero_fourth_transform_lane_is_refused() {
         let mut payload = native(&[(GRIP, [0.0, 0.0, 0.0], FORWARD)]);
         let row = read_native(&payload).unwrap()[0].row;
         let at = row + NATIVE.position + 12;

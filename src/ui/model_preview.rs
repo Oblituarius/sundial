@@ -69,6 +69,22 @@ fn clip_bytes(selection: &Selection, tag: u32) -> Result<Vec<u8>, String> {
     }
 }
 
+/// Reads a clip's bytes under `read`, the count an install waits on, and the Inspector's
+/// `access` where there is one. Both are let go once the bytes are in hand.
+fn read_clip(
+    read: PackageRead,
+    access: Option<&crate::catalog::PackageInspectionAccess>,
+    selection: &Selection,
+    tag: u32,
+) -> Result<Vec<u8>, String> {
+    let bytes = match access {
+        Some(access) => access.read(|| clip_bytes(selection, tag)),
+        None => clip_bytes(selection, tag),
+    };
+    drop(read);
+    bytes
+}
+
 /// Playback rate, defaulting to real time so the struct can still derive `Default`.
 #[derive(Clone, Copy, PartialEq)]
 struct Speed(f32);
@@ -158,6 +174,21 @@ pub fn weapon(ui: &mut egui::Ui, packages: &Path, appearance: Appearance, name: 
     weapon_preview(ui, packages, appearance, name, id, None);
 }
 
+/// Opens the authored viewer on pinned assets before they have been built or installed.
+pub fn local_weapon(ui: &mut egui::Ui, packages: &Path, appearance: LocalAppearance, name: &str) {
+    window::launcher(
+        ui,
+        weapon_source(ui.ctx()),
+        Some(window::Request::new(
+            packages,
+            Target::Local(appearance, None),
+            name,
+            None,
+            false,
+        )),
+    );
+}
+
 /// Open an account item's saved appearance directly, retaining package inspection guards.
 pub(crate) fn open_inspected_weapon(
     ctx: &egui::Context,
@@ -178,31 +209,6 @@ pub(crate) fn open_inspected_weapon(
             false,
         ),
     );
-}
-
-/// Inspector reads participate in package suspension and invalidate after package changes.
-pub(crate) fn inspected_weapon(
-    ui: &mut egui::Ui,
-    packages: &Path,
-    appearance: Appearance,
-    name: &str,
-    access: Arc<crate::catalog::PackageInspectionAccess>,
-) {
-    // One model per inspector viewport/layer, including when navigation changes the item hash.
-    let id = inspector_source(ui);
-    weapon_preview(ui, packages, appearance, name, id, Some(access));
-}
-
-fn inspector_source(ui: &egui::Ui) -> egui::Id {
-    egui::Id::new((
-        "inspector-model-preview",
-        ui.ctx().viewport_id(),
-        ui.layer_id().id,
-    ))
-}
-
-pub(crate) fn inspected_unavailable(ui: &egui::Ui) {
-    window::clear_source(ui.ctx(), inspector_source(ui));
 }
 
 fn weapon_preview(
@@ -246,6 +252,20 @@ pub fn follow_weapon(ctx: &egui::Context, packages: &Path, appearance: Appearanc
     );
 }
 
+/// Keeps the authored viewer on the imported source when another editor tab is active.
+pub fn follow_local_weapon(
+    ctx: &egui::Context,
+    packages: &Path,
+    appearance: LocalAppearance,
+    name: &str,
+) {
+    window::follow(
+        ctx,
+        weapon_source(ctx),
+        window::Request::new(packages, Target::Local(appearance, None), name, None, false),
+    );
+}
+
 /// Whether this viewport currently owns the shared authored preview.
 pub fn weapon_is_open(ctx: &egui::Context) -> bool {
     window::owned_by(ctx, weapon_source(ctx))
@@ -261,17 +281,43 @@ pub fn pop_out(
     packages: &Path,
     (appearance, name): (Appearance, &str),
 ) -> Option<egui::Response> {
+    pop_out_with_access(ui, (id, id), over, packages, (appearance, name), None)
+}
+
+/// An Inspector corner launcher retains package access after its source view closes. The still
+/// `id` is the window's, while `owner` names the item, so a viewer opened on one item stays on
+/// it as the Inspector moves to another.
+pub(crate) fn inspected_pop_out(
+    ui: &mut egui::Ui,
+    (id, owner): (egui::Id, egui::Id),
+    over: egui::Rect,
+    packages: &Path,
+    subject: (Appearance, &str),
+    access: Arc<crate::catalog::PackageInspectionAccess>,
+) -> Option<egui::Response> {
+    pop_out_with_access(ui, (id, owner), over, packages, subject, Some(access))
+}
+
+fn pop_out_with_access(
+    ui: &mut egui::Ui,
+    (id, owner): (egui::Id, egui::Id),
+    over: egui::Rect,
+    packages: &Path,
+    (appearance, name): (Appearance, &str),
+    access: Option<Arc<crate::catalog::PackageInspectionAccess>>,
+) -> Option<egui::Response> {
     still::playback_control(ui, id, over);
-    let owner = pop_out_source(ui.ctx(), id);
+    let owner = pop_out_source(ui.ctx(), owner);
+    let generation = access.as_ref().map(|access| access.generation());
     window::corner_launcher(
         ui,
         owner,
         over,
         window::Request::new(
             packages,
-            Target::Weapon(appearance, None),
+            Target::Weapon(appearance, generation),
             name,
-            None,
+            access,
             false,
         ),
     )
@@ -313,6 +359,42 @@ pub fn pop_out_local(
     )
 }
 
+/// Updates an inline preview's separate viewer while the editor is on another tab.
+pub fn follow_pop_out(
+    ctx: &egui::Context,
+    id: egui::Id,
+    packages: &Path,
+    appearance: Appearance,
+    name: &str,
+) {
+    window::follow(
+        ctx,
+        pop_out_source(ctx, id),
+        window::Request::new(
+            packages,
+            Target::Weapon(appearance, None),
+            name,
+            None,
+            false,
+        ),
+    );
+}
+
+/// The imported counterpart of [`follow_pop_out`], retaining the source reader.
+pub fn follow_pop_out_local(
+    ctx: &egui::Context,
+    id: egui::Id,
+    packages: &Path,
+    appearance: LocalAppearance,
+    name: &str,
+) {
+    window::follow(
+        ctx,
+        pop_out_source(ctx, id),
+        window::Request::new(packages, Target::Local(appearance, None), name, None, false),
+    );
+}
+
 /// Whether the shared viewer is open on the preview `id` through its `pop_out`.
 pub fn popped_out(ctx: &egui::Context, id: egui::Id) -> bool {
     window::owned_by(ctx, pop_out_source(ctx, id))
@@ -348,11 +430,6 @@ fn preview_kind(model: &Model) -> &'static str {
 }
 
 impl Preview {
-    #[cfg(test)]
-    fn sync(&mut self, ctx: &egui::Context, selection: Selection) {
-        self.sync_with_access(ctx, selection, None);
-    }
-
     fn sync_with_access(
         &mut self,
         ctx: &egui::Context,
@@ -604,18 +681,14 @@ impl Preview {
             .request
             .as_ref()
             .and_then(|request| request.access.clone());
+        // Counted from before the save starts, so an install waits for the clip to be read.
+        let read = model_preview::PackageRead::start();
         self.write_in_background(ctx, "Audio saved", path, move || {
-            let read = || {
-                let bytes = clip_bytes(&selection, tag)?;
-                if decoded {
-                    model_preview::assets::decoded_wave(&bytes)
-                } else {
-                    Ok(bytes)
-                }
-            };
-            match access {
-                Some(access) => access.read(read),
-                None => read(),
+            let bytes = read_clip(read, access.as_deref(), &selection, tag)?;
+            if decoded {
+                model_preview::assets::decoded_wave(&bytes)
+            } else {
+                Ok(bytes)
             }
         });
     }
@@ -638,12 +711,13 @@ impl Preview {
         let (repaint, viewport) = (ctx.clone(), ctx.viewport_id());
         let read = model_preview::PackageRead::start();
         std::thread::spawn(move || {
-            let _read = read;
             let decode = || {
                 if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                     return Err("Audio decoding canceled".to_owned());
                 }
-                let bytes = clip_bytes(&selection, tag)?;
+                // Only the clip's bytes need the packages, so a long decode never holds up an
+                // install or Parhelion's suspension of package access.
+                let bytes = read_clip(read, access.as_deref(), &selection, tag)?;
                 let wave = model_preview::assets::decoded_wave_cancelable(&bytes, &cancel)?;
                 let duration = model_preview::assets::wave_duration(&wave)
                     .ok_or("Decoded audio has no valid duration")?;
@@ -657,11 +731,7 @@ impl Preview {
                 file.flush().map_err(|error| error.to_string())?;
                 Ok((file, duration))
             };
-            let result = match access {
-                Some(access) => access.read(decode),
-                None => decode(),
-            };
-            let _ = sender.send(result);
+            let _ = sender.send(decode());
             repaint.request_repaint_of(viewport);
         });
     }

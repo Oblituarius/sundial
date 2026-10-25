@@ -24,8 +24,12 @@ pub(super) trait Context {
         offset: [i32; 3],
     ) -> Bits;
     fn load(&self, resource: usize, position: [i32; 4], offset: [i32; 3]) -> Bits;
-    fn lod(&self, resource: usize, uv: [f32; 4]) -> [f32; 4];
+    fn lod(&self, instruction: usize, resource: usize, sampler: usize, uv: [f32; 4]) -> [f32; 4];
     fn derivative(&self, input: &Operand, y: bool) -> [f32; 4];
+    /// Offset to the other pixel of the current derivative pair.
+    fn derivative_offset(&self, _y: bool) -> f32 {
+        1.0
+    }
 }
 
 struct Registers<'a, C> {
@@ -97,15 +101,15 @@ impl<C: Context> Registers<'_, C> {
 
 impl Program {
     pub(super) fn evaluate(&self, context: &impl Context) -> Option<[[f32; 4]; 16]> {
-        let result = self.run(context, false)?;
+        let result = self.run(context, None)?;
         result.coordinates.is_none().then_some(result.outputs)
     }
 
-    pub(super) fn lod_coordinates(&self, context: &impl Context) -> Option<[f32; 4]> {
-        self.run(context, true)?.coordinates
+    pub(super) fn lod_coordinates(&self, context: &impl Context, at: usize) -> Option<[f32; 4]> {
+        self.run(context, Some(at))?.coordinates
     }
 
-    fn run(&self, context: &impl Context, coordinates: bool) -> Option<ResultValue> {
+    fn run(&self, context: &impl Context, coordinates: Option<usize>) -> Option<ResultValue> {
         let mut r = Registers {
             context,
             immediate: &self.immediate,
@@ -117,6 +121,14 @@ impl Program {
         let mut active = true;
         for (at, instruction) in self.instructions.iter().enumerate() {
             let v = &instruction.operands;
+            // A neighbouring pixel can take the other branch. Stop at the requested
+            // footprint even then, so replay never evaluates a later footprint.
+            if coordinates == Some(at) {
+                return (active && instruction.code == 108).then(|| ResultValue {
+                    outputs: [[0.0; 4]; 16],
+                    coordinates: Some(r.read(&v[1]).map(f32::from_bits)),
+                });
+            }
             match instruction.code {
                 31 => {
                     let condition = active && ((r.read(&v[0])[0] != 0) == instruction.nonzero);
@@ -147,12 +159,6 @@ impl Program {
             }
             let source = |i| r.read(&v[i]);
             let float = |i| source(i).map(f32::from_bits);
-            if coordinates && instruction.code == 108 {
-                return Some(ResultValue {
-                    outputs: [[0.0; 4]; 16],
-                    coordinates: Some(float(1)),
-                });
-            }
             let unary = |f: fn(f32) -> f32| float(1).map(|v| f(v).to_bits());
             let binary = |f: fn(f32, f32) -> f32| {
                 let a = float(1);
@@ -291,10 +297,17 @@ impl Program {
                     r.write(&v[1], remainder, false);
                     continue;
                 }
-                80 => {
+                79 | 80 => {
                     let a = source(1);
                     let b = source(2);
-                    std::array::from_fn(|i| if a[i] >= b[i] { u32::MAX } else { 0 })
+                    std::array::from_fn(|i| {
+                        let matches = if instruction.code == 79 {
+                            a[i] < b[i]
+                        } else {
+                            a[i] >= b[i]
+                        };
+                        if matches { u32::MAX } else { 0 }
+                    })
                 }
                 61 => {
                     let raw = context.size(r.index(&v[2], 0), source(1)[0]);
@@ -315,16 +328,21 @@ impl Program {
                     );
                     continue;
                 }
+                85 => {
+                    let a = source(1);
+                    let b = source(2);
+                    std::array::from_fn(|i| a[i].wrapping_shr(b[i] & 31))
+                }
                 86 => source(1).map(|v| (v as f32).to_bits()),
                 108 => {
-                    let raw = context.lod(r.index(&v[2], 0), float(1));
+                    let raw = context.lod(at, r.index(&v[2], 0), r.index(&v[3], 0), float(1));
                     std::array::from_fn(|i| raw[v[2].lanes[i]].to_bits())
                 }
-                122 | 124 => self.derivatives[at]
+                122..=125 => self.derivatives[at]
                     .as_ref()
                     .map_or_else(
-                        || context.derivative(&v[1], instruction.code == 124),
-                        |derivative| derivative.at(context, instruction.code == 124),
+                        || context.derivative(&v[1], instruction.code >= 124),
+                        |derivative| derivative.at(context, instruction.code >= 124),
                     )
                     .map(f32::to_bits),
                 140 => {

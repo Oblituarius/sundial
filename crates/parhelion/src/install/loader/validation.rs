@@ -3,9 +3,11 @@ use super::*;
 pub(super) fn validate_packages(
     target: &Path,
     sources: &[(ArtifactMetadata, PathBuf)],
-) -> Result<(), InstallError> {
+    known: &[CheckedPackage],
+) -> Result<Vec<CheckedPackage>, InstallError> {
     authored_packages_for_file_names(sources.iter().map(|(a, _)| a.file_name.as_str()))
         .map_err(InstallError::validation)?;
+    let mut checked = Vec::with_capacity(sources.len());
     for (artifact, path) in sources {
         let profile = authored_package_for_file_name(&artifact.file_name)
             .ok_or_else(|| InstallError::validation("Unknown managed package"))?;
@@ -15,48 +17,28 @@ pub(super) fn validate_packages(
             path,
         )
         .map_err(InstallError::validation)?;
-        validate_authored_package_file(path, profile, target)?;
-        verify_file(path, &TransactionDigest::from(artifact))?;
-        let bytes = fs::read(path).map_err(failure)?;
-        let layout = PackageLayout::parse(&bytes).map_err(failure)?;
-        verify_block_sources(target, path, &layout, &bytes)?;
-        if let Some(stock) = canonical_package(profile.package_id) {
-            if profile.patch_id != stock.stock_patch_id + 1 {
-                return Err(InstallError::validation(
-                    "A loader patch must immediately follow its stock generation",
-                ));
-            }
-            let baseline = fs::read(target.join(stock.stock_file_name(stock.stock_patch_id)))
-                .map_err(failure)?;
-            let original = PackageLayout::parse(&baseline).map_err(failure)?;
-            // Sunrise merges mod patches entry by entry and refuses one whose entry table
-            // differs in length from its base.
-            if layout.entry_count != original.entry_count {
+        reject_symlink(path, "managed package")?;
+        let package = if let Some(previous) = known.iter().find(|p| p.artifact == *artifact) {
+            // Digest equality permits immutable structure reuse, never a timestamp or size alone.
+            verify_file(path, &TransactionDigest::from(artifact))?;
+            previous.clone()
+        } else {
+            let bytes = fs::read(path).map_err(failure)?;
+            if TransactionDigest::from(artifact) != crate::artifact::digest_bytes(&bytes) {
                 return Err(InstallError::validation(format!(
-                    "{} has {} entries where its stock generation has {}. Sunrise refuses a patch that adds entries, so build again for this installation",
-                    artifact.file_name, layout.entry_count, original.entry_count
+                    "File changed after review: {}",
+                    path.display()
                 )));
             }
-            let size = original
-                .block_count
-                .checked_mul(crate::format::BLOCK_HEADER_SIZE)
-                .ok_or_else(|| InstallError::validation("Block table length overflow"))?;
-            if layout.block_count < original.block_count
-                || bytes.get(layout.block_table_offset..layout.block_table_offset + size)
-                    != baseline.get(original.block_table_offset..original.block_table_offset + size)
-            {
-                return Err(InstallError::validation(format!(
-                    "{} changes the inherited stock block table",
-                    artifact.file_name
-                )));
+            CheckedPackage {
+                artifact: artifact.clone(),
+                structure: validate_authored_package_bytes(path, bytes, profile, target)?,
             }
-        } else if layout.patch_id != 0 {
-            return Err(InstallError::validation(
-                "A new managed package must begin at generation zero",
-            ));
-        }
+        };
+        package.structure.verify_sources(target, path)?;
+        checked.push(package);
     }
-    Ok(())
+    Ok(checked)
 }
 
 /// Refuses packages Sunrise would not load beside what is installed. That is a new package whose
@@ -109,7 +91,7 @@ pub(super) fn reject_installed_conflicts(
 /// Another mod in the loader's folder, as installation reads it.
 struct OtherMod {
     id: String,
-    incompatible: bool,
+    incompatible: Vec<String>,
     packages: Vec<PathBuf>,
     patches: Vec<PathBuf>,
 }
@@ -164,7 +146,7 @@ fn other_mods(install: &Path) -> Result<Vec<OtherMod>, InstallError> {
             continue;
         };
         if name.starts_with('.')
-            || name == mod_content::ID
+            || mod_content::is_family_id(&name)
             || !entry.file_type().map_err(failure)?.is_dir()
         {
             continue;
@@ -176,7 +158,16 @@ fn other_mods(install: &Path) -> Result<Vec<OtherMod>, InstallError> {
         let field = |key: &str| manifest.as_ref().and_then(|value| value.get(key));
         let incompatible = field("incompatible")
             .and_then(serde_json::Value::as_array)
-            .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(mod_content::ID)));
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|id| {
+                        id.as_str()
+                            .filter(|id| mod_content::is_family_id(id))
+                            .map(str::to_owned)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let id = field("id")
             .and_then(serde_json::Value::as_str)
             .unwrap_or(&name)
@@ -199,19 +190,25 @@ fn package_id(path: &Path) -> Option<u16> {
 
 /// Another mod may change the entries Parhelion changes only where Sunrise merges them intact:
 /// both mods describe the entries in merge data, no stock bytes they both change keep only one
-/// mod's value, and Parhelion's own rows keep their numbers. The loader is simulated with this
-/// build in place of the installed one, so a refusal comes before any content changes. Returns
-/// the shared entries Sunrise merges.
+/// mod's value, and Parhelion's merge data follows every row of its own the loader renumbers. The
+/// loader is simulated with this build in place of the installed one and without the earlier
+/// layout's `retired` packages, so a refusal comes before any content changes. Returns the shared
+/// entries Sunrise merges.
 pub(super) fn check_other_mods(
     target: &Path,
     sources: &[(ArtifactMetadata, PathBuf)],
     retired: &[ArtifactMetadata],
+    members: &[crate::mod_family::Member],
 ) -> Result<Vec<String>, InstallError> {
     let install = target
         .parent()
         .ok_or_else(|| InstallError::validation("Missing game root"))?;
     let others = other_mods(install)?;
-    if let Some(other) = others.iter().find(|other| other.incompatible) {
+    if let Some(other) = others.iter().find(|other| {
+        other.incompatible.iter().any(|id| {
+            id == mod_content::ID || members.iter().any(|member| member.manifest.id == *id)
+        })
+    }) {
         return Err(InstallError::validation(format!(
             "Mod {} declares Parhelion incompatible. Installing this build would cause Sunrise to refuse that mod. Resolve the incompatibility before installing",
             other.id
@@ -251,6 +248,16 @@ pub(super) fn check_other_mods(
         }
         incoming.packages.push(path.clone());
     }
+    let incoming = if members.is_empty() {
+        incoming
+    } else {
+        crate::mod_family::incoming(members, sources, incoming.retired)
+            .map_err(InstallError::validation)?
+    };
+    let proposed = std::iter::once(incoming.manifest.id.clone())
+        .chain(incoming.family.iter().map(|m| m.manifest.id.clone()))
+        .collect();
+    mod_content::ensure_family_environment(install, &proposed).map_err(InstallError::validation)?;
     let coexistence =
         mod_content::coexistence(install, &incoming).map_err(InstallError::validation)?;
     if let Some(problem) = coexistence.problems.first() {
@@ -261,8 +268,9 @@ pub(super) fn check_other_mods(
 
 /// The authored ids a build for this installation may use. On Sunrise's mod loader they leave
 /// out every id an installed package or another mod's new package holds, since Sunrise refuses
-/// a mod package whose id is taken. Parhelion's own files never count, so a build keeps its ids
-/// while nothing else claims them.
+/// a mod package whose id is taken, and it descends from the top, away from the ids Sunrise
+/// Studio takes. Parhelion's own files never count, so a build keeps its ids while nothing else
+/// claims them.
 pub(crate) fn package_window(
     target: &Path,
 ) -> Result<crate::package_profile::Window, InstallError> {
@@ -291,6 +299,44 @@ pub(crate) fn package_window(
             crate::package_profile::MAX_AUTHORED_STANDALONE_PACKAGE_ID,
         ))
     })
+}
+
+/// Whether another installed mod changes the entry `tag`: one of its patches of the entry's
+/// package holds a different entry record than the stock package. Nothing changes on a runtime
+/// without the mod loader.
+pub(crate) fn other_mods_change(target: &Path, tag: u32) -> Result<bool, InstallError> {
+    use sundial::package_authoring::mod_content::plaintext;
+    let install = target
+        .parent()
+        .ok_or_else(|| InstallError::validation("Missing game root"))?;
+    if !uses_mod_loader(target) {
+        return Ok(false);
+    }
+    let tag = tiger_pkg::TagHash(tag);
+    let Some(stock) = canonical_package(tag.pkg_id()) else {
+        return Ok(false);
+    };
+    let stock_path = target.join(stock.stock_file_name(stock.stock_patch_id));
+    let stock_records = plaintext::records(&stock_path).map_err(|reason| {
+        InstallError::validation(format!("{} {}", stock_path.display(), reason.text()))
+    })?;
+    let index = usize::from(tag.entry_index());
+    for other in other_mods(install)? {
+        for patch in other
+            .patches
+            .iter()
+            .filter(|path| package_id(path) == Some(tag.pkg_id()))
+        {
+            // A patch Sunrise can't read is the loader's to refuse, and changes nothing here.
+            let Ok(records) = plaintext::records(patch) else {
+                continue;
+            };
+            if records.rows.get(index) != stock_records.rows.get(index) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Whether the installation's runtime loads Sunrise mods. Installation reads the runtime again
@@ -326,48 +372,6 @@ fn installed_generations(target: &Path) -> Result<BTreeMap<u16, Vec<(String, u8)
     Ok(installed)
 }
 
-fn verify_block_sources(
-    target: &Path,
-    authored: &Path,
-    layout: &PackageLayout,
-    bytes: &[u8],
-) -> Result<(), InstallError> {
-    let mut lengths = BTreeMap::new();
-    for index in 0..layout.block_count {
-        let row = layout.block_table_offset + index * crate::format::BLOCK_HEADER_SIZE;
-        let offset = u32::from_le_bytes(bytes[row..row + 4].try_into().unwrap());
-        let size = u32::from_le_bytes(bytes[row + 4..row + 8].try_into().unwrap());
-        let patch = u16::from_le_bytes(bytes[row + 8..row + 10].try_into().unwrap());
-        if size == 0 {
-            continue;
-        }
-        let length = match lengths.entry(patch) {
-            std::collections::btree_map::Entry::Occupied(entry) => *entry.get(),
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                let path = if patch == layout.patch_id {
-                    authored.to_path_buf()
-                } else {
-                    let profile = canonical_package(layout.package_id).ok_or_else(|| {
-                        InstallError::validation(
-                            "Standalone package references an unavailable predecessor",
-                        )
-                    })?;
-                    target.join(profile.stock_file_name(patch))
-                };
-                reject_symlink(&path, "block source package")?;
-                *entry.insert(fs::metadata(&path).map_err(failure)?.len())
-            }
-        };
-        if u64::from(offset) + u64::from(size) > length {
-            return Err(InstallError::validation(format!(
-                "Package {:04X} block {index} extends beyond generation {patch}",
-                layout.package_id
-            )));
-        }
-    }
-    Ok(())
-}
-
 /// The mod folder's manifest and receipt, and at most 1,024 packages, each with its merge data.
 pub(super) const FOLDER_FILE_LIMIT: usize = 2 + 2 * 1024;
 
@@ -390,35 +394,43 @@ pub(super) fn package_path(artifact: &ArtifactMetadata) -> Result<String, Instal
     ))
 }
 
-pub(super) fn managed(target: &Path) -> Result<Option<Folder>, InstallError> {
+pub(super) fn managed_family_with_packages(
+    target: &Path,
+    known: &[CheckedPackage],
+) -> Result<(BTreeMap<String, Folder>, Vec<CheckedPackage>), InstallError> {
     let install = target
         .parent()
         .ok_or_else(|| InstallError::validation("Missing game root"))?;
     mod_content::ensure_readable(install).map_err(InstallError::validation)?;
-    let directory = mod_content::directory(install);
-    if !directory.try_exists().map_err(failure)? {
-        return Ok(None);
-    }
     mod_content::files(install).map_err(InstallError::validation)?;
-    let receipt: mod_content::Receipt =
-        mod_content::read_json(&directory.join(mod_content::RECEIPT))
-            .map_err(InstallError::validation)?;
-    let sources = receipt
-        .artifacts
-        .iter()
-        .filter(|a| a.path.ends_with(".pkg"))
-        .map(|a| {
-            let path = directory.join(&a.path);
-            let artifact = ArtifactMetadata {
+    let directories = mod_content::family_directories(install).map_err(InstallError::validation)?;
+    let mut family = BTreeMap::new();
+    let mut sources = Vec::new();
+    for (id, directory) in directories {
+        let receipt: mod_content::Receipt =
+            mod_content::read_json(&directory.join(mod_content::RECEIPT))
+                .map_err(InstallError::validation)?;
+        for artifact in &receipt.artifacts {
+            let path = directory.join(&artifact.path);
+            let metadata = ArtifactMetadata {
                 file_name: path.file_name().unwrap().to_string_lossy().into_owned(),
-                byte_length: a.byte_length,
-                sha256: a.sha256.clone(),
+                byte_length: artifact.byte_length,
+                sha256: artifact.sha256.to_ascii_uppercase(),
             };
-            (artifact, path)
-        })
-        .collect::<Vec<_>>();
-    validate_packages(target, &sources)?;
-    Ok(Some(snapshot_folder(&directory)?))
+            if artifact.path.ends_with(".pkg") {
+                sources.push((metadata, path));
+            } else {
+                verify_file(&path, &TransactionDigest::from(&metadata))?;
+            }
+        }
+        family.insert(id, snapshot_folder(&directory)?);
+    }
+    let packages = if sources.is_empty() {
+        Vec::new()
+    } else {
+        validate_packages(target, &sources, known)?
+    };
+    Ok((family, packages))
 }
 
 pub(super) fn artifacts(folder: &Folder) -> Vec<ArtifactMetadata> {
@@ -447,6 +459,14 @@ pub(super) fn snapshot_folder(folder: &Path) -> Result<Folder, InstallError> {
     )
     .map_err(InstallError::validation)?;
     let mut files = BTreeMap::new();
+    for (relative, path) in
+        mod_content::mission_script::files(folder).map_err(InstallError::validation)?
+    {
+        files.insert(
+            relative,
+            TransactionDigest::from(&digest_file(&path).map_err(failure)?),
+        );
+    }
     for entry in fs::read_dir(folder).map_err(failure)? {
         let entry = entry.map_err(failure)?;
         mod_content::checked_path(folder, &entry.path()).map_err(InstallError::validation)?;
@@ -454,8 +474,13 @@ pub(super) fn snapshot_folder(folder: &Path) -> Result<Folder, InstallError> {
             .file_name()
             .into_string()
             .map_err(|_| InstallError::validation("Non-Unicode mod filename"))?;
-        if matches!(name.as_str(), mod_content::MANIFEST | mod_content::RECEIPT)
-            && entry.file_type().map_err(failure)?.is_file()
+        if name == "scripts" && entry.file_type().map_err(failure)?.is_dir() {
+            // The bounded controller layout and every file were checked above.
+            continue;
+        } else if matches!(
+            name.as_str(),
+            mod_content::MANIFEST | mod_content::RECEIPT | mod_content::map_diagnostics::FILE_NAME
+        ) && entry.file_type().map_err(failure)?.is_file()
         {
             files.insert(
                 name,
@@ -508,7 +533,10 @@ pub(super) fn verify_folder(path: &Path, expected: Option<&Folder>) -> Result<()
     }
 }
 
-pub(super) fn verify_file(path: &Path, expected: &TransactionDigest) -> Result<(), InstallError> {
+pub(in crate::install) fn verify_file(
+    path: &Path,
+    expected: &TransactionDigest,
+) -> Result<(), InstallError> {
     reject_symlink(path, "managed package")?;
     if *expected != digest_file(path).map_err(failure)? {
         return Err(InstallError::validation(format!(

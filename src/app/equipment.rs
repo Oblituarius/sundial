@@ -34,8 +34,6 @@ pub(super) use document::{
     restore_class_armor_from_character, set_equipment_item_flags, set_equipment_item_level,
     set_equipment_item_plug, set_weapon_slot_empty,
 };
-#[cfg(test)]
-pub(super) use document::{inferred_item_level, materialize_authored_plugs};
 pub(super) use model::{
     EquipmentSlotCard, EquippedItemPlugs, EquippedItemSnapshot, EquippedPlugValue,
 };

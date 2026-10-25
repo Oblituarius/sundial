@@ -21,6 +21,29 @@ pub(super) fn installed_identities(
     generation_identities(target, target)
 }
 
+/// The installed authored item hashes, as the active runtime loads them. An installation whose
+/// packages carry no authored investment tables, such as one with only other mods or nothing
+/// installed, has none.
+pub(super) fn installed_item_hashes(target: &Path) -> Result<BTreeSet<u32>, String> {
+    let generation = Generation::loaded(target)?;
+    let result = (|| {
+        let globals = resolve_live_named_tag(&generation.manager, "investment_globals", None)?;
+        let profile = canonical_package(globals.pkg_id()).ok_or_else(|| {
+            format!("Ownership table {globals} is outside the recognized package chains")
+        })?;
+        if !generation
+            .directory
+            .join(profile.authored_file_name)
+            .try_exists()
+            .map_err(|e| e.to_string())?
+        {
+            return Ok(BTreeSet::new());
+        }
+        read_identities(&generation).map(|(hashes, _)| hashes)
+    })();
+    generation.finish(result)
+}
+
 /// Read an authored generation against the same installation's stock baseline.
 /// The staged set contains complete canonical overlays, not a second stock installation.
 pub(super) fn generation_identities(
@@ -66,6 +89,26 @@ impl Generation {
             .collect::<Vec<_>>();
         let view = crate::workflow::FilteredPackageView::create(target, &ignored)?;
         let manager = (|| {
+            let manifest_path = authored_directory.join(MANIFEST_FILE_NAME);
+            if manifest_path.is_file() {
+                let manifest: ManifestDocument = sundial::package_authoring::read_json(
+                    File::open(&manifest_path).map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?;
+                manifest.validate()?;
+                if !manifest.mods.is_empty() {
+                    for artifact in &manifest.artifacts {
+                        let path = crate::mod_family::source(
+                            &manifest.mods,
+                            authored_directory,
+                            target,
+                            &artifact.file_name,
+                        )?;
+                        view.add_overlay(&path)?;
+                    }
+                    return open_shadowkeep_package_manager(view.path());
+                }
+            }
             for profile in &profiles {
                 let path = authored_directory.join(profile.file_name);
                 if path.is_file() {
@@ -82,6 +125,28 @@ impl Generation {
             }),
             Err(error) => view.finish(Err(error), drop),
         }
+    }
+
+    /// The installation as the active runtime loads it. Dawn and Sunrise before 0.6 ignore
+    /// Parhelion's mod folder, so there it is stock `packages` with any Parhelion files in them,
+    /// whatever the folder holds. Installation and removal read [`Self::open`] instead, which
+    /// includes the folder on any runtime, since they replace or remove it wherever it is.
+    fn loaded(target: &Path) -> Result<Self, String> {
+        let install = target.parent().ok_or("Missing game root")?;
+        let runtime = sundial::package_authoring::installed_runtime(install)
+            .map_err(|error| error.to_string())?;
+        if runtime
+            .uses_mod_loader()
+            .map_err(|error| error.to_string())?
+        {
+            return Self::open(target, target);
+        }
+        super::validation::decoder::ensure_initialized(target)?;
+        Ok(Self {
+            manager: open_shadowkeep_package_manager(target)?,
+            directory: target.to_path_buf(),
+            view: None,
+        })
     }
 
     /// Releases the generation, removing its view, and returns what was read from it.

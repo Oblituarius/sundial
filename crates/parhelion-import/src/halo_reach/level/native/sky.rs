@@ -12,7 +12,7 @@ use crate::{
         choices,
         material::Material,
         model::{self, Primitive},
-        native_material::{
+        native::material::{
             SKY_RADIANCE,
             sky::{SkyScale, SkySurface, surfaces},
         },
@@ -37,7 +37,7 @@ use std::{
 /// first object, the entity model that reference names, whose first mesh carries each sky model's
 /// geometry, and that model's transparent and light-shaft materials, whose envelopes the sky
 /// surfaces copy.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize)]
 pub struct Templates {
     pub reference: u32,
     pub model: u32,
@@ -47,7 +47,7 @@ pub struct Templates {
 
 /// One sky object: its model reference by graph symbol, where it sits, the center of its bounds,
 /// its world bounds in meters and the order it draws in among the map's sky objects.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Object {
     pub reference: String,
     pub position: [f32; 3],
@@ -104,17 +104,6 @@ const CAMERA_FX_USE_DEFAULT: u16 = 1;
 const SCENE_AVERAGE: f32 = 0.18;
 /// Reach's screen brightness, in stops, where a scenario names no camera effects.
 const DEFAULT_BRIGHTNESS: f32 = -3.3;
-/// Lightmap lobes that may name a key light: the brightest tenth of lit texels, with a bandwidth
-/// byte of at least 191 (0.75).
-const KEY_QUANTILE: f64 = 0.9;
-const KEY_BANDWIDTH: u8 = 191;
-/// Degrees of azimuth and of elevation in a cell of the lobe direction histogram, and the half
-/// angle of the cone that gathers one light's lobes.
-const KEY_CELL: f64 = 3.;
-const KEY_CONE: f64 = 15.;
-/// A key light dominates when no cone three cones or more away gathers this share of its own. A
-/// low sun taken from a light that does not dominate casts long shadows the baked light lacks.
-const KEY_RIVAL: f64 = 0.3;
 
 /// One sky model's share of the sky: the primitives' triangles it draws, in order.
 struct Chunk {
@@ -257,6 +246,31 @@ fn exposure(cache: &Cache) -> Result<(f32, f32, Value)> {
     ))
 }
 
+/// Carry the authored camera target through the calibrated native radiance scale. Automatic
+/// exposure still belongs to Shadowkeep. This preserves relative source targets, rather than
+/// claiming to reproduce Reach's view-dependent luminance reduction and adaptation history.
+pub(super) fn radiance(cache: &Cache, level: Option<f32>) -> Result<(f32, Value)> {
+    let (shown, brightness, mut report) = exposure(cache)?;
+    // The existing native calibration used a source automatic target of 0.09 linear light.
+    const REFERENCE_BRIGHTNESS: f32 = 0.09;
+    let target = if report["automatic"].as_bool() == Some(false) {
+        level.unwrap_or(brightness / shown) * shown
+    } else {
+        brightness
+    };
+    let radiance = SKY_RADIANCE * target / REFERENCE_BRIGHTNESS;
+    ensure!(
+        radiance.is_finite() && radiance > 0.,
+        "Invalid translated camera radiance"
+    );
+    report["native_radiance"] = json!(radiance);
+    report["reference_brightness"] = json!(REFERENCE_BRIGHTNESS);
+    report["method"] = json!(
+        "Source camera target relative to the native calibration. Native exposure adaptation remains active."
+    );
+    Ok((radiance, report))
+}
+
 /// Adds the level's sky to `graph`: one native model and model reference for each chunk of the
 /// sky's triangles, each drawing its surfaces in the transparent and light-shaft stages with the
 /// materials `templates` lends their envelopes. `primitives` are the sky's, about the level's
@@ -291,7 +305,8 @@ pub(super) fn add(
         .flat_map(|(_, colors)| colors.iter().flatten())
         .fold(0f32, |largest, &value| largest.max(value));
     let vertex_color = largest.max(1e-6);
-    let (shown, brightness, exposure_report) = exposure(cache)?;
+    let (shown, brightness, _) = exposure(cache)?;
+    let (radiance, exposure_report) = radiance(cache, level)?;
     // The sky takes its Reach radiance over the average lit level, as the level surfaces do, at its
     // own scale. Without a lightmap, the average lit level is taken where Reach's automatic
     // exposure aims its average lit surface: the screen brightness over the exposure.
@@ -300,10 +315,11 @@ pub(super) fn add(
         .unwrap_or(brightness / shown);
     let scale = SkyScale {
         vertex_color,
-        radiance: SKY_RADIANCE / level,
+        radiance: radiance / level,
         white: 1. / shown,
     };
     let placeholder = Material {
+        decal: None,
         tag: None,
         options: BTreeMap::new(),
         properties: Vec::new(),
@@ -339,7 +355,9 @@ pub(super) fn add(
         [templates.surface, templates.shafts],
         scale,
     )?;
-    let template = native.tag(templates.model, Some(MODEL_CLASS))?;
+    let template = native
+        .tag(templates.model, Some(MODEL_CLASS))
+        .context("Sky model template")?;
     let row = *template
         .array(16, 136, Some(MESH_CLASS))?
         .first()
@@ -432,7 +450,7 @@ pub(super) fn add(
             "vertex_color_scale": vertex_color,
             "radiance_scale": scale.radiance,
             "white": scale.white,
-            "sky_radiance": SKY_RADIANCE,
+            "sky_radiance": radiance,
             "lit_level": level,
             "templates": {
                 "reference": format!("{:08X}", templates.reference),
@@ -526,7 +544,11 @@ fn add_streams(
         .enumerate()
     {
         let tag = template.u32(row + [0, 4, 16][stream])?;
-        let mut header = native.tag(tag, None)?.0.clone();
+        let mut header = native
+            .tag(tag, None)
+            .with_context(|| format!("Sky buffer {tag:08X}"))?
+            .0
+            .clone();
         put(
             &mut header,
             if stream == 2 { 8 } else { 0 },
@@ -676,7 +698,7 @@ fn sky_model(cache: &Cache, pages: &mut Pages, tag: &Tag) -> Result<Value> {
         .with_context(|| format!("Sky {}", tag.path))?;
     // Each section's flags, vertex type, PRT type and lighting policy, and the streams its vertex
     // buffer slots name, with the first vertices' bytes.
-    let geometry = model::Geometry::read(cache, render, render.address()? + 100, false)?;
+    let geometry = model::Geometry::read(cache, render, render.address()? + 100)?;
     let mut sections = Vec::new();
     for (index, &row) in geometry.sections.iter().enumerate() {
         let mut slots = Vec::new();
@@ -755,155 +777,6 @@ fn sky_model(cache: &Cache, pages: &mut Pages, tag: &Tag) -> Result<Value> {
     }))
 }
 
-/// The color of the level's bright, sharp baked lobes, the lobes that may name its key light (the
-/// brightest tenth of lit texels with a bandwidth of at least 0.75), weighted by luminance and
-/// normalized to its brightest channel. Hang 'Em High's is about (0.96, 0.92, 1), a pale lavender.
-/// `None` without lit texels.
-pub fn baked_light_color(atlas: &super::super::lightmap::Atlas) -> Option<[f32; 3]> {
-    // Lobe colors are stored as square roots of their share of the atlas' peak.
-    let share = |byte: u8| (f64::from(byte) / 255.).powi(2);
-    let lit = atlas
-        .lobe
-        .chunks_exact(4)
-        .map(|lobe| {
-            let color = [share(lobe[0]), share(lobe[1]), share(lobe[2])];
-            let luminance = 0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2];
-            (luminance, lobe[3], color)
-        })
-        .filter(|(luminance, ..)| *luminance > 0.)
-        .collect::<Vec<_>>();
-    let mut levels = lit
-        .iter()
-        .map(|(luminance, ..)| *luminance)
-        .collect::<Vec<_>>();
-    let rank = ((levels.len().checked_sub(1)?) as f64 * KEY_QUANTILE) as usize;
-    let cut = *levels.select_nth_unstable_by(rank, f64::total_cmp).1;
-    let mut sum = [0f64; 3];
-    for (luminance, bandwidth, color) in &lit {
-        if *luminance >= cut && *bandwidth >= KEY_BANDWIDTH {
-            for (total, value) in sum.iter_mut().zip(color) {
-                *total += value * luminance;
-            }
-        }
-    }
-    let peak = sum.iter().copied().fold(0f64, f64::max);
-    (peak > 0.).then(|| sum.map(|value| (value / peak) as f32))
-}
-
-/// The direction the level's baked light comes from, toward the light with z up. Reach bakes
-/// these levels' sun into the lightmap with every other light. The bright, sharp lobes are binned
-/// by direction, and the direction whose cone gathers the most of their luminance, refined to the
-/// cone's mean, is the key light. It stands when no cone three cones or more away gathers more than
-/// `KEY_RIVAL` of its luminance. Otherwise the light has no dominant direction, and the mean of
-/// every lit lobe, weighted by its luminance, stands. Breakneck's key light (22 degrees up, toward
-/// -y) is the two warm spot lights it places 190 and 780 world units away as a sun, and its rivals
-/// reach 0.08 to 0.14 of it. Sword Base's reach 0.41 to 0.71 and Hang 'Em High's 0.82 to 0.87,
-/// over three revisions of the atlas. Neutral texels have no lobe and weigh nothing. `None`
-/// without lit texels.
-pub fn baked_light_direction(atlas: &super::super::lightmap::Atlas) -> Option<[f32; 3]> {
-    fn normalized(v: [f64; 3]) -> Option<[f64; 3]> {
-        let length = v.iter().map(|x| x * x).sum::<f64>().sqrt();
-        (length > 1e-9).then(|| v.map(|x| x / length))
-    }
-    let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-    // Lobe colors are stored as square roots of their share of the atlas' peak.
-    let share = |byte: u8| (f64::from(byte) / 255.).powi(2);
-    let mut lit = Vec::new();
-    let mut broad = [0f64; 3];
-    for (lobe, direction) in atlas
-        .lobe
-        .chunks_exact(4)
-        .zip(atlas.direction.chunks_exact(4))
-    {
-        let luminance = 0.2126 * share(lobe[0]) + 0.7152 * share(lobe[1]) + 0.0722 * share(lobe[2]);
-        let Some(axis) = normalized(std::array::from_fn(|k| {
-            f64::from(direction[k]) / 255. * 2. - 1.
-        })) else {
-            continue;
-        };
-        if luminance <= 0. {
-            continue;
-        }
-        for (total, value) in broad.iter_mut().zip(axis) {
-            *total += value * luminance;
-        }
-        lit.push((luminance, lobe[3], axis));
-    }
-    let broad = normalized(broad)?;
-    let mut levels = lit
-        .iter()
-        .map(|(luminance, ..)| *luminance)
-        .collect::<Vec<_>>();
-    let rank = ((levels.len() - 1) as f64 * KEY_QUANTILE) as usize;
-    let cut = *levels.select_nth_unstable_by(rank, f64::total_cmp).1;
-    let rows = (180. / KEY_CELL) as usize;
-    let columns = (360. / KEY_CELL) as usize;
-    let mut cells = vec![(0f64, [0f64; 3]); rows * columns];
-    for &(luminance, bandwidth, axis) in &lit {
-        if luminance < cut || bandwidth < KEY_BANDWIDTH {
-            continue;
-        }
-        let elevation = axis[2].clamp(-1., 1.).asin().to_degrees();
-        let azimuth = axis[1].atan2(axis[0]).to_degrees();
-        let row = (((elevation + 90.) / KEY_CELL) as usize).min(rows - 1);
-        let column = (((azimuth + 180.) / KEY_CELL) as usize).min(columns - 1);
-        let cell = &mut cells[row * columns + column];
-        cell.0 += luminance;
-        for (total, value) in cell.1.iter_mut().zip(axis) {
-            *total += value * luminance;
-        }
-    }
-    let cells = cells
-        .into_iter()
-        .filter(|(weight, _)| *weight > 0.)
-        .filter_map(|(weight, sum)| Some((weight, sum, normalized(sum)?)))
-        .collect::<Vec<_>>();
-    let cone = KEY_CONE.to_radians().cos();
-    let scores = cells
-        .iter()
-        .map(|(_, _, a)| {
-            cells
-                .iter()
-                .filter(|(_, _, b)| dot(*a, *b) >= cone)
-                .map(|(weight, ..)| weight)
-                .sum::<f64>()
-        })
-        .collect::<Vec<_>>();
-    let Some((best, best_score)) = scores
-        .iter()
-        .copied()
-        .enumerate()
-        .max_by(|a, b| a.1.total_cmp(&b.1))
-    else {
-        return Some(broad.map(|v| v as f32));
-    };
-    let mut key = cells[best].2;
-    for _ in 0..3 {
-        let mut sum = [0f64; 3];
-        for (_, cell, axis) in &cells {
-            if dot(*axis, key) >= cone {
-                for (total, value) in sum.iter_mut().zip(cell) {
-                    *total += value;
-                }
-            }
-        }
-        key = normalized(sum).unwrap_or(key);
-    }
-    let apart = (3. * KEY_CONE).to_radians().cos();
-    let rival = cells
-        .iter()
-        .zip(&scores)
-        .filter(|((_, _, axis), _)| dot(*axis, key) < apart)
-        .map(|(_, score)| *score)
-        .fold(0f64, f64::max);
-    let chosen = if rival <= KEY_RIVAL * best_score {
-        key
-    } else {
-        broad
-    };
-    Some(chosen.map(|v| v as f32))
-}
-
 /// A report of `map`'s skies, its structure BSPs' default skies and lighting, and the sky, fog and
 /// lighting tags its scenario names. Positions are in meters.
 pub fn survey(maps: &Path, map: &str) -> Result<Value> {
@@ -932,7 +805,49 @@ pub fn survey(maps: &Path, map: &str) -> Result<Value> {
     }
     let mut bsps = Vec::new();
     for row in cache.block(scenario + SCENARIO_BSPS, SCENARIO_BSP_SIZE)? {
+        // Each cluster's bounds and the rows of its block at `+0x80`: two 16-bit values and a
+        // block of 16-byte rows whose first three floats read as points.
+        let clusters = match cache.reference(row, Some("sbsp"))? {
+            Some(bsp) => {
+                let at = bsp.address()?;
+                cache
+                    .block(at + 0x138, 0x8C)?
+                    .into_iter()
+                    .map(|cluster| {
+                        let entries = cache
+                            .block(cluster + 0x80, 0x10)?
+                            .into_iter()
+                            .map(|entry| {
+                                let points = cache
+                                    .block(entry + 4, 0x10)?
+                                    .into_iter()
+                                    .map(|point| {
+                                        Ok(json!([
+                                            cache.f32(point)?,
+                                            cache.f32(point + 4)?,
+                                            cache.f32(point + 8)?,
+                                            format!("{:08X}", cache.u32(point + 12)?)
+                                        ]))
+                                    })
+                                    .collect::<Result<Vec<_>>>()?;
+                                Ok(json!({
+                                    "a": cache.i16(entry)?,
+                                    "b": cache.i16(entry + 2)?,
+                                    "points": points,
+                                }))
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        Ok(json!({
+                            "bounds": cache.floats::<6>(cluster)?,
+                            "entries": entries,
+                        }))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+            None => Vec::new(),
+        };
         bsps.push(json!({
+            "clusters": clusters,
             "bsp": reference(&cache, row)?,
             "flags": format!("{:04X}", cache.u16(row + BSP_FLAGS)?),
             "default_sky": cache.i16(row + BSP_DEFAULT_SKY)?,
@@ -979,12 +894,74 @@ pub fn survey(maps: &Path, map: &str) -> Result<Value> {
         })
         .collect::<Result<Vec<_>>>()?;
     references.insert("camera_fx".to_owned(), Value::Array(camera_fx));
+    // Every atmosphere fog (`fogg`) and atmosphere globals (`atgf`) tag with its leading words, and
+    // the count of tags in each group.
+    let mut groups = BTreeMap::<String, usize>::new();
+    let mut fog = Vec::new();
+    // Every bitmap's images, each its width, height and mip count, by datum.
+    let mut bitmaps = serde_json::Map::new();
+    for tag in cache.tags.iter().flatten() {
+        if tag.group == "bitm"
+            && let Ok(at) = tag.address()
+            && let Ok(rows) = cache.block(at + 124, 56)
+        {
+            let images = rows
+                .iter()
+                .map(|&row| {
+                    Ok(json!([
+                        cache.u16(row)?,
+                        cache.u16(row + 2)?,
+                        cache.u8(row + 16)?,
+                        cache.i16(row + 8)?,
+                        cache.u8(row + 17)?,
+                        cache.u8(row + 6)?
+                    ]))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            bitmaps.insert(
+                format!("{:08X}", tag.datum),
+                json!({"path": tag.path, "images": images}),
+            );
+        }
+        *groups.entry(tag.group.clone()).or_default() += 1;
+        if ["fogg", "atgf"].contains(&tag.group.as_str()) {
+            fog.push(json!({
+                "group": tag.group,
+                "path": tag.path,
+                "header": match tag.address() {
+                    Ok(at) => words(&cache, at, 0x100).unwrap_or(Value::Null),
+                    Err(_) => Value::Null,
+                },
+            }));
+        }
+    }
+    // The scenario's player spawn points' count and bounds, in meters, or why there are none. A
+    // scenario without spawns still has a sky to report.
+    let spawns = match crate::halo_reach::level::spawn::read(&cache, None, 0) {
+        Ok(spawns) => {
+            let (low, high) = spawns.iter().fold(
+                ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]),
+                |(low, high), spawn| {
+                    (
+                        std::array::from_fn(|k| low[k].min(spawn.position[k])),
+                        std::array::from_fn(|k| high[k].max(spawn.position[k])),
+                    )
+                },
+            );
+            json!({"count": spawns.len(), "low": low, "high": high})
+        }
+        Err(error) => json!({"error": format!("{error:#}")}),
+    };
     Ok(json!({
         "map": map,
         "metres_per_unit": METRES_PER_UNIT,
         "skies": skies,
         "bsps": bsps,
         "references": references,
+        "groups": groups,
+        "fog": fog,
+        "bitmaps": bitmaps,
+        "spawns": spawns,
     }))
 }
 

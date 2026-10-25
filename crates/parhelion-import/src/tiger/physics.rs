@@ -1,14 +1,15 @@
 //! Shadowkeep Havok 2012.2 packfiles containing convex collision compounds, compressed triangle
-//! meshes or the static compound of a world's collision.
+//! meshes, the static compound of a world's collision, or a cloth solver.
 use super::payload::Payload;
 use crate::presentation::put;
 use anyhow::{Context, Result, ensure};
 use std::collections::BTreeMap;
 
+pub mod cloth;
 mod compound;
 mod mesh;
 pub(crate) use compound::{Instance, static_compound};
-pub(crate) use mesh::{bare_mesh, compressed_mesh};
+pub(crate) use mesh::bare_mesh;
 
 pub(crate) struct Hull {
     pub vertices: Vec<[f32; 3]>,
@@ -79,6 +80,11 @@ impl Hull {
         }
         Ok((minimum, maximum))
     }
+}
+
+/// Whether `bytes` is a native Havok 2012.2 packfile whose first object is of class `root`.
+pub(crate) fn rooted(bytes: &[u8], root: &str) -> bool {
+    Template::read(bytes, root).is_ok()
 }
 
 struct Template {
@@ -533,9 +539,9 @@ fn list(
 /// prisms in a list shape and more in a static compound.
 const LIST_PRISMS: usize = 3;
 
-/// A kill volume packfile: a shape array whose entries each hold one volume's convex prisms, in
+/// A volume packfile: a shape array whose entries each hold one volume's convex prisms, in
 /// a list shape for up to three and a static compound of them beyond, as stock Crucible volume
-/// packfiles do. `template` is a stock volume packfile, whose class names cover all four classes.
+/// packfiles do. The stock template must cover the shape classes actually emitted.
 pub(crate) fn volume_shapes(template: &[u8], volumes: &[Vec<Hull>]) -> Result<Vec<u8>> {
     ensure!(
         !volumes.is_empty()
@@ -547,7 +553,6 @@ pub(crate) fn volume_shapes(template: &[u8], volumes: &[Vec<Hull>]) -> Result<Ve
     let root = template.object("s_hkpShape_array_data", 16)?;
     let convex_template = template.object("hkpConvexVerticesShape", 128)?;
     let list_shape = template.object("hkpListShape", 144)?;
-    let compound_shape = template.object("hkpStaticCompoundShape", compound::SHAPE_SIZE)?;
     let mut w = Writer {
         data: Vec::new(),
         local: Vec::new(),
@@ -570,6 +575,7 @@ pub(crate) fn volume_shapes(template: &[u8], volumes: &[Vec<Hull>]) -> Result<Ve
         let shape = if hulls.len() <= LIST_PRISMS {
             list(&mut w, &list_shape, &shapes, &bounds)?
         } else {
+            let compound_shape = template.object("hkpStaticCompoundShape", compound::SHAPE_SIZE)?;
             compound::convex_compound(&mut w, &compound_shape, &shapes, &bounds)?
         };
         w.references

@@ -4,8 +4,16 @@
 use super::*;
 mod view;
 use crate::install::{
-    RecoveryRequest, UpgradeReview, preview_upgrade, recover_interrupted_install,
+    RecoveryRequest, UPGRADE_REVIEW_STEPS, UpgradeReview, preview_upgrade_with_progress,
+    recover_interrupted_install,
 };
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// The steps a recovery runs before the review's own, as Parhelion shows them.
+const RECOVERY_STEPS: [&str; 2] = [
+    "Waiting for model previews to finish reading packages…",
+    "Recovering the interrupted package operation…",
+];
 
 #[derive(Default)]
 pub(super) struct UpgradeUi {
@@ -14,8 +22,12 @@ pub(super) struct UpgradeUi {
     automatic: bool,
     recovering: bool,
     review: Option<Receiver<Result<Option<UpgradeReview>, String>>>,
+    /// The step the worker has reached, counting recovery's steps before the review's.
+    step: Arc<AtomicUsize>,
     plan: Option<UpgradeReview>,
     error: Option<String>,
+    /// Build & Stage chosen in the review, held until the catalog the build reads has loaded.
+    build: bool,
 }
 
 impl UpgradeUi {
@@ -25,6 +37,24 @@ impl UpgradeUi {
     pub(super) fn request(&mut self) {
         self.requested = true;
         self.automatic = true;
+    }
+
+    /// What the worker is doing, then how many of this check's steps it has finished and how
+    /// many there are.
+    pub(super) fn progress(&self) -> (&'static str, usize, usize) {
+        let first = if self.recovering {
+            0
+        } else {
+            RECOVERY_STEPS.len()
+        };
+        let last = RECOVERY_STEPS.len() + UPGRADE_REVIEW_STEPS.len() - 1;
+        let step = self.step.load(Ordering::Relaxed).clamp(first, last);
+        let message = RECOVERY_STEPS
+            .get(step)
+            .or_else(|| UPGRADE_REVIEW_STEPS.get(step - RECOVERY_STEPS.len()))
+            .copied()
+            .unwrap_or_default();
+        (message, step - first, last + 1 - first)
     }
 }
 
@@ -45,11 +75,14 @@ impl PackageAuthoringApp {
             self.reset_catalog_load();
         }
         let (sender, receiver) = mpsc::channel();
+        let first = if recover { 0 } else { RECOVERY_STEPS.len() };
+        let step = Arc::new(AtomicUsize::new(first));
         self.upgrade = UpgradeUi {
             open: !automatic,
             automatic,
             recovering: recover,
             review: Some(receiver),
+            step: Arc::clone(&step),
             ..Default::default()
         };
         thread::spawn(move || {
@@ -60,6 +93,7 @@ impl PackageAuthoringApp {
                     ) {
                         return Err(super::jobs::PREVIEW_READ_BUSY.into());
                     }
+                    step.store(1, Ordering::Relaxed);
                     recover_interrupted_install(&RecoveryRequest {
                         target_packages_directory: packages.clone(),
                         backup_root,
@@ -68,7 +102,10 @@ impl PackageAuthoringApp {
                     })
                     .map_err(|e| e.to_string())?;
                 }
-                preview_upgrade(&packages).map_err(|e| e.to_string())
+                preview_upgrade_with_progress(&packages, &mut |index| {
+                    step.store(RECOVERY_STEPS.len() + index, Ordering::Relaxed);
+                })
+                .map_err(|e| e.to_string())
             })();
             let _ = sender.send(result);
         });
@@ -102,12 +139,63 @@ impl PackageAuthoringApp {
         match view::show(ctx, &self.upgrade, &self.backup_root) {
             view::Action::None => {}
             view::Action::Build => {
+                // The open review holds back the catalog a build reads, so on a fresh open the
+                // build waits for it to load rather than starting now and stopping without it.
                 self.upgrade.open = false;
-                self.start_build_checked(ctx);
+                self.upgrade.build = true;
+                if self.build_ready().is_err() {
+                    self.log.push(LogEntry::info(
+                        "Build & Stage starts once the weapon catalog loads",
+                    ));
+                }
             }
+            view::Action::Restore => self.start_restore(),
             view::Action::Review => self.start_upgrade_review(false),
             view::Action::Recover => self.start_upgrade_review(true),
             view::Action::Close => self.upgrade.open = false,
+        }
+    }
+
+    /// Starts the Build & Stage chosen in the review once the catalog has finished loading, or
+    /// blocks it with the reason when the load ended without a catalog.
+    pub(super) fn start_upgrade_build(&mut self, ctx: &egui::Context) {
+        if !std::mem::take(&mut self.upgrade.build) {
+            return;
+        }
+        if self.catalog.is_some() {
+            self.start_build_checked(ctx);
+        } else {
+            self.block_build("The weapon catalog did not load. Reload it, then build again".into());
+        }
+    }
+}
+
+impl PackageAuthoringApp {
+    /// Opens the installation review for the build kept for this runtime, in place of a new
+    /// build. The install it leads to is an ordinary one.
+    fn start_restore(&mut self) {
+        if self.build_receiver.is_some() || self.install_receiver.is_some() {
+            self.log.push(LogEntry::error(
+                "Wait for the build or install to finish before restoring",
+            ));
+            return;
+        }
+        let Some(kept) = self.upgrade.plan.as_ref().and_then(|plan| plan.kept()) else {
+            return;
+        };
+        match BuildReport::kept(&kept.run_directory) {
+            Ok(report) => {
+                self.upgrade.open = false;
+                self.restore = Some(report);
+                self.build_status_open = true;
+                self.build_dialog_step = BuildDialogStep::ReviewInstall;
+                self.start_replacement_review();
+            }
+            Err(error) => {
+                self.upgrade.error = Some(format!(
+                    "The kept build can't be read: {error}. Build & Stage instead."
+                ));
+            }
         }
     }
 }

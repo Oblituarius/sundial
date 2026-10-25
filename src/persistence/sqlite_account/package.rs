@@ -69,6 +69,22 @@ pub(crate) fn preview_replacement(
     let mut source = open(path, false)?;
     let tx = source.transaction().map_err(err)?;
     validate(&tx)?;
+    if super::Schema::read(&tx).map_err(err)? == super::Schema::V3 {
+        for hash in hashes {
+            let referenced: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM starter_items WHERE definition_hash=?)",
+                    [i64::from(*hash)],
+                    |row| row.get(0),
+                )
+                .map_err(err)?;
+            if referenced {
+                return Err(format!(
+                    "Cannot remove definition 0x{hash:08X} because starter_items still references it. Update the starter loadout in Sunrise before removing this content"
+                ));
+            }
+        }
+    }
     let original_bytes = capture(&tx)?;
     let mut staged = Connection::open_in_memory().map_err(err)?;
     rusqlite::backup::Backup::new(&tx, &mut staged)
@@ -89,6 +105,7 @@ pub(crate) fn preview_replacement(
         resized_items: BTreeMap::new(),
         slot_moves: vec![],
     };
+    report.cleared_plugs += fall_back(&staged, hashes, changes)?;
     for hash in hashes {
         report.cleared_plugs += staged
             .execute("DELETE FROM sockets WHERE plug_hash=?", [i64::from(*hash)])
@@ -157,6 +174,48 @@ pub(crate) fn preview_replacement(
     validate(&staged)?;
     report.cleaned_bytes = capture(&staged)?;
     Ok(report)
+}
+/// Replaces each saved plug the replacement removes from an item whose layout changed with its
+/// lane's incoming default, and returns how many it replaced. Deleting the row instead would
+/// leave the socket empty, which hides it in game. Removed plugs on other items are deleted after.
+fn fall_back(
+    db: &Connection,
+    removed: &BTreeSet<u32>,
+    changes: &[AuthoredSocketChange],
+) -> Result<usize, String> {
+    let mut replaced = 0;
+    for change in changes {
+        let rows = db
+            .prepare(
+                "SELECT s.instance_soid,s.lane,s.plug_hash FROM sockets s JOIN items i \
+                 ON i.instance_soid=s.instance_soid WHERE i.definition_hash=? AND i.socket_policy=1",
+            )
+            .map_err(err)?
+            .query_map([i64::from(change.definition_hash)], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, usize>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(err)?;
+        for (soid, lane, plug) in rows {
+            if !u32::try_from(plug).is_ok_and(|plug| removed.contains(&plug)) {
+                continue;
+            }
+            if let Some(default) = change.fallback(lane) {
+                replaced += db
+                    .execute(
+                        "UPDATE sockets SET plug_hash=? WHERE instance_soid=? AND lane=?",
+                        params![default, soid, lane],
+                    )
+                    .map_err(err)?;
+            }
+        }
+    }
+    Ok(replaced)
 }
 fn resize(
     db: &Connection,

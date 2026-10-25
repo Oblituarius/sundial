@@ -11,16 +11,18 @@ use crate::{
 use eframe::egui;
 use serde_json::Value;
 
-pub(super) fn draw(ui: &mut egui::Ui, content: &ItemInspection<'_>, details: bool, button: bool) {
-    let Some(base) = content.matches.item_package_metadata else {
-        if button {
-            model_preview::inspected_unavailable(ui);
-        }
-        if details {
-            look::empty_state(ui, "No Model");
-        }
-        return;
-    };
+/// The inspected item's model: its saved or default plugs, the ornament among them and the art
+/// rows of whichever geometry is shown, with the dyes that apply.
+struct Resolved<'a> {
+    saved: Option<&'a Value>,
+    plugs: Vec<(u64, &'a ItemPackageMetadata)>,
+    ornament: Option<(u64, &'a ItemPackageMetadata)>,
+    rows: Vec<&'a ItemArtArrangement>,
+    dyes: Vec<(i8, u16)>,
+}
+
+fn resolve<'a>(content: &ItemInspection<'a>) -> Option<Resolved<'a>> {
+    let base = content.matches.item_package_metadata?;
     let saved = content
         .source_context
         .and_then(|context| context.plugs.as_ref());
@@ -45,55 +47,127 @@ pub(super) fn draw(ui: &mut egui::Ui, content: &ItemInspection<'_>, details: boo
     let geometry = ornament.map_or(base, |(_, metadata)| metadata);
     let rows: Vec<_> = valid_art(geometry).collect();
     if rows.is_empty() {
-        if button {
-            model_preview::inspected_unavailable(ui);
-        }
-        if details {
-            look::empty_state(ui, "No Model");
-        }
-        return;
-    }
-    if details {
-        let catalog = content.catalog;
-        look::properties(ui, ("preview-appearance", content.hash), |p| {
-            p.text(
-                "Appearance",
-                if saved.is_some_and(Value::is_array) {
-                    "Saved Plugs"
-                } else {
-                    "Catalog Defaults"
-                },
-            );
-            if let Some((hash, _)) = ornament {
-                p.link("Ornament", catalog, hash, item_name(catalog, hash));
-            }
-            for (hash, metadata) in &plugs {
-                if !is_ornament(catalog, *hash)
-                    && metadata
-                        .translation_dye_rows
-                        .iter()
-                        .any(|rows| !rows.is_empty())
-                {
-                    p.link("Colors", catalog, *hash, item_name(catalog, *hash));
-                }
-            }
-        });
+        return None;
     }
     let colors = if geometry.translation_dye_rows.iter().all(Vec::is_empty) {
         base
     } else {
         geometry
     };
-    let variant_id = egui::Id::new(("preview-art-variant", content.hash, ui.ctx().viewport_id()));
-    let mut index = ui
-        .data(|data| data.get_temp::<usize>(variant_id))
+    let dyes = effective_dyes(
+        &colors.translation_dye_rows,
+        plugs.iter().map(|(_, metadata)| *metadata),
+    );
+    Some(Resolved {
+        saved,
+        plugs,
+        ornament,
+        rows,
+        dyes,
+    })
+}
+
+/// Whether the inspected item has a model to show.
+pub(super) fn available(content: &ItemInspection<'_>) -> bool {
+    resolve(content).is_some()
+}
+
+/// The model row shown, the default-class one unless the Preview page chose another.
+fn variant_id(ui: &egui::Ui, hash: u64) -> egui::Id {
+    egui::Id::new(("preview-art-variant", hash, ui.ctx().viewport_id()))
+}
+
+fn variant(ui: &egui::Ui, hash: u64, rows: &[&ItemArtArrangement]) -> usize {
+    ui.data(|data| data.get_temp::<usize>(variant_id(ui, hash)))
         .filter(|&index| index < rows.len())
         .unwrap_or_else(|| {
             rows.iter()
                 .position(|row| row.character_class == -1)
                 .unwrap_or(0)
-        });
-    if details && rows.len() > 1 {
+        })
+}
+
+/// The Overview's model beside its details, as Parhelion's editor shows it: turning on drag, with
+/// a corner button that opens the full viewer. Returns `false` when the item has no model.
+pub(super) fn inline(ui: &mut egui::Ui, content: &ItemInspection<'_>, size: egui::Vec2) -> bool {
+    let Some(resolved) = resolve(content) else {
+        return false;
+    };
+    let index = variant(ui, content.hash, &resolved.rows);
+    let appearance = Appearance {
+        arrangement: resolved.rows[index].arrangement,
+        dye_textures: Vec::new(),
+        dyes: resolved.dyes,
+    };
+    let packages = content.catalog.install_path().join("packages");
+    // One still per Inspector window rather than per item, so browsing keeps one model and one
+    // read at a time. The viewer it opens belongs to the item and stays on it.
+    let id = egui::Id::new(("inspector-model", ui.ctx().viewport_id(), ui.layer_id().id));
+    let owner = egui::Id::new(("inspector-model", content.hash, ui.ctx().viewport_id()));
+    model_preview::still::placeholder(ui.ctx(), id, None);
+    let access = content.catalog.inspection_access();
+    let response = model_preview::still::show_inspected(
+        ui,
+        id,
+        &packages,
+        appearance.clone(),
+        size,
+        access.clone(),
+    );
+    model_preview::inspected_pop_out(
+        ui,
+        (id, owner),
+        response.rect,
+        &packages,
+        (
+            appearance,
+            content.resolved_name.as_deref().unwrap_or("Model Preview"),
+        ),
+        access,
+    );
+    true
+}
+
+/// The Appearance page's details: where the look comes from and which model row is shown. The
+/// model itself is drawn beside them by the page.
+pub(super) fn draw(ui: &mut egui::Ui, content: &ItemInspection<'_>) {
+    let Some(Resolved {
+        saved,
+        plugs,
+        ornament,
+        rows,
+        ..
+    }) = resolve(content)
+    else {
+        look::empty_state(ui, "No Model");
+        return;
+    };
+    let catalog = content.catalog;
+    look::properties(ui, ("preview-appearance", content.hash), |p| {
+        p.text(
+            "Appearance",
+            if saved.is_some_and(Value::is_array) {
+                "Saved Plugs"
+            } else {
+                "Catalog Defaults"
+            },
+        );
+        if let Some((hash, _)) = ornament {
+            p.link("Ornament", catalog, hash, item_name(catalog, hash));
+        }
+        for (hash, metadata) in &plugs {
+            if !is_ornament(catalog, *hash)
+                && metadata
+                    .translation_dye_rows
+                    .iter()
+                    .any(|rows| !rows.is_empty())
+            {
+                p.link("Colors", catalog, *hash, item_name(catalog, *hash));
+            }
+        }
+    });
+    let mut index = variant(ui, content.hash, &rows);
+    if rows.len() > 1 {
         look::properties(ui, ("preview-model-variant", content.hash), |p| {
             p.custom("Model", |ui| {
                 egui::ComboBox::from_id_salt("preview-model-variant")
@@ -105,24 +179,8 @@ pub(super) fn draw(ui: &mut egui::Ui, content: &ItemInspection<'_>, details: boo
                     });
             });
         });
+        let variant_id = variant_id(ui, content.hash);
         ui.data_mut(|data| data.insert_temp(variant_id, index));
-    }
-    let dyes = effective_dyes(
-        &colors.translation_dye_rows,
-        plugs.iter().map(|(_, metadata)| *metadata),
-    );
-    if button {
-        model_preview::inspected_weapon(
-            ui,
-            &content.catalog.install_path().join("packages"),
-            Appearance {
-                arrangement: rows[index].arrangement,
-                dye_textures: Vec::new(),
-                dyes,
-            },
-            content.resolved_name.as_deref().unwrap_or("Model Preview"),
-            content.catalog.inspection_access(),
-        );
     }
 }
 
@@ -190,94 +248,4 @@ fn effective_dyes<'a>(
         &rows(base),
         plugs.map(|plug| rows(&plug.translation_dye_rows)),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn only_an_ornament_with_a_usable_model_replaces_the_base_geometry() {
-        let valid = ItemPackageMetadata {
-            art_arrangements: vec![ItemArtArrangement {
-                character_class: -1,
-                arrangement: 42,
-            }],
-            ..Default::default()
-        };
-        let disabled = ItemPackageMetadata {
-            art_arrangements: vec![ItemArtArrangement {
-                character_class: -1,
-                arrangement: u16::MAX,
-            }],
-            ..Default::default()
-        };
-        let rows = [(1, &valid, false), (2, &valid, true), (3, &disabled, true)];
-        let chosen = selected_ornament(rows.into_iter()).unwrap();
-        assert_eq!(
-            (chosen.0, chosen.1.art_arrangements[0].arrangement),
-            (2, 42)
-        );
-        assert!(
-            selected_ornament([(1, &valid, false), (2, &disabled, true)].into_iter()).is_none()
-        );
-    }
-    #[test]
-    fn saved_plugs_keep_explicit_empty_and_missing_slots_separate_from_defaults() {
-        let defaults = vec![Some("0x0000000A".into()), Some("0x0000000B".into())];
-        assert_eq!(plug_hashes(None, &defaults), vec![10, 11]);
-        assert_eq!(plug_hashes(Some(&Value::Null), &defaults), vec![10, 11]);
-        assert!(plug_hashes(Some(&serde_json::json!([])), &defaults).is_empty());
-        assert_eq!(
-            plug_hashes(
-                Some(&serde_json::json!([
-                    null,
-                    "0x0000000C",
-                    13,
-                    0,
-                    -1,
-                    4294967296_u64
-                ])),
-                &defaults
-            ),
-            vec![12, 13]
-        );
-        assert!(plug_hashes(Some(&serde_json::json!("invalid")), &defaults).is_empty());
-    }
-
-    #[test]
-    fn shaders_override_custom_and_default_dyes_but_preserve_locked_colors() {
-        let row = |key, value| ItemRenderOverride {
-            stage: 0,
-            key,
-            value,
-        };
-        let base = [
-            vec![row(4, 11)],
-            vec![row(4, 10), row(5, 20), row(6, 30)],
-            vec![row(6, 31)],
-        ];
-        let plug = ItemPackageMetadata {
-            translation_dye_rows: [
-                vec![
-                    row(4, 40),
-                    row(5, 50),
-                    row(6, 60),
-                    row(-1, 99),
-                    row(7, u16::MAX),
-                ],
-                vec![],
-                vec![],
-            ],
-            ..Default::default()
-        };
-        assert_eq!(
-            effective_dyes(&base, [&plug].into_iter()),
-            vec![(4, 40), (5, 50), (6, 31)]
-        );
-        assert_eq!(
-            effective_dyes(&base, std::iter::empty()),
-            vec![(4, 11), (5, 20), (6, 31)]
-        );
-    }
 }

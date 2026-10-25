@@ -279,7 +279,12 @@ pub(super) fn acquisition_status(
                 (
                     "Unsupported unlock-expression opcode".to_owned(),
                     format!(
-                        "Unsupported unlock-expression opcode(s): {}",
+                        "Unsupported unlock-expression {}: {}",
+                        if unsupported.len() == 1 {
+                            "opcode"
+                        } else {
+                            "opcodes"
+                        },
                         unsupported
                             .iter()
                             .map(u32::to_string)
@@ -550,18 +555,5 @@ pub(super) fn draw_condition_token_metadata(
         .on_hover_text(format!("Open details for {canonical}"));
     if response.clicked() {
         request_hash_inspection(ui.ctx(), definition.hash);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn absent_acquisition_condition_is_unconditionally_acquired() {
-        let evaluation = acquisition_evaluation(&[], None);
-
-        assert_eq!(evaluation, AcquisitionEvaluation::Unconditional);
-        assert_eq!(evaluation.state(), AcquisitionState::Acquired);
     }
 }

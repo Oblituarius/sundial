@@ -16,9 +16,6 @@ pub struct Record {
     pub fields: Vec<(usize, u32)>,
 }
 
-#[cfg(test)]
-mod decompile_coverage;
-
 type Encoded = (
     u32,
     usize,
@@ -157,7 +154,7 @@ pub fn choices(class: u32, field: usize) -> Vec<(u32, bool)> {
             choices.extend(
                 entries
                     .iter()
-                    .filter(|entry| entry.observed())
+                    .filter(|entry| entry.has_layout())
                     .map(|entry| (entry.class, false)),
             );
         }

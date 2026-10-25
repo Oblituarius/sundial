@@ -192,14 +192,16 @@ fn compile_canonical(
     let mut sources = progress.step("Loading Source Tables", || {
         sources::load_project_sources(package_directory)
     })?;
-    let mut maps = progress.step("Planning Maps", || {
-        crate::map::Plan::load(
-            package_directory,
-            &sources.manager,
-            maps.to_vec(),
-            LOCALIZATION_DONOR_STRING_HASHES[1],
-        )
-    })?;
+    progress.start("Planning Maps");
+    let mut maps = crate::map::Plan::load(
+        package_directory,
+        &sources.manager,
+        maps.to_vec(),
+        LOCALIZATION_DONOR_STRING_HASHES[1],
+        &mut |label| progress.start(label),
+    )
+    .map_err(|error| error.context("Planning Maps"))?;
+    progress.finish("Planning Maps");
     // Sunrise groups subclasses in threes by item index, so the items take their indices with
     // the subclasses grouped by class, and the plans return in the recipes' own order.
     let order = resolve::subclass_order(&sources, weapons)?;
@@ -235,8 +237,9 @@ fn compile_canonical(
             .cloned()
             .collect::<Vec<_>>();
         // A plug offered everywhere joins the shared plug sets that offer its type's plug, as
-        // every mod is.
-        let plug_sets = super::plug_sets::plan(&sources, &resolved, &plugs)?;
+        // every mod is. A socket that rolls from its own choices gets a set of them, which its
+        // resolved column then names.
+        let plug_sets = super::plug_sets::plan(&sources, &mut resolved, &plugs)?;
         let mut planner = custom_plugs::RecordPlanner::new(&sources, &resolved, &plugs)?;
         let entries = resolved
             .iter()
@@ -270,11 +273,13 @@ fn compile_canonical(
         )
         .filter_map(|perk| perk.program.as_ref())
         .filter(|program| {
-            program.assets().any(|asset| asset.hud_status.is_some())
-                || program
-                    .auxiliary
-                    .iter()
-                    .any(|record| record.hud_status.is_some())
+            program.owned_programs().any(|program| {
+                program.assets().any(|asset| asset.hud_status.is_some())
+                    || program
+                        .auxiliary
+                        .iter()
+                        .any(|record| record.hud_status.is_some())
+            })
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -470,6 +475,8 @@ fn compile_canonical(
                 }),
             &runtime.impacts,
             &rows,
+            runtime.private_perk_allocator,
+            &mut runtime.private_perk_tags,
         )?;
         // The build's own copies of ability entities follow their banks' moves too.
         crate::ability::banks::retarget_new_tags(
@@ -515,9 +522,11 @@ fn compile_canonical(
         runtime,
         maps,
     };
+    let mut linking = assembly::Timings::default();
     let (emission, manager) = progress.step("Linking Package Data", || {
-        assembly::prepare(sources, output)
+        assembly::prepare(sources, output, &mut linking)
     })?;
+    progress.diagnostic(linking.diagnostic());
     let mut bundle =
         emission::emit_packages(package_directory, manager, emission, weapons, progress)?;
     let plug_plan =

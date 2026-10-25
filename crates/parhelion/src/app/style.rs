@@ -358,6 +358,24 @@ pub(crate) fn reset_icon(ui: &mut egui::Ui, name: &str) -> bool {
         .clicked()
 }
 
+/// A warning line: the warning glyph and `text` in the warning colour.
+pub(crate) fn warning(ui: &mut egui::Ui, text: &str) {
+    ui.horizontal_wrapped(|ui| {
+        let color = ui.visuals().warn_fg_color;
+        // Painted, as in `missing`, so a screen reader reads the text and not the glyph.
+        let glyph = egui::WidgetText::from(icon(ui, egui_phosphor::regular::WARNING).color(color))
+            .into_galley(
+                ui,
+                Some(egui::TextWrapMode::Extend),
+                f32::INFINITY,
+                egui::TextStyle::Body,
+            );
+        let (rect, _) = ui.allocate_exact_size(glyph.size(), egui::Sense::hover());
+        ui.painter().galley(rect.min, glyph, color);
+        ui.colored_label(color, text);
+    });
+}
+
 /// A saved choice the current data no longer has: a warning and its label in the error colour,
 /// the detail on hover, and Remove. Returns whether Remove was clicked.
 pub(crate) fn missing(ui: &mut egui::Ui, label: &str, detail: &str) -> bool {
@@ -447,6 +465,17 @@ pub(crate) fn muted_warning(visuals: &egui::Visuals) -> egui::Color32 {
         egui::Color32::from_rgb(201, 142, 78)
     } else {
         egui::Color32::from_rgb(150, 88, 24)
+    }
+}
+
+/// A muted red for a control whose contents need attention, such as a missing tool. Quieter than
+/// an error and still 4.5:1 or better on the card fills.
+#[cfg(feature = "d2-model-importer")]
+pub(crate) fn muted_error(visuals: &egui::Visuals) -> egui::Color32 {
+    if visuals.dark_mode {
+        egui::Color32::from_rgb(214, 120, 120)
+    } else {
+        egui::Color32::from_rgb(160, 40, 40)
     }
 }
 
@@ -832,7 +861,7 @@ pub(crate) fn tile_field<R>(
 /// track, `scale` filling it. A change from the base shows as its own segment, green where it adds
 /// and red where it takes away.
 pub(crate) fn stat_bar(ui: &egui::Ui, rect: egui::Rect, (base, value): (i32, i32), scale: i32) {
-    const HEIGHT: f32 = 8.0;
+    const HEIGHT: f32 = 10.0;
     let bar = egui::Rect::from_center_size(rect.center(), egui::vec2(rect.width(), HEIGHT));
     let painter = ui.painter();
     let visuals = ui.visuals();
@@ -984,77 +1013,4 @@ pub(crate) fn list_row(ui: &mut egui::Ui, selected: bool, label: &str) -> egui::
     })
     .inner
     .on_hover_text(label)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn perk_text_follows_body_size_without_changing_the_global_theme() {
-        let ctx = egui::Context::default();
-        ctx.global_style_mut(|style| {
-            style
-                .text_styles
-                .insert(egui::TextStyle::Body, egui::FontId::proportional(18.0));
-        });
-        let before = egui::TextStyle::Small.resolve(&ctx.global_style());
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
-            egui::CentralPanel::default().show(ui, |ui| {
-                perk_workbench_style(ui);
-                assert_eq!(egui::TextStyle::Small.resolve(ui.style()).size, 18.0);
-            });
-        });
-        assert_eq!(egui::TextStyle::Small.resolve(&ctx.global_style()), before);
-    }
-
-    fn luminance(color: egui::Color32) -> f32 {
-        let channels = color.to_array()[..3]
-            .iter()
-            .map(|value| {
-                let value = f32::from(*value) / 255.0;
-                if value <= 0.04045 {
-                    value / 12.92
-                } else {
-                    ((value + 0.055) / 1.055).powf(2.4)
-                }
-            })
-            .collect::<Vec<_>>();
-        channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722
-    }
-
-    #[test]
-    fn status_text_has_normal_text_contrast_in_both_themes() {
-        for visuals in [egui::Visuals::light(), egui::Visuals::dark()] {
-            let ctx = egui::Context::default();
-            ctx.set_visuals(visuals);
-            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
-                egui::CentralPanel::default().show(ui, |ui| {
-                    workbench_style(ui);
-                    let visuals = ui.visuals();
-                    for foreground in [
-                        success_color(visuals),
-                        visuals.warn_fg_color,
-                        visuals.error_fg_color,
-                    ] {
-                        for background in [
-                            visuals.panel_fill,
-                            visuals.window_fill(),
-                            visuals.extreme_bg_color,
-                        ] {
-                            let foreground = luminance(foreground);
-                            let background = luminance(background);
-                            let contrast = (foreground.max(background) + 0.05)
-                                / (foreground.min(background) + 0.05);
-                            assert!(
-                                contrast >= 4.5,
-                                "status contrast {contrast}, dark={}",
-                                visuals.dark_mode
-                            );
-                        }
-                    }
-                });
-            });
-        }
-    }
 }

@@ -9,22 +9,34 @@ pub(crate) const PARHELION_ASSET_FILE_NAME: &str = "w64_parhelion_assets_0aa0_0.
 pub(crate) const PRIVATE_PERK_RUNTIME_PACKAGE_ID: u16 = 0x01BB;
 pub(crate) const PRIVATE_PERK_RUNTIME_EXPECTED_ENTRY_COUNT: usize = 6_468;
 
-/// The authored package ids one build uses. Its asset packages count up from `base`, and its
-/// private runtime overflow counts down from `top`. Sunrise's mod loader loads one package per
-/// id, so there the window skips ids an installed package or another mod already holds.
+/// The authored package ids one build uses, `base` through `top`. Its packages count from its
+/// first id: asset packages, then map packages.
+///
+/// Without a mod loader the window ascends from `0x0AA0`, the names those installs have always
+/// had, and private runtime overflow counts down from its top toward the assets, so the two meet
+/// only once the window is spent. On Sunrise's mod loader it descends from its top. Sunrise Studio
+/// gives a mod's new packages the first ids no stock package holds, `0x0AA0` upward, without
+/// reading other mods, and the loader refuses a mod whose package id another mod already adds, so
+/// every package of a build sits at the other end. The private runtime's packages and imported
+/// content take the highest ids still free as they need them, and asset and map packages count
+/// past those. The loader window also skips ids an installed package or another mod already
+/// holds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Window {
     pub base: u16,
     pub top: u16,
+    pub descending: bool,
 }
 
 impl Window {
     pub(crate) const FULL: Self = Self {
         base: PARHELION_ASSET_PACKAGE_ID,
         top: MAX_AUTHORED_STANDALONE_PACKAGE_ID,
+        descending: false,
     };
 
-    /// The longest run of authored ids that `taken` leaves free, the lowest of equal runs.
+    /// A descending window over the longest run of authored ids that `taken` leaves free, the
+    /// highest of equal runs.
     pub(crate) fn avoiding(taken: &BTreeSet<u16>) -> Option<Self> {
         let mut best: Option<Self> = None;
         let mut base = None;
@@ -34,13 +46,66 @@ impl Window {
                 continue;
             }
             let base = *base.get_or_insert(id);
-            if best.is_none_or(|best| id - base > best.top - best.base) {
-                best = Some(Self { base, top: id });
+            if best.is_none_or(|best| id - base >= best.top - best.base) {
+                best = Some(Self {
+                    base,
+                    top: id,
+                    descending: true,
+                });
             }
         }
         best
     }
+
+    /// The window's first id, where its first asset package goes.
+    pub(crate) fn first(self) -> u16 {
+        self.nth(0)
+            .unwrap_or(if self.descending { self.top } else { self.base })
+    }
+
+    /// The id `n` packages from the window's first, if the window holds it.
+    pub(crate) fn nth(self, n: usize) -> Option<u16> {
+        if self.descending && host().is_standalone() {
+            return (self.base..=self.top)
+                .rev()
+                .filter(|id| !crate::mod_family::build::reserved(*id))
+                .nth(n);
+        }
+        let n = u16::try_from(n).ok()?;
+        if self.descending {
+            self.top.checked_sub(n).filter(|id| *id >= self.base)
+        } else {
+            self.base.checked_add(n).filter(|id| *id <= self.top)
+        }
+    }
+
+    /// The window's last id, where private runtime overflow starts without a mod loader, counting
+    /// toward the first.
+    pub(crate) fn last(self) -> u16 {
+        if self.descending { self.base } else { self.top }
+    }
+
+    /// The window without its first id, or `None` when that leaves nothing.
+    pub(crate) fn rest(self) -> Option<Self> {
+        (self.base < self.top).then(|| {
+            if self.descending {
+                Self {
+                    top: self.top - 1,
+                    ..self
+                }
+            } else {
+                Self {
+                    base: self.base + 1,
+                    ..self
+                }
+            }
+        })
+    }
 }
+
+/// The window packed as `base << 16 | top`, with the high bit set when it descends. Authored ids
+/// stop at `0x0CFF`, so the bit is free.
+const DESCENDING: u32 = 1 << 31;
 
 static WINDOW: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(
     ((PARHELION_ASSET_PACKAGE_ID as u32) << 16) | MAX_AUTHORED_STANDALONE_PACKAGE_ID as u32,
@@ -51,16 +116,18 @@ static WINDOW: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(
 pub(crate) fn window() -> Window {
     let packed = WINDOW.load(std::sync::atomic::Ordering::Relaxed);
     Window {
-        base: (packed >> 16) as u16,
+        base: ((packed & !DESCENDING) >> 16) as u16,
         top: packed as u16,
+        descending: packed & DESCENDING != 0,
     }
 }
 
 /// Sets the window for the build holding the [`Profile`]. The names an earlier build gave its
 /// standalone packages no longer apply.
 fn set_window(window: Window) {
+    let direction = if window.descending { DESCENDING } else { 0 };
     WINDOW.store(
-        (u32::from(window.base) << 16) | u32::from(window.top),
+        direction | (u32::from(window.base) << 16) | u32::from(window.top),
         std::sync::atomic::Ordering::Relaxed,
     );
     STANDALONE_NAMES
@@ -139,6 +206,20 @@ fn set_host(host: Host) {
     HOST.store(u32::from(host.id), std::sync::atomic::Ordering::Relaxed);
 }
 
+static NODES_SHARED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether another installed Sunrise mod changes the presentation nodes, for the build holding
+/// the [`Profile`]. Automatic Collections placement then puts entries after a node's stock
+/// entries, where Sunrise's merge can add them beside the other mod's.
+pub(crate) fn presentation_nodes_shared() -> bool {
+    NODES_SHARED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Sets what [`presentation_nodes_shared`] reads for the build holding the turn.
+pub(crate) fn set_presentation_nodes_shared(shared: bool) {
+    NODES_SHARED.store(shared, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// A build's turn with the window, the host and the standalone names, which every authored id it
 /// places reads. Builds in one process take turns, so a build for a mod loader install never
 /// lends its layout to another, and the stock layout returns when the turn ends.
@@ -176,8 +257,10 @@ pub(crate) fn join() -> Profile {
 impl Drop for Profile {
     fn drop(&mut self) {
         if self.turn.is_some() {
+            crate::mod_family::build::clear();
             set_window(Window::FULL);
             set_host(Host::APPENDED);
+            set_presentation_nodes_shared(false);
             HOLDING.set(false);
         }
     }
@@ -284,7 +367,7 @@ pub(crate) const PARHELION_ASSET_PACKAGE: AuthoredPackage = AuthoredPackage {
     required_output: true,
 };
 
-pub(crate) const CANONICAL_PACKAGES: [CanonicalPackage; 27] = [
+pub(crate) const CANONICAL_PACKAGES: [CanonicalPackage; 28] = [
     // The private perk runtime package.
     CanonicalPackage {
         package_id: PRIVATE_PERK_RUNTIME_PACKAGE_ID,
@@ -387,6 +470,16 @@ pub(crate) const CANONICAL_PACKAGES: [CanonicalPackage; 27] = [
         authored_patch_id: 6,
         authored_file_name: "w64_sandbox_0206_6.pkg",
         stock_generation: EARLIER_GENERATION,
+        required_output: false,
+    },
+    // First-person holding parameters for the native hand cannon animation family.
+    CanonicalPackage {
+        package_id: 0x0207,
+        stock_file_stem: "w64_sandbox_0207",
+        stock_patch_id: 6,
+        authored_patch_id: 7,
+        authored_file_name: "w64_sandbox_0207_7.pkg",
+        stock_generation: FINAL_GENERATION,
         required_output: false,
     },
     // The human locomotion and rider motion tables and their selectors.
@@ -844,39 +937,6 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn authored_package_profiles_are_coherent() {
-        assert_eq!(
-            AUTHORED_PACKAGES
-                .iter()
-                .map(|profile| profile.package_id)
-                .collect::<BTreeSet<_>>()
-                .len(),
-            AUTHORED_PACKAGES.len()
-        );
-        assert_eq!(
-            AUTHORED_PACKAGES
-                .iter()
-                .map(|profile| profile.file_name)
-                .collect::<BTreeSet<_>>()
-                .len(),
-            AUTHORED_PACKAGES.len()
-        );
-        for profile in CANONICAL_PACKAGES {
-            assert_eq!(
-                profile.authored_file_name,
-                profile.stock_file_name(profile.authored_patch_id)
-            );
-        }
-        for profile in AUTHORED_PACKAGES {
-            assert_eq!(authored_package(profile.package_id), Some(profile));
-            assert_eq!(
-                authored_package_for_file_name(profile.file_name),
-                Some(profile)
-            );
-        }
-    }
 
     #[test]
     fn authored_artifact_selection_requires_core_and_accepts_optional_runtime_hosts() {

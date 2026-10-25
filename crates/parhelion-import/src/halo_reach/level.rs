@@ -23,14 +23,19 @@ pub mod ambience;
 mod collision;
 mod decals;
 mod decorators;
+pub(crate) mod lighting;
 pub mod lightmap;
+pub mod mission;
 pub mod native;
 pub mod objectives;
 mod objects;
 pub mod picture;
 pub mod spawn;
+pub mod squads;
+pub mod streaming;
 pub mod variant;
 pub mod volumes;
+mod water;
 
 /// The group of the lightmap BSP data that holds a BSP's render geometry.
 const LIGHTMAP_GROUP: &str = "Lbsp";
@@ -65,10 +70,53 @@ const SCENARIO_BSP_FLAGS: usize = 0x50;
 /// The flag of a BSP that is not normally playable space in a multiplayer level, such as a shared
 /// backdrop.
 const NOT_PLAYABLE: u16 = 1 << 10;
+/// The flag of a shared BSP.
+const SHARED: u16 = 1 << 11;
 /// The scenario's zone sets, and each one's mask of the BSPs it loads.
 const ZONE_SETS: usize = 0xAC;
 const ZONE_SET_SIZE: usize = 0x13C;
 const ZONE_SET_BSPS: usize = 0x10C;
+
+/// Source cache files whose resource pages can be read by this level. Inspect the cache's own
+/// shared-page table so reuse never relies on a fixed list of MCC filenames.
+pub fn source_files(maps: &Path, map: &str) -> Result<Vec<std::path::PathBuf>> {
+    let root = maps.canonicalize()?;
+    let path = root.join(map).canonicalize()?;
+    ensure!(
+        path.starts_with(&root),
+        "Source map escapes its cache directory"
+    );
+    let cache = Cache::open(&path)?;
+    let zone = cache.only("zone")?.address()?;
+    let play = cache.only("play")?.offset.unwrap_or(zone + 28);
+    let shared = cache.block(play + 12, 264)?;
+    let mut paths = BTreeSet::from([path]);
+    for page in cache.block(play + 24, 88)? {
+        let index = cache.i16(page + 4)?;
+        if index < 0 || cache.i32(page + 12)? == 0 {
+            continue;
+        }
+        let row = *shared
+            .get(index as usize)
+            .context("Shared cache outside table")?;
+        let source = cache.string(row, 256)?;
+        let name = source
+            .rsplit(['/', '\\'])
+            .next()
+            .context("Shared cache filename")?;
+        ensure!(
+            !name.is_empty() && name.ends_with(".map") && name != ".map" && !name.contains(':'),
+            "Invalid shared cache name"
+        );
+        let path = root.join(name).canonicalize()?;
+        ensure!(
+            path.starts_with(&root),
+            "Shared cache escapes its directory"
+        );
+        paths.insert(path);
+    }
+    Ok(paths.into_iter().collect())
+}
 
 /// One placement of an instanced geometry mesh.
 #[derive(Clone, Debug, Serialize)]
@@ -167,6 +215,8 @@ struct Part {
     /// The sum and count of the lit levels of the image, the per-vertex probes and the coloring
     /// probes.
     levels: [(f64, usize); 3],
+    /// Its decorators, drawn once every BSP is read ([`decorators::place`]).
+    decorated: decorators::Decorators,
     /// What its decorators placed.
     decorators: serde_json::Value,
 }
@@ -176,6 +226,8 @@ pub struct Bsp {
     pub tag: Tag,
     /// Whether the scenario counts it as playable space. A shared backdrop is not.
     pub playable: bool,
+    /// Whether the scenario marks it shared, as a multiplayer level's backdrop.
+    pub shared: bool,
 }
 
 /// Where a relocated block of a resource definition keeps its rows.
@@ -287,14 +339,38 @@ fn space(pointer: u32) -> Result<Space> {
     })
 }
 
-/// The structure BSPs the scenario's first zone set loads, in scenario order, or every BSP of a
-/// scenario without zone sets. A multiplayer level has one zone set.
-pub fn bsps(cache: &Cache) -> Result<Vec<Bsp>> {
+/// The mask of the structure BSPs the scenario's zone sets `zone_sets` load, together, and every
+/// BSP for a scenario without zone sets. A multiplayer level has one zone set, and a campaign
+/// mission one for each stretch of the mission.
+pub(super) fn loaded_bsps(cache: &Cache, zone_sets: &[usize]) -> Result<u32> {
     let scenario = cache.only("scnr")?.address()?;
-    let loaded = match cache.block(scenario + ZONE_SETS, ZONE_SET_SIZE)?.first() {
-        Some(&zone_set) => cache.u32(zone_set + ZONE_SET_BSPS)?,
-        None => u32::MAX,
-    };
+    let rows = cache.block(scenario + ZONE_SETS, ZONE_SET_SIZE)?;
+    if rows.is_empty() {
+        ensure!(
+            zone_sets.iter().all(|&zone_set| zone_set == 0),
+            "The scenario has no zone sets"
+        );
+        return Ok(u32::MAX);
+    }
+    let mut mask = 0;
+    for &zone_set in zone_sets {
+        let row = rows.get(zone_set).with_context(|| {
+            format!(
+                "The scenario has {} zone sets, not {}",
+                rows.len(),
+                zone_set + 1
+            )
+        })?;
+        mask |= cache.u32(row + ZONE_SET_BSPS)?;
+    }
+    Ok(mask)
+}
+
+/// The structure BSPs the scenario's zone sets `zone_sets` load, in scenario order, whether or not
+/// any is playable.
+fn loaded(cache: &Cache, zone_sets: &[usize]) -> Result<Vec<Bsp>> {
+    let scenario = cache.only("scnr")?.address()?;
+    let loaded = loaded_bsps(cache, zone_sets)?;
     let mut bsps = Vec::new();
     for (index, row) in cache
         .block(scenario + SCENARIO_BSPS, SCENARIO_BSP_SIZE)?
@@ -307,21 +383,132 @@ pub fn bsps(cache: &Cache) -> Result<Vec<Bsp>> {
         let tag = cache
             .reference(row, Some("sbsp"))?
             .with_context(|| format!("Scenario structure BSP {index} is empty"))?;
+        let flags = cache.u16(row + SCENARIO_BSP_FLAGS)?;
         bsps.push(Bsp {
             tag,
-            playable: (cache.u16(row + SCENARIO_BSP_FLAGS)? & NOT_PLAYABLE) == 0,
+            playable: flags & NOT_PLAYABLE == 0,
+            shared: flags & SHARED != 0,
         });
     }
+    Ok(bsps)
+}
+
+/// The mask of the scenario's structure BSPs, bit `n` for its `n`th, that `bsps` name.
+pub(super) fn bsp_mask(cache: &Cache, bsps: &[Tag]) -> Result<u32> {
+    let scenario = cache.only("scnr")?.address()?;
+    let mut mask = 0;
+    for (index, row) in cache
+        .block(scenario + SCENARIO_BSPS, SCENARIO_BSP_SIZE)?
+        .into_iter()
+        .enumerate()
+        .take(32)
+    {
+        if let Some(tag) = cache.reference(row, Some("sbsp"))?
+            && bsps.iter().any(|loaded| loaded.path == tag.path)
+        {
+            mask |= 1 << index;
+        }
+    }
+    Ok(mask)
+}
+
+/// The structure BSPs the scenario's zone sets `zone_sets` load, in scenario order.
+pub fn bsps(cache: &Cache, zone_sets: &[usize]) -> Result<Vec<Bsp>> {
+    let bsps = loaded(cache, zone_sets)?;
     ensure!(
         bsps.iter().any(|bsp| bsp.playable),
-        "The scenario loads no playable structure BSP"
+        "The scenario's zone sets {zone_sets:?} load no playable structure BSP"
     );
     Ok(bsps)
 }
 
-/// The first playable structure BSP the scenario loads.
+/// The bounding boxes of the clusters of `bsps`, in meters, which together hold the space those
+/// structure BSPs enclose.
+pub(super) fn cluster_boxes<'a>(
+    cache: &Cache,
+    bsps: impl IntoIterator<Item = &'a Bsp>,
+) -> Result<Vec<([f32; 3], [f32; 3])>> {
+    let mut boxes = Vec::new();
+    for bsp in bsps {
+        for row in cache.block(bsp.tag.address()? + CLUSTERS, CLUSTER_SIZE)? {
+            let bounds = cache.floats::<6>(row)?.map(|value| value * METRES_PER_UNIT);
+            boxes.push((
+                [bounds[0], bounds[2], bounds[4]],
+                [bounds[1], bounds[3], bounds[5]],
+            ));
+        }
+    }
+    Ok(boxes)
+}
+
+/// The boxes of the structure clusters of `tags`, in meters, leaving out each structure BSP's
+/// outside cluster, the one whose box holds every other cluster's of its BSP.
+pub(super) fn interior_boxes(cache: &Cache, tags: &[Tag]) -> Result<Vec<([f32; 3], [f32; 3])>> {
+    let mut interior = Vec::new();
+    for tag in tags {
+        let boxes = cache
+            .block(tag.address()? + CLUSTERS, CLUSTER_SIZE)?
+            .into_iter()
+            .map(|row| {
+                let bounds = cache.floats::<6>(row)?.map(|value| value * METRES_PER_UNIT);
+                Ok((
+                    [bounds[0], bounds[2], bounds[4]],
+                    [bounds[1], bounds[3], bounds[5]],
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let holds_all = |(low, high): ([f32; 3], [f32; 3])| {
+            boxes.len() > 1
+                && boxes
+                    .iter()
+                    .all(|(l, h)| (0..3).all(|k| low[k] <= l[k] && high[k] >= h[k]))
+        };
+        interior.extend(boxes.iter().copied().filter(|&b| !holds_all(b)));
+    }
+    Ok(interior)
+}
+
+/// One zone set of a scenario: its name, the structure BSPs it loads and the positions of the
+/// player starting locations a map of it spawns players at ([`spawn::starts_in`]), in meters.
+#[derive(Clone, Debug, Serialize)]
+pub struct ZoneSet {
+    pub name: String,
+    pub bsps: Vec<String>,
+    pub playable: bool,
+    pub starts: Vec<[f32; 3]>,
+}
+
+/// The name string of a zone set row.
+const ZONE_SET_NAME: usize = 0x04;
+
+/// The zone sets of cache `map` in `maps`, in scenario order, which a map recipe names by index.
+/// A scenario without zone sets lists one that loads every structure BSP.
+pub fn zone_sets(maps: &Path, map: &str) -> Result<Vec<ZoneSet>> {
+    let cache = Cache::open(&maps.join(map))?;
+    let scenario = cache.only("scnr")?.address()?;
+    let rows = cache.block(scenario + ZONE_SETS, ZONE_SET_SIZE)?;
+    (0..rows.len().max(1))
+        .map(|index| {
+            let bsps = loaded(&cache, &[index])?;
+            Ok(ZoneSet {
+                name: match rows.get(index) {
+                    Some(&row) => cache.string(row + ZONE_SET_NAME, 0x100)?,
+                    None => String::new(),
+                },
+                bsps: bsps.iter().map(|bsp| bsp.tag.path.clone()).collect(),
+                playable: bsps.iter().any(|bsp| bsp.playable),
+                starts: spawn::starts_in(&cache, &bsps)?
+                    .iter()
+                    .map(|start| start.position)
+                    .collect(),
+            })
+        })
+        .collect()
+}
+
+/// The first playable structure BSP the scenario's first zone set loads.
 fn playable(cache: &Cache) -> Result<Tag> {
-    bsps(cache)?
+    bsps(cache, &[0])?
         .into_iter()
         .find(|bsp| bsp.playable)
         .map(|bsp| bsp.tag)
@@ -368,13 +555,33 @@ pub fn read(cache: &Cache, pages: &mut Pages, tag: &Tag) -> Result<Level> {
     read_all(cache, pages, std::slice::from_ref(tag))
 }
 
-/// Reads structure BSPs `tags` as one level. A shader two BSPs share becomes one material, and
-/// one lightmap atlas holds every BSP's lightmap image and lighting probes.
+/// Reads structure BSPs `tags` as one level. Identical source material selections share an
+/// identity across BSPs, including a decal's layer and sprite. One lightmap atlas holds every
+/// BSP's lightmap image and lighting probes.
 pub fn read_all(cache: &Cache, pages: &mut Pages, tags: &[Tag]) -> Result<Level> {
+    read_areas(cache, pages, tags, &[(0..tags.len()).collect()])
+}
+
+/// Reads structure BSPs `tags` as one level whose `areas`, each the indices in `tags` of the BSPs
+/// that load together, budget their decorators apart (`decorators::place`). Each primitive
+/// names its own BSP, so an area draws only what its BSPs hold.
+pub fn read_areas(
+    cache: &Cache,
+    pages: &mut Pages,
+    tags: &[Tag],
+    areas: &[Vec<usize>],
+) -> Result<Level> {
     let lut = lightmap::direction_lut(cache, pages)?;
     let mut parts = Vec::with_capacity(tags.len());
     for (bsp, tag) in tags.iter().enumerate() {
         parts.push(read_bsp(cache, pages, tag, bsp, lut.as_deref())?);
+    }
+    decorators::place(cache, pages, &mut parts, areas)?;
+    for (part, tag) in parts.iter_mut().zip(tags) {
+        let bsps = bsp_mask(cache, std::slice::from_ref(tag))?;
+        for primitive in &mut part.primitives {
+            primitive.bsps = bsps;
+        }
     }
     let mut levels = [(0f64, 0usize); 3];
     for part in &parts {
@@ -409,10 +616,9 @@ pub fn read_all(cache: &Cache, pages: &mut Pages, tags: &[Tag]) -> Result<Level>
         let mut indices = Vec::with_capacity(part.materials.len());
         for material in part.materials {
             let shared = material.tag.as_ref().and_then(|tag| {
-                level
-                    .materials
-                    .iter()
-                    .position(|known| known.tag.as_ref() == Some(tag))
+                level.materials.iter().position(|known| {
+                    known.tag.as_ref() == Some(tag) && known.decal == material.decal
+                })
             });
             indices.push(shared.unwrap_or_else(|| {
                 level.materials.push(material);
@@ -478,11 +684,11 @@ fn read_bsp(
         .flatten()
         .find(|candidate| candidate.group == LIGHTMAP_GROUP && candidate.path == tag.path)
         .cloned();
-    let (owner, base, unowned) = match &lightmap {
-        Some(data) => (data, data.address()? + LIGHTMAP_GEOMETRY, false),
-        None => (tag, at + BSP_GEOMETRY, true),
+    let (owner, base) = match &lightmap {
+        Some(data) => (data, data.address()? + LIGHTMAP_GEOMETRY),
+        None => (tag, at + BSP_GEOMETRY),
     };
-    let geometry = Geometry::read(cache, owner, base, unowned)?;
+    let geometry = Geometry::read(cache, owner, base)?;
     let mut materials = cache
         .block(at + MATERIALS, MATERIAL_SIZE)?
         .into_iter()
@@ -497,7 +703,17 @@ fn read_bsp(
     }
     let mut meshes = Vec::with_capacity(sections);
     let mut mesh_bounds = Vec::with_capacity(sections);
+    let required = cluster_meshes
+        .keys()
+        .copied()
+        .chain(instances.iter().map(|instance| instance.mesh))
+        .collect::<BTreeSet<_>>();
     for mesh in 0..sections {
+        if !required.contains(&mesh) {
+            meshes.push(Vec::new());
+            mesh_bounds.push(None);
+            continue;
+        }
         let (primitives, bounds) = read_mesh(cache, pages, &geometry, owner, mesh, materials.len())
             .with_context(|| format!("Mesh {mesh} of {}", tag.path))?;
         meshes.push(primitives);
@@ -561,12 +777,18 @@ fn read_bsp(
         let buffer = cluster_lighting.get(cluster).copied().flatten();
         let vertex_lighting = VertexLighting::read(cache, pages, &geometry, buffer, lut)?;
         for primitive in &meshes[mesh] {
+            let mut primitive = primitive.clone();
+            if primitive.flags & PER_VERTEX_PART != 0
+                && let Some(lighting) = &vertex_lighting
+            {
+                lighting.apply(&mut primitive)?;
+            }
             let probe = vertex_lighting
                 .as_ref()
                 .filter(|_| primitive.flags & PER_VERTEX_PART != 0)
-                .and_then(|lighting| lighting.probe(primitive));
+                .and_then(|lighting| lighting.probe(&primitive));
             primitive_probes.push(probe.map(|texel| add_probe(&mut probes, &mut levels[1], texel)));
-            primitives.push(primitive.clone());
+            primitives.push(primitive);
         }
     }
     for (index, instance) in instances.iter().enumerate() {
@@ -584,15 +806,23 @@ fn read_bsp(
             (None, None) => colorings.get_mut(index).and_then(Option::take),
             _ => None,
         };
-        let coloring_probe = coloring.map(|texel| add_probe(&mut probes, &mut levels[2], texel));
+        let coloring_light = coloring.as_ref().map(|coloring| coloring.analytical_light);
+        let coloring_probe =
+            coloring.map(|coloring| add_probe(&mut probes, &mut levels[2], coloring.texel));
         for primitive in &meshes[instance.mesh] {
             let mut placed = primitive.clone();
             placed.instance = Some(format!("instance{index}"));
+            if let Some(identifier) = coloring_light {
+                placed.analytical_light = Some(identifier);
+            }
             if let Some(coordinates) = &coordinates {
                 apply(&mut placed, coordinates)?;
             }
             // The probe compares each placed normal with its lobe, which is in the level's space.
             instance.place_primitive(&mut placed);
+            if let Some(lighting) = &vertex_lighting {
+                lighting.apply(&mut placed)?;
+            }
             let probe = vertex_lighting
                 .as_ref()
                 .and_then(|lighting| lighting.probe(&placed));
@@ -611,14 +841,9 @@ fn read_bsp(
     }
     // Then decorators, each instance lit by a probe of its own baked light. Their probes stay out
     // of the lit levels the report averages.
-    let (decorated, decorators) = decorators::read(cache, pages, tag, at, &mut materials)?;
-    for (group, texel) in decorated {
-        let probe = add_probe(&mut probes, &mut (0., 0), texel);
-        for primitive in group {
-            primitive_probes.push(Some(probe));
-            primitives.push(primitive);
-        }
-    }
+    let decorated = decorators::read(cache, pages, tag, at, &mut materials, &mut |texel| {
+        add_probe(&mut probes, &mut (0., 0), texel)
+    })?;
     let drawn: BTreeSet<usize> = instances.iter().map(|i| i.mesh).collect();
     let unused_meshes = (0..geometry.sections.len())
         .filter(|mesh| !cluster_meshes.contains_key(mesh) && !drawn.contains(mesh))
@@ -636,7 +861,8 @@ fn read_bsp(
         lighting,
         probes,
         levels,
-        decorators,
+        decorated,
+        decorators: serde_json::Value::Null,
     })
 }
 
@@ -657,8 +883,8 @@ fn cluster_meshes(cache: &Cache, clusters: &[usize]) -> Result<BTreeMap<usize, u
 type Bounds = [[f32; 3]; 2];
 
 /// Mesh `mesh` of `geometry`, which `owner` keeps, in its own space: its primitives, whose
-/// materials index the BSP's `materials`, and the bounds of its vertices. A mesh whose section
-/// does not decode, such as one without a vertex buffer, draws nothing and has no bounds.
+/// materials index the BSP's `materials`, and the bounds of its vertices. An empty section
+/// draws nothing and has no bounds. Malformed required sections propagate their decode error.
 fn read_mesh(
     cache: &Cache,
     pages: &mut Pages,
@@ -667,33 +893,72 @@ fn read_mesh(
     mesh: usize,
     materials: usize,
 ) -> Result<(Vec<Primitive>, Option<Bounds>)> {
-    let Ok(Some(Section {
+    let Some(Section {
+        row,
         vertices,
         indices,
         restart,
         topology,
         parts,
         ..
-    })) = geometry.section(cache, pages, owner, mesh, 1)
+    }) = geometry.section(cache, pages, owner, mesh, 1)?
     else {
         return Ok((Vec::new(), None));
     };
     let mut primitives = Vec::new();
+    let water = water::Coordinates::read(cache, pages, geometry, mesh, &parts)?;
+    let mut subparts = BTreeMap::<usize, Vec<usize>>::new();
+    for subpart in cache.block(row + 12, 16)? {
+        let parent = usize::try_from(cache.i16(subpart + 8)?)?;
+        ensure!(parent < parts.len(), "Subpart parent outside mesh");
+        subparts.entry(parent).or_default().push(subpart);
+    }
     for (index, &part) in parts.iter().enumerate() {
-        let primitive = model::draw(
-            cache,
-            mesh,
-            index,
-            part,
-            part + 4,
-            topology,
-            &indices,
-            restart,
-            &vertices,
-            materials,
-        )?;
-        if !primitive.indices.is_empty() {
-            primitives.push(primitive);
+        let ranges = subparts.remove(&index).unwrap_or_default();
+        // A non-lightmapped section may have no subparts. Required subpart ranges must cover
+        // the parent exactly, since silently drawing the parent would erase light selection.
+        let ranges = if ranges.is_empty() {
+            vec![(part + 4, None)]
+        } else {
+            let first = cache.u32(part + 4)?;
+            let end = first
+                .checked_add(cache.u32(part + 8)?)
+                .context("Part range overflow")?;
+            let mut next = first;
+            let mut ranges = ranges
+                .into_iter()
+                .map(|row| {
+                    Ok((
+                        cache.u32(row)?,
+                        cache.u32(row + 4)?,
+                        row,
+                        cache.u32(row + 12)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            ranges.sort_unstable_by_key(|range| range.0);
+            for &(start, count, _, _) in &ranges {
+                ensure!(start == next, "Subpart ranges overlap or leave a gap");
+                next = start.checked_add(count).context("Subpart range overflow")?;
+                ensure!(next <= end, "Subpart exceeds parent part");
+            }
+            ensure!(next == end, "Subparts do not cover parent part");
+            ranges
+                .into_iter()
+                .map(|(_, _, row, id)| (row, Some(id)))
+                .collect()
+        };
+        for (range, analytical_light) in ranges {
+            let mut primitive = model::draw(
+                cache, mesh, index, part, range, topology, &indices, restart, &vertices, materials,
+            )?;
+            primitive.analytical_light = analytical_light;
+            if let Some(water) = &water {
+                water.apply(cache, part, range, topology, &indices, &mut primitive)?;
+            }
+            if !primitive.indices.is_empty() {
+                primitives.push(primitive);
+            }
         }
     }
     Ok((primitives, Some(vertex_bounds(&vertices))))
@@ -720,7 +985,7 @@ struct Sources {
     lightmap_streams: Vec<Option<usize>>,
     per_vertex: Vec<Option<lightmap::PerVertex>>,
     cluster_lighting: Vec<Option<lightmap::PerVertex>>,
-    colorings: Vec<Option<lightmap::Texel>>,
+    colorings: Vec<Option<lightmap::Coloring>>,
 }
 
 impl Sources {
@@ -769,6 +1034,15 @@ struct VertexLighting<'a> {
 }
 
 impl<'a> VertexLighting<'a> {
+    fn apply(&self, primitive: &mut Primitive) -> Result<()> {
+        for vertex in &mut primitive.vertices {
+            vertex.lighting = Some(
+                lightmap::vertex(&self.bytes, self.buffer, vertex.source, self.lut)
+                    .context("Per-vertex lighting does not cover a drawn source vertex")?,
+            );
+        }
+        Ok(())
+    }
     /// Reads `buffer` from `geometry` when there is one and the directions `lut` to decode it.
     fn read(
         cache: &Cache,
@@ -938,8 +1212,12 @@ fn write_compiled_shaders(
 pub fn export_shaders(maps: &Path, map: &str, material: &str, output: &Path) -> Result<()> {
     let cache = Cache::open(&maps.join(map))?;
     let mut pages = Pages::default();
-    let bsp = playable(&cache)?;
-    let level = read(&cache, &mut pages, &bsp)?;
+    // Every BSP the level loads, since Forge World keeps its cliffs in its second.
+    let tags = bsps(&cache, &[0])?
+        .into_iter()
+        .map(|bsp| bsp.tag)
+        .collect::<Vec<_>>();
+    let level = read_all(&cache, &mut pages, &tags)?;
     let found = material_ending(&level, material)?;
     let template = &found
         .properties
@@ -992,13 +1270,68 @@ pub fn export_shaders(maps: &Path, map: &str, material: &str, output: &Path) -> 
 /// buffer indices and the first six such buffers (each one's declaration and first bytes), and
 /// the compiled vertex shaders of the template of the material whose path ends with `material`
 /// as `vertex-<index>-<slot>.bin`, with that material's `g_sample_vmf_diffuse` table as an image.
+/// The scenario's cubemap rows (`+0x7B8`, `0x20` bytes: a name, a position, two indices and a
+/// block of points) and each structure BSP's cubemap bitmap with its image count and the cube
+/// indices its clusters name, written to `cubemaps.json` in `output`.
+pub fn export_cubemaps(maps: &Path, map: &str, output: &Path) -> Result<()> {
+    let cache = Cache::open(&maps.join(map))?;
+    let scenario = cache.only("scnr")?.address()?;
+    let cubemaps = cache
+        .block(scenario + 0x7B8, 0x20)?
+        .into_iter()
+        .map(|row| {
+            Ok(serde_json::json!({
+                "name": cache.u32(row)?,
+                "position": cache.floats::<3>(row + 4)?.map(|v| v * METRES_PER_UNIT),
+                "word_10": cache.i16(row + 0x10)?,
+                "word_12": cache.i16(row + 0x12)?,
+                "points": cache.block(row + 0x14, 0x10)?.len(),
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let bsps = cache
+        .block(scenario + 0x50, 0xAC)?
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let structure = cache.reference(row, Some("sbsp"))?;
+            let bitmap = cache.reference(row + 0x58, Some("bitm")).ok().flatten();
+            let images = match &bitmap {
+                Some(bitmap) => Some(cache.block(bitmap.address()? + 124, 56)?.len()),
+                None => None,
+            };
+            let mut named = std::collections::BTreeSet::new();
+            if let Some(structure) = &structure {
+                for cluster in cache.block(structure.address()? + 0x138, 0x8C)? {
+                    for entry in cache.block(cluster + 0x80, 0x10)? {
+                        named.insert(cache.i16(entry)?);
+                    }
+                }
+            }
+            Ok(serde_json::json!({
+                "index": index,
+                "structure": structure.map(|tag| tag.path),
+                "bitmap": bitmap.map(|tag| tag.path),
+                "images": images,
+                "named": named,
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    fs::create_dir_all(output)?;
+    fs::write(
+        output.join("cubemaps.json"),
+        serde_json::to_string_pretty(&serde_json::json!({"cubemaps": cubemaps, "bsps": bsps}))?,
+    )?;
+    Ok(())
+}
+
 pub fn export_lighting(maps: &Path, map: &str, material: &str, output: &Path) -> Result<()> {
     let cache = Cache::open(&maps.join(map))?;
     let mut pages = Pages::default();
     let bsp = playable(&cache)?;
     let lightmap = cache.find(LIGHTMAP_GROUP, &bsp.path)?.clone();
     let at = lightmap.address()?;
-    let geometry = Geometry::read(&cache, &lightmap, at + LIGHTMAP_GEOMETRY, false)?;
+    let geometry = Geometry::read(&cache, &lightmap, at + LIGHTMAP_GEOMETRY)?;
     fs::create_dir_all(output)?;
     let mut lights = BTreeMap::<i32, usize>::new();
     for &mesh in &geometry.sections {
@@ -1120,7 +1453,7 @@ pub fn export_primitive_lighting(
 ) -> Result<()> {
     let cache = Cache::open(&maps.join(map))?;
     let mut pages = Pages::default();
-    let tags = bsps(&cache)?
+    let tags = bsps(&cache, &[0])?
         .into_iter()
         .map(|bsp| bsp.tag)
         .collect::<Vec<_>>();

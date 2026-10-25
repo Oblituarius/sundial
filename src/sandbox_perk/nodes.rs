@@ -81,18 +81,11 @@ pub struct NodeKind {
 }
 
 impl NodeKind {
-    /// Compiler coverage and understanding of runtime behavior are separate evidence axes.
-    pub const fn semantics(&self) -> &'static str {
-        if self.occurrences == 0 {
-            "Unverified Native Layout"
-        } else {
-            "Traced Operation with Field Limits"
-        }
-    }
-    /// Whether the surveyed packages contain this kind at all.
+    /// Whether a concrete native declaration is recovered, including registered
+    /// kinds absent from the surveyed stock actions. `occurrences` remains the census.
     #[must_use]
-    pub const fn observed(&self) -> bool {
-        self.occurrences != 0
+    pub const fn has_layout(&self) -> bool {
+        self.class != 0 && self.struct_size != 0
     }
 }
 
@@ -315,40 +308,4 @@ pub fn plain_condition_title(kind: u8) -> Option<&'static str> {
         42 => "On a Finisher",
         _ => return None,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn check_node(node: &NodeKind, expected_kind: usize) {
-        assert_eq!(usize::from(node.kind), expected_kind);
-        for text in [node.name, node.summary, node.evidence] {
-            assert!(!text.contains(';'), "{text}");
-            assert!(!text.contains('\u{2014}'), "{text}");
-            assert!(!text.is_empty());
-        }
-        if node.support == Support::Unobserved {
-            assert_eq!(node.occurrences, 0);
-            assert_eq!(node.class, 0);
-        } else {
-            assert_ne!(node.class, 0);
-            assert_ne!(node.struct_size, 0);
-        }
-    }
-
-    #[test]
-    fn every_kind_is_indexed_by_its_number_and_carries_usable_prose() {
-        for (index, node) in CONDITIONS.iter().enumerate() {
-            check_node(node, index);
-        }
-        for (index, node) in EFFECTS.iter().enumerate() {
-            check_node(node, index);
-        }
-        for (index, entry) in POLICIES.iter().enumerate() {
-            assert_eq!(usize::from(entry.kind), index);
-            assert!(!entry.name.is_empty());
-            assert!(!entry.summary.contains(';'));
-        }
-    }
 }

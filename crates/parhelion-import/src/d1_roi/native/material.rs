@@ -18,6 +18,20 @@ pub(super) struct Draw {
     pub layout: u16,
 }
 
+/// The native state a D1 decal's blend state becomes, and whether it replaces target 0's color.
+/// Material `+0x20` selects a blend state with its high bit. Both executables give states 22
+/// and 23 the premultiplied blend `src + dst * src.a` that keeps the destination alpha, on
+/// target 0 or targets 0 and 1, as native vehicle decal programs such as `815B9A49` expect.
+/// D1 state 25 writes target 0's color without blending, where native state 25 blends three
+/// targets, so it becomes native 22 with zero inverse coverage.
+fn decal_state(state: u8) -> Result<(u8, bool)> {
+    Ok(match state {
+        0x96 | 0x97 => (state, false),
+        0x99 => (0x96, true),
+        _ => anyhow::bail!("Untranslated source decal blend state {state:02X}"),
+    })
+}
+
 fn vectors(data: &Payload, field: usize) -> Result<Vec<u8>> {
     Ok(data
         .array(field, 16, Some(0x80800090))?
@@ -25,6 +39,45 @@ fn vectors(data: &Payload, field: usize) -> Result<Vec<u8>> {
         .flat_map(|at| data.0[at..at + 16].iter().copied())
         .collect())
 }
+
+/// Stock techniques a PS4 draw borrows whole, by draw stage and native layout, since its
+/// GCN programs have no translation. Each is the stock gear (sandbox or investment
+/// package) technique drawn by the most models at that stage and layout among those with
+/// no object inputs, which would index the stock entity's channels. Of about 830,000 stock
+/// draws only 111 bind a technique without a vertex program, and a PS4 item whose draws
+/// all did froze or crashed the game on view.
+const BORROWED_TECHNIQUES: [(usize, u16, u32); 30] = [
+    (0, 30, 0x80EFAC1B),
+    (0, 123, 0x80FC7DF6),
+    (0, 138, 0x80C1D687),
+    (0, 139, 0x80EF4DC0),
+    (0, 143, 0x80BDFD59),
+    (1, 30, 0x80C1901B),
+    (1, 123, 0x815B3521),
+    (1, 138, 0x80C1CAFF),
+    (1, 139, 0x80EF91D3),
+    (3, 30, 0x80EF938B),
+    (3, 138, 0x80EF9389),
+    (3, 139, 0x80EF3C7A),
+    (3, 143, 0x80C68445),
+    (7, 30, 0x80EF0F75),
+    (7, 123, 0x815B37F1),
+    (7, 138, 0x81531C4A),
+    (7, 139, 0x81532F58),
+    (7, 143, 0x80EFA482),
+    (8, 139, 0x80C1DFD8),
+    (9, 123, 0x80EF8E3D),
+    (9, 139, 0x81532F59),
+    (10, 30, 0x80BF8671),
+    (10, 138, 0x80C1CAFE),
+    (10, 139, 0x80BF8667),
+    (10, 143, 0x80BDFD5B),
+    (12, 30, 0x80EFAD53),
+    (12, 138, 0x80EFAD50),
+    (12, 139, 0x80EFB192),
+    (12, 143, 0x80EF4E84),
+    (14, 139, 0x80EF5148),
+];
 
 struct StageInputs {
     textures: BTreeMap<u32, String>,
@@ -114,6 +167,32 @@ impl Assembly<'_> {
         })
     }
 
+    /// Copy the stock technique that draws this stage with the same vertex elements.
+    fn borrowed_technique(
+        &mut self,
+        tag: u32,
+        symbol: &str,
+        pass: usize,
+        layout: u16,
+    ) -> Result<String> {
+        let technique = BORROWED_TECHNIQUES
+            .iter()
+            .find(|(stage, stock, _)| *stage == pass && self.layouts.same_elements(layout, *stock))
+            .map(|(.., technique)| *technique)
+            .with_context(|| {
+                format!(
+                    "No stock technique draws stage {pass} with the elements of layout {layout}"
+                )
+            })?;
+        let stock = self.native.tag(technique, Some(0x808071E8))?;
+        self.approximations.insert(
+            "PS4 source shaders are GCN and are not translated: each draw borrows a stock Shadowkeep gear technique for its stage and vertex layout, so this item renders with stock surfaces".to_owned(),
+        );
+        self.evidence.push(json!({"material":tag,"symbol":symbol,"pass":pass,"layout":layout,"borrowed_technique":technique}));
+        let template = self.class_template(0x808071E8)?;
+        self.node(symbol, template, &stock.0, None, &[])
+    }
+
     pub(super) fn material(
         &mut self,
         tag: u32,
@@ -136,6 +215,9 @@ impl Assembly<'_> {
             self.source.reference(tag)? == expected_class,
             "Source material class differs"
         );
+        if ps4_source {
+            return self.borrowed_technique(tag, symbol, pass, layout);
+        }
         let source = self.source.read(tag)?;
         let dye_tag = equipment.dyes.get(&(dye / 2)).copied();
         let dye_data = dye_tag.map(|tag| self.source.read(tag)).transpose()?;
@@ -149,6 +231,17 @@ impl Assembly<'_> {
             &(source.u32(0xC)? & 0x00FF_FFFF).to_le_bytes(),
         )?;
         out[0x27] = 0;
+        let decal = (pass == 1)
+            .then(|| decal_state(source.u8(0x20)?))
+            .transpose()?;
+        if let Some((state, _)) = decal {
+            out[0x20] = state;
+        }
+        let gbuffer = match pass {
+            0 => Some(super::resource::Gbuffer::Surface),
+            1 => decal.map(|(_, replace)| super::resource::Gbuffer::Decal { replace }),
+            _ => None,
+        };
         put(&mut out, 0x28, &u32::MAX.to_le_bytes())?;
         let masks = scope_masks(&source, &self.globals, simulated, pass, &mut out)?;
         let depth = (source.u32(0x1C)? & (1 << self.globals.depth.index) != 0)
@@ -175,46 +268,6 @@ impl Assembly<'_> {
                 4 => (Stage::Pixel, 1),
                 _ => unreachable!(),
             };
-            if ps4_source {
-                // PS4: GCN shaders are not translatable to DXBC; textures are bound at
-                // draw time by TFX opcodes, not in static material arrays. Apply only the
-                // constant vectors (inline cbuffer) and leave the shader slot null.
-                let values = vectors(&source, from + 0x58)?;
-                let constants = vectors(&source, from + 0x38)?;
-                let mut program = expression::translate(
-                    &[],
-                    constants,
-                    &expression::Inputs {
-                        globals: &self.globals,
-                        dye: dye_data.as_ref(),
-                        secondary: dye % 2 != 0,
-                        plates: &equipment.plates,
-                        detail: &detail,
-                        objects: 0,
-                        object_channels: &self.object_channels,
-                        outputs: values.len() / 16,
-                        samplers: 0,
-                        stage: packed,
-                        reticle: pass == 16,
-                    },
-                )?;
-                program.initialize(&values)?;
-                array(&mut out, to + 8, 0x80807211, &[], 8)?;
-                put(&mut out, to + 0x18, &0u64.to_le_bytes())?;
-                array(&mut out, to + 0x20, 0x80800009, &program.code, 1)?;
-                array(&mut out, to + 0x30, 0x80800090, &program.constants, 16)?;
-                array(&mut out, to + 0x40, 0x808073F3, &[], 16)?;
-                array(&mut out, to + 0x50, 0x80800090, &values, 16)?;
-                put(&mut out, to + 0x70, &0u32.to_le_bytes())?;
-                out[to + 0x74] = if values.is_empty() { 0 } else { 0x10 };
-                put(
-                    &mut out,
-                    to + 0x80,
-                    &(if values.is_empty() { u32::MAX } else { 0 }).to_le_bytes(),
-                )?;
-                evidence.push(json!({"stage":stage,"object_inputs":0,"defaulted_source_globals":program.defaulted_globals,"ps4_gcn_shader":shader}));
-                continue;
-            }
             let StageInputs {
                 mut textures,
                 samplers,
@@ -251,6 +304,7 @@ impl Assembly<'_> {
                 &expression::Inputs {
                     globals: &self.globals,
                     dye: dye_data.as_ref(),
+                    empty_palette: equipment.dyes.is_empty(),
                     secondary: dye % 2 != 0,
                     plates: &equipment.plates,
                     detail: &detail,
@@ -260,6 +314,7 @@ impl Assembly<'_> {
                     samplers: samplers.len(),
                     stage: packed,
                     reticle: pass == 16,
+                    light: false,
                 },
             )?;
             program.initialize(&values)?;
@@ -267,7 +322,7 @@ impl Assembly<'_> {
                 shader,
                 super::resource::Shader {
                     stage,
-                    deferred: index == 4 && matches!(pass, 0 | 1),
+                    gbuffer: gbuffer.filter(|_| index == 4),
                     layout,
                     depth: depth.filter(|_| index == 4),
                     reticle_mask: program.reticle_mask.filter(|_| index == 4),

@@ -8,6 +8,7 @@ pub(super) enum Action {
     #[default]
     None,
     Build,
+    Restore,
     Review,
     Recover,
     Close,
@@ -53,6 +54,12 @@ fn heading(ui: &mut egui::Ui, state: &UpgradeUi) {
         "Checking Installation"
     } else if state.error.is_some() {
         "Installation Needs Attention"
+    } else if let Some(kept) = state.plan.as_ref().and_then(|plan| plan.kept()) {
+        if kept.mod_folder {
+            "Restore Your Sunrise 0.6 Build"
+        } else {
+            "Restore Your Build for This Runtime"
+        }
     } else if state.plan.is_some() {
         "Rebuild for Sunrise Mods"
     } else {
@@ -63,14 +70,12 @@ fn heading(ui: &mut egui::Ui, state: &UpgradeUi) {
 
 fn content(ui: &mut egui::Ui, state: &UpgradeUi, backup: &str) {
     if state.busy() {
+        let (message, completed, total) = state.progress();
         ui.horizontal_wrapped(|ui| {
             ui.spinner();
-            ui.label(if state.recovering {
-                "Recovering the interrupted operation and checking your installation."
-            } else {
-                "Checking the installed Sunrise version and your custom packages."
-            });
+            ui.label(message);
         });
+        hint(ui, &format!("Step {} of {total}", completed + 1));
         hint(ui, "Keep Parhelion open until this finishes.");
     } else if let Some(error) = &state.error {
         ui.label("The operation could not finish. Review the details before trying again.");
@@ -82,8 +87,17 @@ fn content(ui: &mut egui::Ui, state: &UpgradeUi, backup: &str) {
             );
         });
         ui.label("If an earlier install was interrupted, close Destiny and choose Recover Interrupted Operation.");
+    } else if let Some(kept) = state.plan.as_ref().and_then(|plan| plan.kept()) {
+        let age = age(kept.installed);
+        ui.label(if kept.mod_folder {
+            format!("Parhelion kept the Sunrise 0.6 build you installed {age}. Restoring installs it again without a rebuild, and backs up and removes the packages a Dawn or earlier Sunrise install put in stock packages, so the two builds never load together.")
+        } else {
+            format!("Parhelion kept the build you installed for this runtime {age}. Restoring installs it again without a rebuild, and moves your Sunrise 0.6 build out of the mod folder, so the two never load together.")
+        });
+        path_block(ui, "Kept Build", &kept.run_directory);
+        ui.label("The review checks it against this installation, your other mods and your account before anything changes. If it no longer fits, build again instead.");
     } else if let Some(plan) = &state.plan {
-        ui.label("On Sunrise 0.6 or later, builds install to the mod folder. Packages from earlier builds can't move there, so build and install again to bring your items over.");
+        ui.label("On Sunrise 0.6 or later, builds install to the mod folder. Packages from earlier builds can't move there, so build them again from your recipes and install to bring your items over.");
         ui.add_space(4.0);
         style::block(ui.style()).show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -114,6 +128,18 @@ fn content(ui: &mut egui::Ui, state: &UpgradeUi, backup: &str) {
     }
 }
 
+/// When a build was installed, in words.
+fn age(installed: std::time::SystemTime) -> String {
+    let days = installed
+        .elapsed()
+        .map_or(0, |elapsed| elapsed.as_secs() / 86_400);
+    match days {
+        0 => "in the last day".to_owned(),
+        1 => "a day ago".to_owned(),
+        days => format!("{days} days ago"),
+    }
+}
+
 fn path_block(ui: &mut egui::Ui, label: &str, value: &Path) {
     style::block(ui.style()).show(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -135,7 +161,7 @@ fn path(ui: &mut egui::Ui, label: &str, value: &Path) {
 fn actions(ui: &mut egui::Ui, state: &UpgradeUi, action: &mut Action) {
     ui.spacing_mut().button_padding = egui::vec2(12.0, 7.0);
     if state.busy() {
-        ui.add_enabled(false, egui::Button::new("Please Wait…"));
+        ui.add_enabled(false, egui::Button::new("Working…"));
         return;
     }
     if state.error.is_some() {
@@ -144,6 +170,17 @@ fn actions(ui: &mut egui::Ui, state: &UpgradeUi, action: &mut Action) {
         }
         if ui.button("Recover Interrupted Operation").clicked() {
             *action = Action::Recover;
+        }
+    } else if state
+        .plan
+        .as_ref()
+        .is_some_and(|plan| plan.kept().is_some())
+    {
+        if ui.add(style::primary(ui, "Review Restore")).clicked() {
+            *action = Action::Restore;
+        }
+        if ui.button("Build & Stage").clicked() {
+            *action = Action::Build;
         }
     } else if state.plan.is_some() && ui.add(style::primary(ui, "Build & Stage")).clicked() {
         *action = Action::Build;

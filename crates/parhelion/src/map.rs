@@ -1,5 +1,6 @@
-//! Crucible maps authored as new activities. A map is listed by activity and display rows cloned
-//! from a donor map's pair, is offered in private matches by an entry cloned from the donor's, and
+//! Maps authored as new activities. A map is listed by activity and display rows cloned from a
+//! donor activity's pair, a Crucible map or a mission, is offered in private matches by an entry
+//! cloned from a Crucible donor's, and
 //! owns its packages as a stock map does: `w64_<name>_activities` holds its activity root and
 //! scenario, where named tags select them, and with geometry its slice set and object registry.
 //! `w64_<name>` holds its world, the map root chain and converted pieces. No stock map changes.
@@ -17,15 +18,27 @@ mod activity;
 #[cfg(feature = "d2-model-importer")]
 mod chain;
 #[cfg(feature = "d2-model-importer")]
+mod destination;
+pub mod diagnostics;
+#[cfg(feature = "d2-model-importer")]
+mod encounters;
+#[cfg(feature = "d2-model-importer")]
 mod geometry;
+pub(crate) mod mission;
 #[cfg(feature = "d2-model-importer")]
 mod picture;
+#[cfg(feature = "d2-model-importer")]
+mod placed;
 #[cfg(feature = "d2-model-importer")]
 mod plan;
 #[cfg(feature = "d2-model-importer")]
 mod private_match;
 #[cfg(feature = "d2-model-importer")]
 mod registry;
+#[cfg(feature = "d2-model-importer")]
+mod streaming;
+#[cfg(feature = "d2-model-importer")]
+mod triggers;
 #[cfg(not(feature = "d2-model-importer"))]
 mod unsupported;
 #[cfg(feature = "d2-model-importer")]
@@ -57,6 +70,17 @@ pub(crate) struct Picture {
 const SCHEMA: u32 = 1;
 /// Sunrise keeps an internal name in 40 bytes with its terminator.
 const MAX_NAME_LENGTH: usize = 39;
+/// The longest destination label a map's localization entry takes, in bytes.
+const MAX_DESTINATION_LENGTH: usize = 96;
+/// The fixed destination rows of the definition and display tables.
+#[cfg(feature = "d2-model-importer")]
+pub(crate) const DESTINATION_ROWS: usize = 48;
+
+fn destination_label_valid(label: &str) -> bool {
+    !label.trim().is_empty()
+        && label.len() <= MAX_DESTINATION_LENGTH
+        && !label.chars().any(char::is_control)
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -66,36 +90,131 @@ pub struct MapRecipe {
     pub name: String,
     pub title: String,
     pub description: String,
-    /// The internal name of the stock Crucible map the new map is cloned from.
+    /// A label shared by authored activities in an otherwise unused native destination row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
+    /// The internal name of the stock activity the new map is cloned from: a Crucible map for a
+    /// multiplayer level, a mission or strike for a stretch of a campaign mission.
     pub donor: String,
     /// Another game's level the map draws and collides with, placed in the donor's world.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<MapSource>,
+    #[serde(default, skip_serializing_if = "MapOptions::is_default")]
+    pub options: MapOptions,
+    /// Embedded artwork for the activity's private match portrait and landscape images.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<crate::presentation::Artwork>,
+    /// Stock private-match activity whose portrait and landscape artwork should be used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_donor: Option<String>,
 }
 
-/// A Halo: Reach multiplayer level.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MapOptions {
+    /// None allows mission_ activities and otherwise preserves the donor's policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vehicle_summoning: Option<bool>,
+    pub ambient_audio: bool,
+    pub death_boundaries: bool,
+}
+
+impl Default for MapOptions {
+    fn default() -> Self {
+        Self {
+            vehicle_summoning: None,
+            ambient_audio: true,
+            death_boundaries: true,
+        }
+    }
+}
+
+impl MapOptions {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    #[cfg(feature = "d2-model-importer")]
+    pub(crate) fn vehicle_summoning(&self, name: &str) -> Option<bool> {
+        self.vehicle_summoning
+            .or_else(|| name.starts_with("mission_").then_some(true))
+    }
+}
+
+/// A Halo: Reach multiplayer level or stretch of a campaign mission.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MapSource {
     /// The folder of Reach `.map` caches.
     pub maps: PathBuf,
-    /// The cache whose first structure BSP becomes the map.
+    /// The cache whose level becomes the map.
     pub map: String,
+    /// The selected zone sets in route order. Automatic source crossings partition a campaign
+    /// into connected native bubbles. Script-only variants stay with their preceding area.
+    /// A multiplayer level normally has one zone set. Players start in the first selected area.
+    #[serde(default = "first_zone_set", skip_serializing_if = "is_first_zone_set")]
+    pub zone_sets: Vec<usize>,
     /// A map variant (`.mvar`) of that cache, whose Forge objects and spawn points stand in for the
     /// scenario's own placements of everything its palette offers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub variant: Option<PathBuf>,
     /// The vgmstream command line decoder that reads the level's sounds from Reach's
-    /// `fmod/pc/sfx.fsb` beside the maps folder. Without it the map plays no ambience.
+    /// `fmod/pc/sfx.fsb` beside the maps folder. Without it the build uses the vgmstream the
+    /// importer finds, and with none the map plays no ambience.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_decoder: Option<PathBuf>,
+    /// Mission recording banks, with at most one dialogue language. An empty list uses MCC's
+    /// `sfx.fsb` and `english.fsb` beside the maps folder.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audio_banks: Vec<PathBuf>,
+    /// Selected HaloScript roots to compile into a Lua sidecar beside the converted map.
+    /// An empty list exports source analysis alone. Installing the controller is separate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mission_scripts: Vec<String>,
+    /// JSON native mission bindings with explicit source names, target activity and SDK identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission_bindings: Option<PathBuf>,
+    /// Encounter prefixes for native squad bring-up. They stop at their first source wait.
+    /// These openings use Normal, solo difficulty and do not execute full mission progression.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub encounter_starts: Vec<String>,
+    /// Ordered encounter openings activated by a named source player volume. Each opening still
+    /// ends at its first wait. The recipe records the chosen source gate explicitly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub encounter_gates: Vec<EncounterGate>,
     /// Whole meters the level moves by.
     #[serde(default)]
     pub offset: [i32; 3],
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EncounterGate {
+    /// Any of these source volumes activates the next opening while the player is inside it.
+    pub volumes: Vec<String>,
+    pub scripts: Vec<String>,
+}
+
+fn first_zone_set() -> Vec<usize> {
+    vec![0]
+}
+
+fn is_first_zone_set(zone_sets: &[usize]) -> bool {
+    zone_sets == [0]
+}
+
 impl MapRecipe {
-    fn validate(&self) -> AuthoringResult<()> {
+    pub(crate) fn validate(&self) -> AuthoringResult<()> {
+        if self.image.is_some() && self.image_donor.is_some() {
+            return Err(invalid(
+                "Choose either uploaded artwork or an activity image donor",
+            ));
+        }
+        if (self.image.is_some() || self.image_donor.is_some()) && !self.donor.starts_with("pvp_") {
+            return Err(invalid(
+                "Activity artwork currently requires a private-match donor",
+            ));
+        }
         if self.schema != SCHEMA {
             return Err(invalid(format!(
                 "Map {} uses schema {}, expected {SCHEMA}",
@@ -114,11 +233,50 @@ impl MapRecipe {
                 )));
             }
         }
+        if self
+            .destination
+            .as_deref()
+            .is_some_and(|label| !destination_label_valid(label))
+        {
+            return Err(invalid(format!(
+                "Destination must be 1 to {MAX_DESTINATION_LENGTH} bytes without control characters"
+            )));
+        }
         if self.title.trim().is_empty() || self.description.trim().is_empty() {
             return Err(invalid(format!(
                 "Map {} needs a title and a description",
                 self.name
             )));
+        }
+        if self.source.is_none() && (!self.options.ambient_audio || !self.options.death_boundaries)
+        {
+            return Err(invalid(
+                "Ambient audio and death boundaries require a source level",
+            ));
+        }
+        if self
+            .source
+            .as_ref()
+            .is_some_and(|source| source.zone_sets.is_empty())
+        {
+            return Err(invalid(format!("Map {} loads no zone set", self.name)));
+        }
+        if let Some(source) = &self.source {
+            if !source.encounter_gates.is_empty() && source.encounter_starts.is_empty() {
+                return Err(invalid(
+                    "Encounter gates require an initial encounter opening",
+                ));
+            }
+            for gate in &source.encounter_gates {
+                if gate.volumes.is_empty()
+                    || gate.scripts.is_empty()
+                    || gate.volumes.iter().collect::<BTreeSet<_>>().len() != gate.volumes.len()
+                {
+                    return Err(invalid(
+                        "Encounter gates need distinct source volumes and selected scripts",
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -128,6 +286,86 @@ impl MapRecipe {
 /// selection names.
 pub fn library_directory() -> Option<PathBuf> {
     sundial::package_authoring::parhelion_data_directory().map(|root| root.join("maps"))
+}
+
+/// Private-match activities with artwork, read from the same source tables the build uses.
+#[cfg(feature = "d2-model-importer")]
+pub(crate) struct ImageChoice {
+    pub name: String,
+    pub preview: Result<image::RgbaImage, String>,
+}
+
+#[cfg(feature = "d2-model-importer")]
+pub(crate) fn image_choices(directory: &Path) -> Result<Vec<ImageChoice>, String> {
+    use crate::tag_payload::{read_tag, read_u32};
+    use sundial::package_authoring::{open_shadowkeep_package_manager, resolve_live_named_tag};
+    use tiger_pkg::TagHash;
+    let manager = open_shadowkeep_package_manager(directory)?;
+    let load = || -> AuthoringResult<Vec<ImageChoice>> {
+        let tag = resolve_live_named_tag(&manager, "investment_globals", None).map_err(invalid)?;
+        let globals = read_tag(&manager, tag, "investment globals")?;
+        let root = read_tag(
+            &manager,
+            TagHash(read_u32(&globals, 0x10)?),
+            "investment root",
+        )?;
+        let activities = read_tag(
+            &manager,
+            TagHash(read_u32(&root, 8 + 4 * 16)?),
+            "activity table",
+        )?;
+        let table = read_tag(
+            &manager,
+            TagHash(read_u32(&root, 8 + 64 * 16)?),
+            "private match table",
+        )?;
+        let displays = read_tag(
+            &manager,
+            TagHash(read_u32(&globals, 0x10 + 43 * 16)?),
+            "private match displays",
+        )?;
+        let icons = read_tag(
+            &manager,
+            TagHash(read_u32(&globals, 0x10 + 75 * 16)?),
+            "item icon table",
+        )?;
+        Ok(private_match::image_rows(&activities, &table, &displays)?
+            .into_iter()
+            .map(|(name, row)| ImageChoice {
+                name,
+                preview: picture::preview(&manager, &icons, row).map_err(|error| error.to_string()),
+            })
+            .collect())
+    };
+    load().map_err(|error| error.to_string())
+}
+
+/// How many destination rows the packages leave for authored labels, read from the same source
+/// tables the build uses.
+#[cfg(feature = "d2-model-importer")]
+pub(crate) fn blank_destination_rows(directory: &Path) -> Result<usize, String> {
+    use crate::tag_payload::{read_tag, read_u32};
+    use sundial::package_authoring::{open_shadowkeep_package_manager, resolve_live_named_tag};
+    use tiger_pkg::TagHash;
+    let manager = open_shadowkeep_package_manager(directory)?;
+    let load = || -> AuthoringResult<usize> {
+        let tag = resolve_live_named_tag(&manager, "investment_globals", None).map_err(invalid)?;
+        let globals = read_tag(&manager, tag, "investment globals")?;
+        let root = read_tag(
+            &manager,
+            TagHash(read_u32(&globals, 0x10)?),
+            "investment root",
+        )?;
+        let activities = read_tag(
+            &manager,
+            TagHash(read_u32(&root, 8 + 4 * 16)?),
+            "activity table",
+        )?;
+        Ok(destination::rows(&manager, &root, &globals, &activities)?
+            .available
+            .len())
+    };
+    load().map_err(|error| error.to_string())
 }
 
 /// The map recipe at `path`, checked.

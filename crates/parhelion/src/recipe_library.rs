@@ -129,8 +129,11 @@ pub struct LibraryBadge {
 pub struct RecipeLibraryEntry {
     pub kind: crate::ItemKind,
     pub collection_destination: Option<crate::collection::Destination>,
+    pub collection_position: Option<crate::collection::Position>,
     pub armor_class: Option<crate::ArmorClass>,
     pub(crate) armor_origin: Option<crate::collection::armor::Origin>,
+    /// Oldest imported graph revision, including portable appearance attachments.
+    pub import_revision: Option<u32>,
     pub badge: Option<LibraryBadge>,
     /// The release watermark's fingerprint. [`load_corner_icon`] reads the artwork.
     pub corner_icon: Option<u64>,
@@ -179,6 +182,7 @@ pub struct MapLibraryEntry {
     /// The map's internal name, which its activity and packages carry.
     pub name: String,
     pub title: String,
+    pub destination: Option<String>,
     /// Whether the map converts another game's level.
     pub source: bool,
 }
@@ -196,7 +200,7 @@ pub struct RecipeLibrary {
     root: PathBuf,
     canonical_root: PathBuf,
     refresh: Option<DefaultsRefresh>,
-    /// The folder of map recipes the library lists, none without the D2 model importer.
+    /// Activities belong to builds with the D2 model importer.
     maps: Option<PathBuf>,
 }
 
@@ -224,11 +228,14 @@ impl RecipeLibrary {
                 root.display()
             )
         })?;
+        let maps = cfg!(feature = "d2-model-importer")
+            .then(|| root.parent().map(|parent| parent.join("maps")))
+            .flatten();
         let mut library = Self {
             root,
             canonical_root,
             refresh: None,
-            maps: None,
+            maps,
         };
         library.refresh = library.materialize_bundled_recipes()?;
         Ok(library)
@@ -237,6 +244,51 @@ impl RecipeLibrary {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Saves a complete activity only while its original bytes and library location still match.
+    #[cfg(feature = "d2-model-importer")]
+    pub(crate) fn save_map(
+        &self,
+        path: &Path,
+        recipe: &crate::map::MapRecipe,
+        original: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let _lock = self.lock()?;
+        recipe.validate().map_err(|error| error.to_string())?;
+        let directory = self
+            .maps
+            .as_ref()
+            .ok_or("Activity library is unavailable")?;
+        if path.parent() != Some(directory.as_path()) {
+            return Err("Activity recipe is outside the library".into());
+        }
+        let canonical = fs::canonicalize(directory).map_err(|error| error.to_string())?;
+        let before = mutation::read_optional(path)?.ok_or("Activity recipe was removed")?;
+        if before != original
+            || fs::canonicalize(path)
+                .map_err(|error| error.to_string())?
+                .parent()
+                != Some(canonical.as_path())
+        {
+            return Err(
+                "Activity recipe changed outside this editor. Close and reopen it before saving."
+                    .into(),
+            );
+        }
+        for (other, loaded) in
+            crate::map::library_files(directory).map_err(|error| error.to_string())?
+        {
+            if other != path && loaded.map_err(|error| error.to_string())?.name == recipe.name {
+                return Err(format!(
+                    "Another activity already uses the internal name {}",
+                    recipe.name
+                ));
+            }
+        }
+        let bytes = serde_json::to_vec_pretty(recipe).map_err(|error| error.to_string())?;
+        mutation::publish(path, &bytes, Some(original))?;
+        Ok(bytes)
     }
 
     /// Bundled recipes replaced while opening, because a release changed them.
@@ -256,62 +308,65 @@ impl RecipeLibrary {
         let mut scan = RecipeLibraryScan::default();
         for path in paths {
             match WeaponRecipe::load_listing_details(&path) {
-                Ok((recipe, armor_origin)) => scan.entries.push(RecipeLibraryEntry {
-                    // Read first, while the fields below have not yet moved out of the recipe.
-                    art: crate::icon_art::Art::of(&recipe),
-                    armor_origin,
-                    kind: recipe.kind,
-                    collection_destination: recipe.overrides.collection_destination,
-                    armor_class: recipe.overrides.armor_class,
-                    badge: recipe.overrides.badge.as_ref().map(|badge| LibraryBadge {
-                        name: badge.name.clone(),
-                        description: badge.description.clone(),
-                        icon: badge
-                            .icon
+                Ok((recipe, armor_origin, import_revision)) => {
+                    scan.entries.push(RecipeLibraryEntry {
+                        // Read first, while the fields below have not yet moved out of the recipe.
+                        art: crate::icon_art::Art::of(&recipe),
+                        armor_origin,
+                        import_revision,
+                        kind: recipe.kind,
+                        collection_destination: recipe.overrides.collection_destination,
+                        collection_position: recipe.overrides.collection_position,
+                        armor_class: recipe.overrides.armor_class,
+                        badge: recipe.overrides.badge.as_ref().map(|badge| LibraryBadge {
+                            name: badge.name.clone(),
+                            description: badge.description.clone(),
+                            icon: badge
+                                .icon
+                                .as_ref()
+                                .map(crate::presentation::Artwork::fingerprint),
+                        }),
+                        corner_icon: recipe
+                            .overrides
+                            .corner_icon
                             .as_ref()
                             .map(crate::presentation::Artwork::fingerprint),
-                    }),
-                    corner_icon: recipe
-                        .overrides
-                        .corner_icon
-                        .as_ref()
-                        .map(crate::presentation::Artwork::fingerprint),
-                    bundled: path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| {
-                            BUNDLED_RECIPES
-                                .iter()
-                                .any(|(file_name, _)| name == *file_name)
-                        }),
-                    path,
-                    donor_hash: recipe.donor.item_hash.parse_u32().unwrap_or_default(),
-                    type_donor_hash: recipe.type_donor_hash(),
-                    identity_hash: recipe.identity.item_hash.parse_u32().unwrap_or_default(),
-                    type_name: recipe.type_name,
-                    class_type_name: (recipe.kind == crate::ItemKind::Subclass)
-                        .then(|| {
-                            crate::subclass::class_type_name(
-                                recipe.overrides.subclass_every_class,
-                                recipe.overrides.subclass_class,
-                            )
-                        })
-                        .flatten(),
-                    ammo_type: recipe.overrides.ammo_type,
-                    damage_type: recipe.overrides.modern_damage_type,
-                    rarity: recipe.overrides.rarity,
-                    icon_hash: recipe
-                        .icon_donor
-                        .as_ref()
-                        .or(recipe.presentation_donor.as_ref())
-                        .unwrap_or(&recipe.donor)
-                        .item_hash
-                        .parse_u32()
-                        .unwrap_or_default(),
-                    icon_edit: recipe.overrides.icon_edit,
-                    name: recipe.name,
-                    namespace: recipe.namespace,
-                }),
+                        bundled: path.file_name().and_then(|name| name.to_str()).is_some_and(
+                            |name| {
+                                BUNDLED_RECIPES
+                                    .iter()
+                                    .any(|(file_name, _)| name == *file_name)
+                            },
+                        ),
+                        path,
+                        donor_hash: recipe.donor.item_hash.parse_u32().unwrap_or_default(),
+                        type_donor_hash: recipe.type_donor_hash(),
+                        identity_hash: recipe.identity.item_hash.parse_u32().unwrap_or_default(),
+                        type_name: recipe.type_name,
+                        class_type_name: (recipe.kind == crate::ItemKind::Subclass)
+                            .then(|| {
+                                crate::subclass::class_type_name(
+                                    recipe.overrides.subclass_every_class,
+                                    recipe.overrides.subclass_class,
+                                )
+                            })
+                            .flatten(),
+                        ammo_type: recipe.overrides.ammo_type,
+                        damage_type: recipe.overrides.modern_damage_type,
+                        rarity: recipe.overrides.rarity,
+                        icon_hash: recipe
+                            .icon_donor
+                            .as_ref()
+                            .or(recipe.presentation_donor.as_ref())
+                            .unwrap_or(&recipe.donor)
+                            .item_hash
+                            .parse_u32()
+                            .unwrap_or_default(),
+                        icon_edit: recipe.overrides.icon_edit,
+                        name: recipe.name,
+                        namespace: recipe.namespace,
+                    })
+                }
                 Err(error) => scan.errors.push(format!("{}: {error}", path.display())),
             }
         }
@@ -330,6 +385,7 @@ impl RecipeLibrary {
                         path,
                         name: recipe.name,
                         title: recipe.title,
+                        destination: recipe.destination,
                         source: recipe.source.is_some(),
                     }),
                     Err(error) => scan.errors.push(error.to_string()),
@@ -460,7 +516,8 @@ impl RecipeLibrary {
 
     #[cfg(test)]
     pub fn save_existing(&self, path: &Path, recipe: &WeaponRecipe) -> Result<(), String> {
-        self.save_existing_checked(path, recipe, None)
+        self.save_existing_checked(path, recipe, None, false)
+            .map(|_| ())
     }
 
     /// Serializes library writers and checks external edits again before publication.
@@ -471,7 +528,22 @@ impl RecipeLibrary {
         baseline: &WeaponRecipe,
         recipe: &WeaponRecipe,
     ) -> Result<(), String> {
-        self.save_existing_checked(path, recipe, Some(baseline))
+        self.save_existing_checked(path, recipe, Some(baseline), false)
+            .map(|_| ())
+    }
+
+    /// [`Self::save_existing_if_unchanged`] for a write that replaces part of the reader's own
+    /// work, such as a reimport taking the conversion's sockets. The file it replaces is first
+    /// kept in a new folder under the library's `backups/recipes`, whose path it returns.
+    #[cfg(feature = "d2-model-importer")]
+    pub fn save_existing_with_backup(
+        &self,
+        path: &Path,
+        baseline: &WeaponRecipe,
+        recipe: &WeaponRecipe,
+    ) -> Result<PathBuf, String> {
+        self.save_existing_checked(path, recipe, Some(baseline), true)?
+            .ok_or_else(|| "The recipe was saved without a backup".into())
     }
 
     fn save_existing_checked(
@@ -479,7 +551,8 @@ impl RecipeLibrary {
         path: &Path,
         recipe: &WeaponRecipe,
         baseline: Option<&WeaponRecipe>,
-    ) -> Result<(), String> {
+        back_up: bool,
+    ) -> Result<Option<PathBuf>, String> {
         let _lock = self.lock()?;
         let target = self.confined_existing_path(path)?;
         self.ensure_unique_identity(recipe, Some(&target))?;
@@ -498,7 +571,23 @@ impl RecipeLibrary {
                 return Err("This recipe changed on disk after you opened it. Your draft is still here. Export it to a separate file, then reopen the library recipe to reconcile the changes.".into());
             }
         }
-        mutation::publish(&target, encoded.as_bytes(), Some(&original))
+        let backup = if back_up {
+            let folder = self.create_restore_backup()?;
+            let name = target
+                .file_name()
+                .ok_or("The recipe has no file name to back up")?;
+            sundial::storage::create_file(&folder.join(name), &original).map_err(|error| {
+                format!(
+                    "Could not back up the recipe in {}: {error}",
+                    folder.display()
+                )
+            })?;
+            Some(folder)
+        } else {
+            None
+        };
+        mutation::publish(&target, encoded.as_bytes(), Some(&original))?;
+        Ok(backup)
     }
 
     pub fn import(&self, source: &Path) -> Result<(PathBuf, WeaponRecipe), String> {
@@ -713,28 +802,33 @@ impl RecipeLibrary {
                 continue;
             }
             // Names and identities only, so an embedded model is not restored for each recipe.
-            let existing = WeaponRecipe::load_listing(&path).map_err(|error| {
-                format!(
-                    "Could not verify recipe identity uniqueness because {} is invalid: {error}",
-                    path.display()
-                )
-            })?;
-            if existing
-                .namespace
-                .eq_ignore_ascii_case(&candidate.namespace)
-            {
+            let (namespace, existing_hashes) = match WeaponRecipe::load_listing(&path) {
+                Ok(existing) => {
+                    let hashes = existing
+                        .identity
+                        .parsed_hashes(&existing.namespace)
+                        .map_err(|error| {
+                            format!("Invalid identity in {}: {error}", path.display())
+                        })?;
+                    (existing.namespace, hashes)
+                }
+                // A recipe this version refuses still claims its namespace and identities, so
+                // they are read on their own rather than stopping every other save.
+                Err(_) => WeaponRecipe::load_claim(&path).map_err(|error| {
+                    format!(
+                        "Could not verify recipe identity uniqueness because {} is invalid: {error}",
+                        path.display()
+                    )
+                })?,
+            };
+            if namespace.eq_ignore_ascii_case(&candidate.namespace) {
                 return Err(format!(
                     "Recipe namespace {:?} is already used by {}",
                     candidate.namespace,
                     path.display()
                 ));
             }
-            let existing_hashes = existing
-                .identity
-                .parsed_hashes(&existing.namespace)
-                .map_err(|error| format!("Invalid identity in {}: {error}", path.display()))?
-                .into_iter()
-                .collect::<BTreeSet<_>>();
+            let existing_hashes = existing_hashes.into_iter().collect::<BTreeSet<_>>();
             if let Some(collision) = candidate_hashes.intersection(&existing_hashes).next() {
                 return Err(format!(
                     "Recipe identity hash 0x{collision:08X} is already used by {}",

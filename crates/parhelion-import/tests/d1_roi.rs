@@ -141,16 +141,28 @@ fn unpatchable_generations_keep_index_and_storage_together() -> Result<()> {
     // Test _unpatchable naming convention (alias for generation 0)
     let root2 = temp.path().join("source2");
     fs::create_dir(&root2)?;
-    package(&root2.join("xboxone_fixture_unp3_0.pkg"), 0, 0, 0, b"generation 3");
-    package(&root2.join("xboxone_fixture_unpatchable_0.pkg"), 0, 0, 0, b"generation 0 alias");
-    let mut data = fs::read(&root2.join("xboxone_fixture_unp3_0.pkg"))?;
+    package(
+        &root2.join("xboxone_fixture_unp3_0.pkg"),
+        0,
+        0,
+        0,
+        b"generation 3",
+    );
+    package(
+        &root2.join("xboxone_fixture_unpatchable_0.pkg"),
+        0,
+        0,
+        0,
+        b"generation 0 alias",
+    );
+    let mut data = fs::read(root2.join("xboxone_fixture_unp3_0.pkg"))?;
     data[0x10..0x18].copy_from_slice(&(55707u64 * 100).to_le_bytes());
     data[0x18..0x1C].copy_from_slice(&55707u32.to_le_bytes());
-    fs::write(&root2.join("xboxone_fixture_unp3_0.pkg"), data)?;
-    data = fs::read(&root2.join("xboxone_fixture_unpatchable_0.pkg"))?;
+    fs::write(root2.join("xboxone_fixture_unp3_0.pkg"), data)?;
+    data = fs::read(root2.join("xboxone_fixture_unpatchable_0.pkg"))?;
     data[0x10..0x18].copy_from_slice(&(52553u64 * 100).to_le_bytes());
     data[0x18..0x1C].copy_from_slice(&52553u32.to_le_bytes());
-    fs::write(&root2.join("xboxone_fixture_unpatchable_0.pkg"), data)?;
+    fs::write(root2.join("xboxone_fixture_unpatchable_0.pkg"), data)?;
     let source2 = Source::open(&root2, |_, _| {})?;
     // unp3 (gen 3) should win over unpatchable (gen 0) since 3 > 0
     ensure!(source2.read(0x81824000)?.0 == b"generation 3");
@@ -316,9 +328,8 @@ fn mounted_roi_armor_exports_both_bodies_and_original_referenced_streams() -> Re
                     );
                 }
                 if matches!(class, 0x80801A9C | 0x80801BF6) {
-                    models.insert(u32::from_le_bytes(
-                        raw[offset + 0x15C..offset + 0x160].try_into()?,
-                    ));
+                    let model = offset + if source.platform() == 7 { 0x15C } else { 0x1C4 };
+                    models.insert(u32::from_le_bytes(raw[model..model + 4].try_into()?));
                 }
             }
             let exported = body["models"]
@@ -351,7 +362,7 @@ fn mounted_roi_armor_exports_both_bodies_and_original_referenced_streams() -> Re
 }
 
 #[test]
-fn ps4_packages_pass_discovery_gate_and_block_export() -> Result<()> {
+fn ps4_packages_pass_discovery_and_export_gates() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let root = temp.path().join("source");
     fs::create_dir_all(&root)?;
@@ -382,18 +393,19 @@ fn ps4_packages_pass_discovery_gate_and_block_export() -> Result<()> {
         "weapons() still has a platform-8-only gate: {weapon_err}"
     );
     // armor export now passes the platform gate; it fails on missing investment tables.
-    let export_err = source.export_armor(0, temp.path().join("out").as_path()).unwrap_err();
+    let export_err = source
+        .export_armor(0, temp.path().join("out").as_path())
+        .unwrap_err();
     ensure!(
         !export_err.to_string().contains("not yet supported"),
         "export_armor must no longer block PS4 at the platform gate: {export_err}"
     );
-    // weapon export is still blocked with a clear PS4 message until Phase 4.
     let export_err = source
         .export_weapon(0, temp.path().join("out2").as_path())
         .unwrap_err();
     ensure!(
-        export_err.to_string().contains("PS4"),
-        "export_weapon must name PS4 in its not-yet-supported message: {export_err}"
+        !export_err.to_string().contains("not yet supported"),
+        "export_weapon must no longer block PS4 at the platform gate: {export_err}"
     );
     Ok(())
 }

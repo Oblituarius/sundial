@@ -67,6 +67,18 @@ impl PackageAuthoringApp {
             WorkbenchPage::Advanced => {
                 let donor = self.current_donor();
                 self.draw_gameplay_workspace(ui, donor.as_ref());
+                // A behavior chosen here claims its sockets in the same frame, so the choice and
+                // the perks it places are one undo step. Undo then never lands between them,
+                // where the next sync would take the perks straight back.
+                if self.recipe.kind.is_weapon()
+                    && let Some(donor) = &donor
+                {
+                    super::socket_editor::sync_behavior_socket_pins(
+                        &mut self.recipe,
+                        &mut self.behavior_pins,
+                        donor,
+                    );
+                }
             }
             WorkbenchPage::Identity => self.draw_identity_workspace(ui),
         }
@@ -251,6 +263,20 @@ impl PackageAuthoringApp {
     }
 
     pub(super) fn draw_recipe_library_actions(&mut self, ui: &mut egui::Ui, replaced: &mut bool) {
+        for (label, redo, key) in [("Undo", false, egui::Key::Z), ("Redo", true, egui::Key::Y)] {
+            let shortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, key);
+            if ui
+                .add_enabled(
+                    self.recipe_history_available(redo),
+                    egui::Button::new(label).shortcut_text(ui.ctx().format_shortcut(&shortcut)),
+                )
+                .clicked()
+            {
+                self.restore_recipe_history(ui.ctx(), redo);
+                ui.close();
+            }
+        }
+        ui.separator();
         if ui
             .button("Duplicate")
             .on_hover_text(

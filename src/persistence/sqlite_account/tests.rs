@@ -10,6 +10,7 @@ use sundial_account::{
 
 mod package;
 mod safety;
+pub(crate) mod versions;
 
 pub(crate) fn default_resources() -> super::AccountDefaults {
     super::AccountDefaults {
@@ -17,6 +18,17 @@ pub(crate) fn default_resources() -> super::AccountDefaults {
         rows: include_str!("fixtures/investment_defaults.sql").to_owned(),
         settings_schema: super::contract::SETTINGS_SCHEMA.to_owned(),
         settings_rows: include_str!("fixtures/account_settings_defaults.sql").to_owned(),
+        starter: None,
+    }
+}
+
+/// The schema v3 resources Sunrise 0.6 installs, with the account settings tables v2 shares.
+pub(crate) fn v3_resources() -> super::AccountDefaults {
+    super::AccountDefaults {
+        schema: super::contract::SCHEMA_V3.to_owned(),
+        rows: include_str!("fixtures/v3/investment_defaults.sql").to_owned(),
+        starter: Some(super::contract::STARTER_V3.to_owned()),
+        ..default_resources()
     }
 }
 

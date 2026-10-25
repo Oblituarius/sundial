@@ -9,6 +9,8 @@ impl PackageAuthoringApp {
         ui.spacing_mut().item_spacing.y = 4.0;
         let donor = self.current_donor();
         let model = self.catalog.is_some() && donor.is_some();
+        #[cfg(feature = "d2-model-importer")]
+        let model = model || self.recipe.overrides.imported_graph.is_some();
         let column = egui::Layout::top_down(egui::Align::Min);
         if let Some(donor_width) = workbench_left_column_width(ui.available_width()) {
             let spacing = ui.spacing().item_spacing.x;
@@ -94,19 +96,39 @@ impl PackageAuthoringApp {
         }
     }
 
-    /// The recipe's weapon as the game draws it: the appearance donor's model in the recipe's
-    /// colors with its ornament, turning on drag. Beside the weapon's text it ends where the
+    /// The recipe's selected model, including pinned imported assets, turning on drag.
+    /// Beside the weapon's text it ends where the
     /// donor column ends, `band`, within its bounds. Its corner opens the model viewer, which
     /// has the full tools.
-    fn draw_weapon_preview(&self, ui: &mut egui::Ui, band: Option<f32>) {
+    pub(in crate::app) fn draw_weapon_preview(&self, ui: &mut egui::Ui, band: Option<f32>) {
+        let id = egui::Id::new("weapon-preview");
+        let width = ui.available_width();
+        let height = preview_height(width, band);
+        #[cfg(feature = "d2-model-importer")]
+        if let Some(reference) = &self.recipe.overrides.imported_graph {
+            let appearance = crate::imported::preview::appearance(reference, self.recipe.kind);
+            sundial::ui::model_preview::still::placeholder(ui.ctx(), id, None);
+            let response = sundial::ui::model_preview::still::show_local(
+                ui,
+                id,
+                &self.packages,
+                appearance.clone(),
+                egui::vec2(width, height),
+            );
+            sundial::ui::model_preview::pop_out_local(
+                ui,
+                id,
+                response.rect,
+                &self.packages,
+                (appearance, &self.recipe.name),
+            );
+            return;
+        }
         let Some(catalog) = self.catalog.as_ref() else {
             return;
         };
         let appearance = donor_view::preview::loadout(catalog, &self.recipe)
             .map(|loadout| catalog.preview_appearance(&loadout));
-        let id = egui::Id::new("weapon-preview");
-        let width = ui.available_width();
-        let height = preview_height(width, band);
         // The appearance's icon stands in until its model is read.
         let icon = self
             .recipe
@@ -538,7 +560,12 @@ impl PackageAuthoringApp {
         #[cfg(not(feature = "d2-model-importer"))]
         let importing = false;
         ui.add_space(6.0);
-        if importing || self.appearance_ornaments_offered() {
+        #[cfg(feature = "d2-model-importer")]
+        if imported {
+            imported_view::part(&self.recipe, ui, imported_view::Part::Model);
+            self.draw_imported_model_picker(ui);
+        }
+        if !imported && (importing || self.appearance_ornaments_offered()) {
             ui.horizontal(|ui| {
                 let width = Self::appearance_label_width(ui);
                 ui.allocate_ui_with_layout(
@@ -649,7 +676,7 @@ impl PackageAuthoringApp {
         )
         .on_hover_text(
             "Shaders with an animated glow also light this weapon's glowing parts, such as sights \
-             and vents. Other parts stay as they are",
+             and vents. Other parts stay as they are.",
         )
         .on_disabled_hover_text("Imported models keep their own materials.");
     }
@@ -1100,8 +1127,8 @@ impl PackageAuthoringApp {
             let reset = ui
                 .horizontal_wrapped(|ui| {
                     style::heading(ui, "Weapon Stats", !donor_exact).on_hover_text(
-                        "Each row reads its in-game value, such as RPM, then the raw value saved \
-                         to the weapon. Added stats need stat group support",
+                        "Each row includes the starting perks in its displayed value. The field \
+                         edits the weapon's own raw value. Hover a reading for its breakdown.",
                     );
                     !donor_exact && style::reset_icon(ui, "Reset Weapon Stats")
                 })
@@ -1120,11 +1147,19 @@ impl PackageAuthoringApp {
                         );
                     self.draw_stat_group_picker(ui, Some(donor));
                 });
-            let warnings = self
+            let contributions = starting_plugs(self.catalog.as_ref(), &self.recipe, donor);
+            let magazine = self.magazine_reading(ui.ctx(), donor, &contributions);
+            let mut warnings = self
                 .rate_conversion_warning(donor)
                 .map(|warning| (super::stat_editor::ROUNDS_PER_MINUTE_HASH, warning))
                 .into_iter()
                 .collect::<Vec<_>>();
+            if magazine.as_ref().is_some_and(|reading| reading.now <= 0) {
+                warnings.push((
+                    super::stat_editor::MAGAZINE_HASH,
+                    "The game hides the Magazine row at 0".to_owned(),
+                ));
+            }
             // In the order the game lists the stats of the group the weapon displays with.
             let order = self
                 .recipe
@@ -1141,7 +1176,8 @@ impl PackageAuthoringApp {
                 &mut self.recipe.overrides.removed_investment_stats,
                 donor,
                 (self.show_internal_stats, &order),
-                &warnings,
+                (&warnings, magazine.as_ref()),
+                &contributions,
             );
         } else {
             ui.heading("Weapon Stats");

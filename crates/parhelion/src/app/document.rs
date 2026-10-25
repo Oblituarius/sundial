@@ -2,6 +2,18 @@
 use super::*;
 
 impl PackageAuthoringApp {
+    pub(super) fn activity_dirty(&self) -> bool {
+        #[cfg(feature = "d2-model-importer")]
+        {
+            self.activity_editor
+                .as_ref()
+                .is_some_and(super::activity_view::Editor::dirty)
+        }
+        #[cfg(not(feature = "d2-model-importer"))]
+        {
+            false
+        }
+    }
     /// Persistent storage belongs to the desktop open action, not UI construction.
     pub(super) fn initialize_storage(&mut self) {
         if self.recipe_library.is_some() {
@@ -69,6 +81,8 @@ impl PackageAuthoringApp {
         self.backup_recipe_snapshots = backup_preferences.backup_recipe_snapshots;
         self.show_preview_fps = backup_preferences.show_preview_fps;
         self.play_preview_animations = backup_preferences.play_preview_animations;
+        self.load_preview_models = backup_preferences.load_preview_models;
+        self.ability_notice_dismissed = backup_preferences.ability_notice_dismissed;
         self.log = log;
     }
 
@@ -85,6 +99,7 @@ impl PackageAuthoringApp {
                 .invalid_weapon_name
                 .as_ref()
                 .map(|(_, error)| error.clone()),
+            activity_dirty: self.activity_dirty(),
             open: self.recipe_path.clone().map(|path| OpenRecipe {
                 path,
                 recipe: self.recipe.clone(),
@@ -140,6 +155,7 @@ impl PackageAuthoringApp {
 /// What a build reads from the window, so its recipes load and are checked away from it.
 pub(super) struct BuildInputs {
     invalid_name: Option<String>,
+    activity_dirty: bool,
     open: Option<OpenRecipe>,
     /// The recipes and maps the build includes.
     enabled: BTreeSet<PathBuf>,
@@ -184,12 +200,46 @@ impl RecipeRead {
 }
 
 impl BuildInputs {
+    /// Progress uses the selected name without restoring embedded assets just to label a read.
+    pub(super) fn recipe_name(&self, path: &Path) -> String {
+        self.open
+            .as_ref()
+            .filter(|open| open.path == path)
+            .map(|open| open.recipe.name.as_str())
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| {
+                self.library_items
+                    .iter()
+                    .find(|item| item.path == path)
+                    .map(|item| item.name.as_str())
+                    .filter(|name| !name.trim().is_empty())
+            })
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                path.file_name().and_then(|name| name.to_str()).map_or_else(
+                    || path.display().to_string(),
+                    |name| name.trim_end_matches(".parhelion.json").to_owned(),
+                )
+            })
+    }
+
+    #[cfg(test)]
     pub(super) fn request(&self) -> Result<BatchBuildRequest, String> {
+        self.request_reporting(&mut |_, _, _| {})
+    }
+
+    /// As [`Self::request`], calling `progress` with each selected recipe's file, how many were
+    /// read before it and how many there are, as it starts reading the file. A recipe that embeds
+    /// an imported model can be hundreds of megabytes, so a build reports each one.
+    pub(super) fn request_reporting(
+        &self,
+        progress: &mut dyn FnMut(&Path, usize, usize),
+    ) -> Result<BatchBuildRequest, String> {
         Ok(BatchBuildRequest {
             package_directory: self.package_directory.clone(),
             staging_root: self.staging_root.clone(),
             ignore_installed_authored_overlays: self.ignore_installed,
-            recipes: self.recipes(RecipeRead::Build)?,
+            recipes: self.recipes(RecipeRead::Build, progress)?,
             maps: crate::map::load_selected(
                 self.enabled
                     .intersection(&self.map_paths)
@@ -202,7 +252,7 @@ impl BuildInputs {
     /// The removal warning needs identities and socket dependencies, not restored assets.
     /// The build still rereads complete recipes and checks the open draft against disk.
     pub(super) fn included_item_hashes(&self) -> Result<BTreeSet<u32>, String> {
-        self.recipes(RecipeRead::Listing)?
+        self.recipes(RecipeRead::Listing, &mut |_, _, _| {})?
             .iter()
             .map(|recipe| {
                 recipe
@@ -214,7 +264,14 @@ impl BuildInputs {
             .collect()
     }
 
-    fn recipes(&self, read: RecipeRead) -> Result<Vec<WeaponRecipe>, String> {
+    fn recipes(
+        &self,
+        read: RecipeRead,
+        progress: &mut dyn FnMut(&Path, usize, usize),
+    ) -> Result<Vec<WeaponRecipe>, String> {
+        if self.activity_dirty {
+            return Err("Save or close the activity editor before building.".into());
+        }
         if self
             .open
             .as_ref()
@@ -223,10 +280,8 @@ impl BuildInputs {
         {
             return Err(error.clone());
         }
-        let mut recipes = Vec::with_capacity(self.enabled.len());
-        for path in self.enabled.difference(&self.map_paths) {
-            recipes.push(self.recipe(path, read)?);
-        }
+        let paths = self.enabled.difference(&self.map_paths).collect::<Vec<_>>();
+        let mut recipes = self.read_all(&paths, read, progress)?;
         if let Some(library) = &self.library {
             let included = recipes
                 .iter()
@@ -266,6 +321,85 @@ impl BuildInputs {
                     ));
                 }
                 recipes.push(recipe);
+            }
+        }
+        Ok(recipes)
+    }
+
+    /// Reads `paths` on up to four threads, in their order. `progress` sees each file as a thread
+    /// starts it. An error stops further reads, and the first error in order is returned.
+    fn read_all(
+        &self,
+        paths: &[&PathBuf],
+        read: RecipeRead,
+        progress: &mut dyn FnMut(&Path, usize, usize),
+    ) -> Result<Vec<WeaponRecipe>, String> {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        enum Event {
+            Started(usize),
+            Read(usize, Box<Result<WeaponRecipe, String>>),
+        }
+        let total = paths.len();
+        let workers = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZero::get)
+            .clamp(1, 4)
+            .min(total);
+        if workers <= 1 {
+            return paths
+                .iter()
+                .enumerate()
+                .map(|(index, path)| {
+                    progress(path, index, total);
+                    self.recipe(path, read)
+                })
+                .collect();
+        }
+        let next = AtomicUsize::new(0);
+        let stop = AtomicBool::new(false);
+        let mut results = (0..total).map(|_| None).collect::<Vec<_>>();
+        std::thread::scope(|scope| {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            for _ in 0..workers {
+                let sender = sender.clone();
+                let (next, stop) = (&next, &stop);
+                scope.spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(path) = paths.get(index) else {
+                            break;
+                        };
+                        if sender.send(Event::Started(index)).is_err() {
+                            break;
+                        }
+                        let result = self.recipe(path, read);
+                        if result.is_err() {
+                            stop.store(true, Ordering::Relaxed);
+                        }
+                        if sender.send(Event::Read(index, Box::new(result))).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            drop(sender);
+            let mut completed = 0;
+            for event in receiver {
+                match event {
+                    Event::Started(index) => progress(paths[index], completed, total),
+                    Event::Read(index, result) => {
+                        completed += 1;
+                        results[index] = Some(*result);
+                    }
+                }
+            }
+        });
+        // Reads are claimed in order, so every recipe before a failed one was read, and those
+        // never claimed come after it.
+        let mut recipes = Vec::with_capacity(total);
+        for result in results {
+            match result {
+                Some(result) => recipes.push(result?),
+                None => break,
             }
         }
         Ok(recipes)
@@ -426,6 +560,85 @@ impl PackageAuthoringApp {
         self.recipe_revision = self.recipe_revision.wrapping_add(1);
     }
 
+    /// Records what changed since the last frame as an undo step. Changes from one continuing drag
+    /// or one focused text field join the same step. Discard Changes is an ordinary step.
+    pub(super) fn record_recipe_history(&mut self, ctx: &egui::Context) {
+        if self.recipe != self.recorded_recipe {
+            let before = std::mem::replace(&mut self.recorded_recipe, self.recipe.clone());
+            let pins = std::mem::replace(&mut self.recorded_pins, self.behavior_pins.clone());
+            self.recipe_history.record((before, pins), ctx);
+        } else if self.recorded_pins != self.behavior_pins {
+            self.recorded_pins.clone_from(&self.behavior_pins);
+        }
+    }
+
+    /// History belongs to the open recipe. Opening, creating, importing or duplicating a recipe
+    /// starts it again, while saving keeps it, as perk documents do.
+    pub(super) fn reset_recipe_history(&mut self) {
+        self.recipe_history = Default::default();
+        self.recorded_recipe.clone_from(&self.recipe);
+        self.recorded_pins.clone_from(&self.behavior_pins);
+    }
+
+    /// Whether a build, install or library job, or an open perk edit, holds the recipe still.
+    pub(super) fn recipe_editing_locked(&self) -> bool {
+        self.build_receiver.is_some()
+            || self.library_state.busy()
+            || self.install_receiver.is_some()
+            || self.perk_workbench.editing()
+    }
+
+    pub(super) fn recipe_history_available(&self, redo: bool) -> bool {
+        !self.recipe_editing_locked() && self.recipe_history.available(redo)
+    }
+
+    pub(super) fn restore_recipe_history(&mut self, ctx: &egui::Context, redo: bool) {
+        if self.recipe_editing_locked() {
+            return;
+        }
+        self.record_recipe_history(ctx);
+        let mut state = (self.recipe.clone(), self.behavior_pins.clone());
+        if !self.recipe_history.restore(&mut state, redo) {
+            return;
+        }
+        (self.recipe, self.behavior_pins) = state;
+        self.recorded_recipe.clone_from(&self.recipe);
+        self.recorded_pins.clone_from(&self.behavior_pins);
+        // A name still being corrected belongs to the state left behind.
+        self.invalid_weapon_name = None;
+        self.barrel_controls.invalidate();
+        self.runtime_donors.invalidate();
+        self.synchronize_recipe_dirty();
+    }
+
+    /// Ctrl+Z undoes and Ctrl+Y or Ctrl+Shift+Z redoes while the pointer is over the editor
+    /// rather than a window. A focused text field keeps the keys for its own undo.
+    pub(super) fn recipe_history_shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.egui_wants_keyboard_input()
+            || ctx.memory(|memory| memory.top_modal_layer().is_some())
+            || egui::Popup::is_any_open(ctx)
+        {
+            return;
+        }
+        let over_editor = ctx
+            .input(|input| input.pointer.latest_pos())
+            .and_then(|pointer| ctx.layer_id_at(pointer))
+            .is_none_or(|layer| layer.order == egui::Order::Background);
+        if !over_editor {
+            return;
+        }
+        if ctx.input_mut(|input| {
+            input.consume_key(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::Z,
+            ) || input.consume_key(egui::Modifiers::COMMAND, egui::Key::Y)
+        }) {
+            self.restore_recipe_history(ctx, true);
+        } else if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Z)) {
+            self.restore_recipe_history(ctx, false);
+        }
+    }
+
     pub(super) fn discard_recipe_changes(&mut self) {
         self.recipe = self.recipe_baseline.clone();
         self.advance_recipe_revision();
@@ -437,6 +650,11 @@ impl PackageAuthoringApp {
     }
 
     pub(super) fn request_recipe_action(&mut self, action: PendingRecipeAction) -> bool {
+        #[cfg(feature = "d2-model-importer")]
+        if matches!(action, PendingRecipeAction::Close) && self.activity_dirty() {
+            self.confirm_activity_close();
+            return false;
+        }
         self.pending_recipe_error = None;
         if self.recipe_dirty {
             self.pending_recipe_action = Some(action);
@@ -472,6 +690,9 @@ impl PackageAuthoringApp {
     }
 
     pub(super) fn open_recipe_path(&mut self, path: &Path) -> bool {
+        // The preview and source card of an imported recipe share one hashed check per opening.
+        #[cfg(feature = "d2-model-importer")]
+        parhelion_import::forget_opened();
         match WeaponRecipe::load_json(path) {
             Ok(recipe) => {
                 self.recipe = recipe;
@@ -481,6 +702,7 @@ impl PackageAuthoringApp {
                 self.recipe_path = Some(path.to_path_buf());
                 self.recipe_requires_initial_save = false;
                 self.recipe_dirty = false;
+                self.reset_recipe_history();
                 self.clear_dependent_picker_queries();
                 self.scroll_recipe_to_top = true;
                 self.invalidate_results();
@@ -521,6 +743,7 @@ impl PackageAuthoringApp {
         self.recipe_path = None;
         self.recipe_requires_initial_save = true;
         self.recipe_dirty = true;
+        self.reset_recipe_history();
         self.clear_dependent_picker_queries();
         self.scroll_recipe_to_top = true;
         self.invalidate_results();
@@ -543,6 +766,7 @@ impl PackageAuthoringApp {
         self.recipe_path = None;
         self.recipe_requires_initial_save = false;
         self.recipe_dirty = false;
+        self.reset_recipe_history();
         self.clear_dependent_picker_queries();
         self.scroll_recipe_to_top = true;
         self.invalidate_results();
@@ -680,6 +904,7 @@ impl PackageAuthoringApp {
                 self.advance_recipe_revision();
                 self.recipe_path = Some(destination.clone());
                 self.recipe_dirty = false;
+                self.reset_recipe_history();
                 self.clear_dependent_picker_queries();
                 self.scroll_recipe_to_top = true;
                 self.invalidate_results();

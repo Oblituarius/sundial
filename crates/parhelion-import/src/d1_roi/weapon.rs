@@ -5,7 +5,6 @@ use std::collections::BTreeSet;
 
 mod runtime;
 mod stats;
-mod talent;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Weapon {
@@ -24,7 +23,10 @@ pub struct Weapon {
 impl Source {
     pub fn weapons(&self) -> Result<Vec<Weapon>> {
         ensure!(
-            self.report.selected.iter().all(|p| matches!(p.platform, 7 | 8)),
+            self.report
+                .selected
+                .iter()
+                .all(|p| matches!(p.platform, 7 | 8)),
             "Weapon discovery requires Xbox One or PS4 Rise of Iron packages"
         );
         let (_, definitions) = self.table(0x80801933)?;
@@ -166,10 +168,6 @@ impl Source {
     /// Export executable talent references and every selectable source model.
     /// This provenance bundle does not claim native runtime compatibility.
     pub fn export_weapon(&self, hash: u32, output: &Path) -> Result<PathBuf> {
-        ensure!(
-            self.platform() != 7,
-            "PS4 weapon export is not yet supported"
-        );
         let output = self.output(output)?;
         let item = self
             .weapons()?
@@ -180,11 +178,21 @@ impl Source {
         for tag in [item.definition, item.strings] {
             assets.insert(tag, self.read(tag)?);
         }
-        let art = self.weapon_art(&item, &mut assets)?;
-        let talents = self.weapon_talents(&item, &mut assets)?;
-        let stats = self.weapon_stats(&item, &mut assets)?;
-        let runtime = self.weapon_runtime(&item, &mut assets)?;
-        let dyes = self.dyes(item.definition, &mut assets)?;
+        let art = self
+            .weapon_art(&item, &mut assets)
+            .context("Source weapon art")?;
+        let talents = self
+            .item_talents(item.definition, &mut assets)
+            .context("Source weapon talents")?;
+        let stats = self
+            .weapon_stats(&item, &mut assets)
+            .context("Source weapon stats")?;
+        let runtime = self
+            .weapon_runtime(&item, &mut assets)
+            .context("Source weapon runtime")?;
+        let dyes = self
+            .dyes(item.definition, &mut assets)
+            .context("Source weapon dyes")?;
         self.unchanged()?;
         fs::create_dir_all(&output)?;
         let assets = self.write_assets(&output, assets)?;

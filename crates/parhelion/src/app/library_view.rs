@@ -176,6 +176,7 @@ fn draw_recipe_search(
     query: &mut String,
     sort: &mut SortOrder,
     kind: &mut Option<ItemKind>,
+    activities_only: &mut bool,
     focus: &mut bool,
 ) {
     ui.horizontal(|ui| {
@@ -193,11 +194,38 @@ fn draw_recipe_search(
         }
         egui::ComboBox::from_id_salt((id, "kind"))
             .width(132.0)
-            .selected_text(kind.map_or("All Items", ItemKind::plural))
+            .selected_text(if *activities_only {
+                "Activities"
+            } else {
+                kind.map_or("All Items", ItemKind::plural)
+            })
             .show_ui(ui, |ui| {
-                ui.selectable_value(kind, None, "All Items");
+                if ui
+                    .selectable_label(kind.is_none() && !*activities_only, "All Items")
+                    .clicked()
+                {
+                    *kind = None;
+                    *activities_only = false;
+                }
+                #[cfg(feature = "d2-model-importer")]
+                if ui
+                    .selectable_label(*activities_only, "Activities")
+                    .clicked()
+                {
+                    *kind = None;
+                    *activities_only = true;
+                }
                 for option in ItemKind::ALL {
-                    ui.selectable_value(kind, Some(option), option.plural());
+                    if ui
+                        .selectable_label(
+                            *kind == Some(option) && !*activities_only,
+                            option.plural(),
+                        )
+                        .clicked()
+                    {
+                        *kind = Some(option);
+                        *activities_only = false;
+                    }
                 }
             });
         egui::ComboBox::from_id_salt(id)
@@ -220,6 +248,7 @@ fn draw_recipe_search(
 /// Both library navigation and build selection use the authored weapon preview.
 fn draw_library_row(
     ui: &mut egui::Ui,
+    catalog: Option<&InvestmentCatalog>,
     icons: &mut LibraryIcons,
     entry: &RecipeLibraryEntry,
     details: &str,
@@ -411,13 +440,7 @@ fn draw_library_row(
                 menu_action = actions::entry_menu(ui, entry, state.can_restore);
             });
         }
-        let clicked = response
-            .on_hover_ui(|ui| {
-                sundial::investment::tooltip_title(ui, &entry.namespace);
-                ui.label(details);
-                ui.label(action);
-            })
-            .clicked();
+        let clicked = library_tooltip(response, catalog, icons, entry, details, action).clicked();
         LibraryRowResponse {
             activated: clicked || checkbox_changed,
             action: menu_action,
@@ -426,12 +449,53 @@ fn draw_library_row(
     .inner
 }
 
+/// A recipe row's tooltip: the game's item tooltip on its base item's band once the catalog has
+/// loaded, with what the row is and what clicking it does as its note.
+fn library_tooltip(
+    response: egui::Response,
+    catalog: Option<&InvestmentCatalog>,
+    icons: &LibraryIcons,
+    entry: &RecipeLibraryEntry,
+    details: &str,
+    action: &str,
+) -> egui::Response {
+    let Some(catalog) = catalog.filter(|_| entry.donor_hash != 0) else {
+        return response.on_hover_ui(|ui| {
+            sundial::investment::tooltip_title(ui, &entry.namespace);
+            ui.label(details);
+            ui.label(action);
+        });
+    };
+    let note = format!("{}\n{details}\n{action}", entry.namespace);
+    // The recipe's own icon, never the base item's while it loads.
+    let icon = match icons.previews.get(&entry.path) {
+        Some(AuthoredIconPreview::Ready { texture, .. }) => {
+            sundial::investment::IconOverride::Texture(texture.id())
+        }
+        _ => sundial::investment::IconOverride::Pending,
+    };
+    catalog.item_tooltip(
+        response,
+        entry.donor_hash,
+        sundial::investment::ItemTooltip {
+            name: Some(&entry.name),
+            type_name: entry.type_name.as_deref().or(entry.class_type_name),
+            // The base item's text and stats are not the recipe's.
+            description: Some(""),
+            rarity: entry.rarity.map(|rarity| rarity as u8 + 1),
+            icon: Some(icon),
+            note: Some(&note),
+            template: true,
+        },
+    )
+}
+
 /// A map's row details: what it is, and the game its level comes from.
 fn map_details(map: &crate::recipe_library::MapLibraryEntry) -> &'static str {
     if map.source {
-        "Crucible Map · Halo: Reach"
+        "Activity · Halo: Reach"
     } else {
-        "Crucible Map"
+        "Activity"
     }
 }
 
@@ -456,8 +520,8 @@ fn matching_maps<'a>(
 }
 
 /// A map's row, drawn as a recipe's is, with a map glyph for its icon. With `inclusion` it
-/// carries a build selection checkbox, and without one it opens nothing, as maps have no editor.
-/// Returns whether the selection toggled.
+/// carries a build selection checkbox, and without one it opens the activity editor.
+/// Returns whether the row was activated.
 fn draw_map_row(
     ui: &mut egui::Ui,
     map: &crate::recipe_library::MapLibraryEntry,
@@ -475,15 +539,7 @@ fn draw_map_row(
             egui::vec2(ui.available_width(), row_height),
             egui::Sense::hover(),
         );
-        let response = ui.interact(
-            rect,
-            ui.make_persistent_id("map-row"),
-            if inclusion.is_some() {
-                egui::Sense::CLICK
-            } else {
-                egui::Sense::hover()
-            },
-        );
+        let response = ui.interact(rect, ui.make_persistent_id("map-row"), egui::Sense::CLICK);
         let visuals = ui.style().interact_selectable(&response, current);
         let fill = if current {
             ui.visuals().selection.bg_fill
@@ -585,7 +641,7 @@ fn draw_map_row(
                 ui.label(if inclusion.is_some() {
                     "Toggle selection"
                 } else {
-                    "Maps have no editor yet"
+                    "Open activity recipe"
                 });
             })
             .clicked();
@@ -814,6 +870,7 @@ impl PackageAuthoringApp {
                     &mut self.build_selection_query,
                     &mut self.library_state.sort,
                     &mut self.library_state.kind,
+                    &mut self.library_state.activities_only,
                     &mut self.recipe_search_focus_pending,
                 );
                 let query = self.build_selection_query.trim().to_lowercase();
@@ -844,6 +901,7 @@ impl PackageAuthoringApp {
                             let included = draft.contains(&entry.path);
                             if draw_library_row(
                                 ui,
+                                self.catalog.as_ref(),
                                 &mut self.library_icons,
                                 entry,
                                 details,

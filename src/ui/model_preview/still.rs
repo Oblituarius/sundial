@@ -34,10 +34,12 @@ type Wanted = (
     PathBuf,
     Subject,
     Option<Arc<BTreeMap<usize, crate::dyes::DyeSource>>>,
+    Option<u64>,
 );
 
 #[derive(Default)]
 struct Still {
+    access: Option<Arc<crate::catalog::PackageInspectionAccess>>,
     /// The appearance the page asks for.
     wanted: Option<Wanted>,
     /// The appearance the model shows. An older one stays up while a newer one loads.
@@ -70,6 +72,8 @@ struct Still {
     software_frames: u64,
     /// What stands in for the model until the first one is read, such as the item's icon.
     placeholder: Option<egui::TextureHandle>,
+    /// The model Load Model asked for while previews don't load on their own.
+    requested: Option<Subject>,
 }
 
 /// The camera a model is fitted with: the default one, turned to `angle` when one is set.
@@ -125,6 +129,27 @@ pub fn show(
     show_sources(ui, id, packages, appearance, overrides, size, None)
 }
 
+/// Draw an installed Inspector appearance with package suspension and generation invalidation.
+pub(crate) fn show_inspected(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    packages: &Path,
+    appearance: Appearance,
+    size: egui::Vec2,
+    access: Arc<crate::catalog::PackageInspectionAccess>,
+) -> egui::Response {
+    show_subject(
+        ui,
+        id,
+        packages,
+        Some(Subject::Appearance(appearance)),
+        &[],
+        size,
+        None,
+        Some(access),
+    )
+}
+
 /// Draw local shader materials on ordinary native preview geometry before the recipe is built.
 pub fn show_sources(
     ui: &mut egui::Ui,
@@ -143,6 +168,7 @@ pub fn show_sources(
         overrides,
         size,
         sources,
+        None,
     )
 }
 
@@ -155,7 +181,16 @@ pub fn show_object(
     tag: Option<u32>,
     size: egui::Vec2,
 ) -> egui::Response {
-    show_subject(ui, id, packages, tag.map(Subject::Object), &[], size, None)
+    show_subject(
+        ui,
+        id,
+        packages,
+        tag.map(Subject::Object),
+        &[],
+        size,
+        None,
+        None,
+    )
 }
 
 /// Draw an unbuilt imported appearance through the native model and material renderer.
@@ -174,9 +209,11 @@ pub fn show_local(
         &[],
         size,
         None,
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn show_subject(
     ui: &mut egui::Ui,
     id: egui::Id,
@@ -185,6 +222,7 @@ fn show_subject(
     overrides: &[SurfaceOverride],
     size: egui::Vec2,
     sources: Option<Arc<BTreeMap<usize, crate::dyes::DyeSource>>>,
+    access: Option<Arc<crate::catalog::PackageInspectionAccess>>,
 ) -> egui::Response {
     let state = ui.ctx().data_mut(|data| {
         data.get_temp_mut_or_default::<Arc<Mutex<Still>>>(id)
@@ -196,15 +234,48 @@ fn show_subject(
     };
     let paused_id = paused_id(ui.ctx());
     let paused = !ui.is_enabled()
+        || access.as_ref().is_some_and(|access| access.is_suspended())
         || ui
             .ctx()
             .data(|data| data.get_temp::<bool>(paused_id))
             .unwrap_or(false);
-    still.wanted = subject.map(|subject| (packages.to_owned(), subject, sources));
+    let generation = access.as_ref().map(|access| access.generation());
+    let wanted = subject.map(|subject| (packages.to_owned(), subject, sources, generation));
+    if still
+        .wanted
+        .as_ref()
+        .zip(wanted.as_ref())
+        .is_some_and(|(old, new)| {
+            // An inspected still is one per window, so another item's model never stands in
+            // for the next item's while it loads.
+            old.0 != new.0 || old.3 != new.3 || (new.3.is_some() && !old.1.same_model(&new.1))
+        })
+    {
+        // No geometry or image from an older package snapshot may remain visible. The GPU
+        // state stays: it replaces and deletes the old upload when the next model is drawn,
+        // which a fresh state could not do for the old one's GL objects.
+        if let Some(load) = still.load.take() {
+            load.stop();
+        }
+        still.model = None;
+        still.bounds = None;
+        still.error = None;
+        still.texture = None;
+        still.rendered = None;
+        still.rendered_seconds = None;
+        still.software = image_job::Job::default();
+    }
+    still.access = access;
+    still.wanted = wanted;
     still.receive();
-    request_preview(&mut still, ui.ctx(), paused);
+    let held = still.hold(ui.ctx());
+    request_preview(&mut still, ui.ctx(), paused || held);
     still.interact(ui, &response);
-    still.draw(ui, rect, overrides, paused);
+    if held {
+        still.draw_held(ui, rect);
+    } else {
+        still.draw(ui, rect, overrides, paused);
+    }
     ui.painter().rect_stroke(
         rect,
         2.0,
@@ -288,7 +359,8 @@ impl Still {
             }
             return;
         }
-        if self.shown.as_ref() == Some(wanted)
+        // A model cleared with its packages is read again even when it was the one shown.
+        if (self.model.is_some() && self.shown.as_ref() == Some(wanted))
             || self
                 .error
                 .as_ref()
@@ -300,27 +372,115 @@ impl Still {
         let load = model_preview::Load::default();
         self.pending = Some((wanted.clone(), receiver));
         self.load = Some(load.clone());
-        let (packages, subject, sources) = wanted.clone();
+        let (packages, subject, sources, generation) = wanted.clone();
+        let access = self.access.clone();
         let (repaint, viewport) = (ctx.clone(), ctx.viewport_id());
         let read = model_preview::PackageRead::start();
         std::thread::spawn(move || {
             let _read = read;
-            let model = match &subject {
-                Subject::Appearance(appearance) => {
-                    model_preview::appearance::load_reported(&packages, appearance, &load)
+            let read_model = || {
+                if access
+                    .as_ref()
+                    .is_some_and(|access| Some(access.generation()) != generation)
+                {
+                    return Err(model_preview::CANCELLED.into());
                 }
-                Subject::Object(tag) => model_preview::load_reported(&packages, *tag, &load, None),
-                Subject::Local(appearance) => appearance.load(&packages, &load, None, None),
+                let model = match &subject {
+                    Subject::Appearance(appearance) => {
+                        model_preview::appearance::load_reported(&packages, appearance, &load)
+                    }
+                    Subject::Object(tag) => {
+                        model_preview::load_reported(&packages, *tag, &load, None)
+                    }
+                    Subject::Local(appearance) => appearance.load(&packages, &load, None, None),
+                };
+                model.and_then(|mut model| {
+                    if let Some(sources) = sources {
+                        crate::dyes::source::apply(&packages, &sources, &mut model, &load)?;
+                    }
+                    Ok(model)
+                })
             };
-            let result = model.and_then(|mut model| {
-                if let Some(sources) = sources {
-                    crate::dyes::source::apply(&packages, &sources, &mut model, &load)?;
-                }
-                Ok(model)
-            });
+            let result = match &access {
+                Some(access) => access.read(read_model),
+                None => read_model(),
+            };
             let _ = sender.send(result);
             repaint.request_repaint_of(viewport);
         });
+    }
+
+    /// Whether the model waits for Load Model, with automatic loading off. The model asked for,
+    /// or one already shown, keeps loading while its item is edited. Another item's model is
+    /// cleared rather than left standing in for this one.
+    fn hold(&mut self, ctx: &egui::Context) -> bool {
+        let Some((_, subject, ..)) = &self.wanted else {
+            return false;
+        };
+        if options::get(ctx, ctx.viewport_id()).autoload {
+            return false;
+        }
+        let shown = self
+            .shown
+            .as_ref()
+            .filter(|_| self.model.is_some())
+            .map(|(_, shown, ..)| shown);
+        if [self.requested.as_ref(), shown]
+            .into_iter()
+            .flatten()
+            .any(|asked| asked.same_model(subject))
+        {
+            return false;
+        }
+        self.requested = None;
+        if let Some(load) = self.load.take() {
+            load.stop();
+        }
+        self.model = None;
+        self.bounds = None;
+        self.error = None;
+        self.texture = None;
+        self.rendered = None;
+        self.rendered_seconds = None;
+        self.software = image_job::Job::default();
+        true
+    }
+
+    /// The item's icon and Load Model, which reads this item's model.
+    fn draw_held(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let painter = ui.painter_at(rect);
+        let [red, green, blue] = Scene::default().background;
+        painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(red, green, blue));
+        let side = self.draw_placeholder(&painter, rect);
+        let size = egui::vec2(104.0, ui.spacing().interact_size.y);
+        let below = if side > 0.0 {
+            side / 2.0 + 8.0 + size.y / 2.0
+        } else {
+            0.0
+        };
+        let button = egui::Rect::from_center_size(rect.center() + egui::vec2(0.0, below), size);
+        if ui
+            .put(button.intersect(rect), egui::Button::new("Load Model"))
+            .clicked()
+        {
+            self.requested = self.wanted.as_ref().map(|(_, subject, ..)| subject.clone());
+            ui.ctx().request_repaint();
+        }
+    }
+
+    /// Draws the item's icon, faded, at the centre, and returns its side, or 0 without one.
+    fn draw_placeholder(&self, painter: &egui::Painter, rect: egui::Rect) -> f32 {
+        let Some(image) = &self.placeholder else {
+            return 0.0;
+        };
+        let side = (rect.width().min(rect.height()) * 0.4).min(96.0);
+        painter.image(
+            image.id(),
+            egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(side)),
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            egui::Color32::from_white_alpha(110),
+        );
+        side
     }
 
     fn draw(
@@ -378,16 +538,8 @@ impl Still {
             );
         }
         // Until the first model is read, the item's icon, faded, stands in for it.
-        if self.model.is_none()
-            && let Some(image) = &self.placeholder
-        {
-            let side = (rect.width().min(rect.height()) * 0.4).min(96.0);
-            painter.image(
-                image.id(),
-                egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(side)),
-                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                egui::Color32::from_white_alpha(110),
-            );
+        if self.model.is_none() {
+            self.draw_placeholder(&painter, rect);
         }
         // An older model stays up while the one the page asks for loads, and while the software
         // renderer draws the first image of a newly read one, which would otherwise pass for it.
@@ -626,10 +778,17 @@ pub fn show_pins(
             .ctx()
             .data(|data| data.get_temp::<bool>(paused_id))
             .unwrap_or(false);
-    still.wanted =
-        appearance.map(|appearance| (packages.to_owned(), Subject::Appearance(appearance), None));
+    still.wanted = appearance.map(|appearance| {
+        (
+            packages.to_owned(),
+            Subject::Appearance(appearance),
+            None,
+            None,
+        )
+    });
     still.receive();
-    request_preview(&mut still, ui.ctx(), paused);
+    let held = still.hold(ui.ctx());
+    request_preview(&mut still, ui.ctx(), paused || held);
     if let Some((yaw, pitch)) = view.angle() {
         still.camera.yaw = yaw;
         still.camera.pitch = pitch;
@@ -766,7 +925,11 @@ pub fn show_pins(
             ..Camera::default()
         };
     }
-    still.draw(ui, rect, &[], paused);
+    if held {
+        still.draw_held(ui, rect);
+    } else {
+        still.draw(ui, rect, &[], paused);
+    }
     let camera = still.camera;
     drop(still);
     let hovered = response.hover_pos().and_then(|at| nearest(camera, at));

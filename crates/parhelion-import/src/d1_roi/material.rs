@@ -4,6 +4,27 @@ use serde_json::{Value, json};
 
 impl Source {
     pub(super) fn constant_buffer(&self, tag: u32) -> Result<(Payload, Vec<u8>)> {
+        if self.platform() == 7 {
+            // PS4 names a constant-buffer header whose reference holds the raw vectors
+            // (Charm's Vector4Container).
+            let entry = self
+                .package(tag)?
+                .reader
+                .entry(TagHash(tag).entry_index() as usize)
+                .ok_or(MissingTag(tag))?;
+            let values = self.read(entry.reference)?.0;
+            ensure!(
+                entry.file_type == 32
+                    && entry.file_subtype == 7
+                    && !values.is_empty()
+                    && values.len().is_multiple_of(16),
+                "Unsupported PS4 constant buffer {tag:08X} (type {}/{}, {} bytes)",
+                entry.file_type,
+                entry.file_subtype,
+                values.len()
+            );
+            return Ok((self.read(tag)?, values));
+        }
         ensure!(
             self.reference(tag)? == 0x80801AA5,
             "Unsupported source constant buffer class"
@@ -115,19 +136,19 @@ impl Source {
                 continue;
             }
             let program = self.read(shader)?;
-            if ps4 {
-                // PS4 GCN shaders — no DXBC, no readable TFX code array.
-                // Textures/samplers are empty arrays; bound at draw time by TFX opcodes.
-                stages.push(json!({"stage":name,"shader":shader,"shader_class":self.reference(shader)?,"textures":[],"samplers":[],"tfx":[],"code_bytes":0}));
-                assets.insert(shader, program);
-                continue;
-            }
-            let code = program.array(8, 1, Some(0x80800009))?;
-            let start = *code.first().context("Empty shader program")?;
-            ensure!(
-                program.bytes::<4>(start)? == *b"DXBC",
-                "Source shader is not DXBC"
-            );
+            // PS4 programs are GCN in Gnmx structures; the material layout around them is
+            // the Xbox One one (Charm's SMaterial/SMaterialShader).
+            let (start, code_bytes) = if ps4 {
+                (0, 0)
+            } else {
+                let code = program.array(8, 1, Some(0x80800009))?;
+                let start = *code.first().context("Empty shader program")?;
+                ensure!(
+                    program.bytes::<4>(start)? == *b"DXBC",
+                    "Source shader is not DXBC"
+                );
+                (start, code.len())
+            };
             let mut textures = Vec::new();
             for row in data.array(at + 0x10, 8, Some(0x80801B28))? {
                 let source_texture = data.u32(row + 4)?;
@@ -147,6 +168,20 @@ impl Source {
                     .reader
                     .entry(TagHash(sampler).entry_index() as usize)
                     .ok_or(MissingTag(sampler))?;
+                if ps4 {
+                    // PS4 keeps its 16-byte GNM sampler inside the 24-byte header.
+                    let header = self.read(sampler)?;
+                    ensure!(
+                        entry.file_type == 16
+                            && entry.reference == 0x80801A42
+                            && header.0.len() == 24
+                            && header.u64(0)? == 24,
+                        "Unsupported PS4 sampler {sampler:08X}"
+                    );
+                    assets.insert(sampler, header);
+                    samplers.push(sampler);
+                    continue;
+                }
                 ensure!(
                     entry.file_type == 32 && entry.file_subtype == 16,
                     "Unsupported Xbox sampler header"
@@ -194,7 +229,7 @@ impl Source {
                 assets.insert(external, buffer);
                 Some(json!({"tag":external,"bytes":values.len(),"vectors":values.len()/16}))
             };
-            stages.push(json!({"stage":name,"shader":shader,"shader_class":self.reference(shader)?,"code_offset":start,"code_bytes":code.len(),
+            stages.push(json!({"stage":name,"shader":shader,"shader_class":self.reference(shader)?,"code_offset":start,"code_bytes":code_bytes,
                 "textures":textures,"samplers":samplers,"tfx":tfx,"constants":vectors(at+0x38)?,"cbuffer":vectors(at+0x58)?,"external_cbuffer":external}));
             assets.insert(shader, program);
         }

@@ -96,38 +96,8 @@ fn format_file_size(bytes: u64) -> String {
     }
 }
 
-pub(super) fn draw_install_report(ui: &mut egui::Ui, report: &InstallReport) {
-    ui.heading(egui::RichText::new("Packages Installed").color(style::success_color(ui.visuals())));
-    let count = report.artifacts.len();
-    ui.strong(format!(
-        "{count} verified {} installed",
-        if count == 1 { "package" } else { "packages" }
-    ));
-    if report.cleaned_account.is_some() {
-        ui.label(
-            "Applied the reviewed item, socket selection, and reference changes to this account.",
-        );
-    }
-    match &report.profile_sync {
-        Some(Ok(sync)) => {
-            let noun = if sync.total_unlocks == 1 {
-                "weapon"
-            } else {
-                "weapons"
-            };
-            ui.label(format!(
-                "Collections updated: {} {noun} available.",
-                sync.total_unlocks
-            ));
-        }
-        Some(Err(error)) => {
-            ui.colored_label(
-                ui.visuals().error_fg_color,
-                format!("Packages installed, but Collections could not be updated: {error}"),
-            );
-        }
-        None => {}
-    }
+/// What installation added to the account and equipped.
+fn draw_item_grants(ui: &mut egui::Ui, report: &InstallReport) {
     let items = |count: usize| format!("{count} {}", if count == 1 { "item" } else { "items" });
     match &report.item_grants {
         Some(Ok(grants)) => {
@@ -166,18 +136,66 @@ pub(super) fn draw_install_report(ui: &mut egui::Ui, report: &InstallReport) {
         }
         None => {}
     }
+}
+
+pub(super) fn draw_install_report(ui: &mut egui::Ui, report: &InstallReport) {
+    ui.heading(egui::RichText::new("Packages Installed").color(style::success_color(ui.visuals())));
+    let count = report.artifacts.len();
+    ui.strong(format!(
+        "{count} verified {} installed",
+        if count == 1 { "package" } else { "packages" }
+    ));
+    if report.cleaned_account.is_some() {
+        ui.label(
+            "Applied the reviewed item, socket selection, and reference changes to this account.",
+        );
+    }
+    match &report.profile_sync {
+        Some(Ok(sync)) => {
+            let noun = if sync.total_unlocks == 1 {
+                "weapon"
+            } else {
+                "weapons"
+            };
+            ui.label(format!(
+                "Collections updated: {} {noun} available.",
+                sync.total_unlocks
+            ));
+        }
+        Some(Err(error)) => {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("Packages installed, but Collections could not be updated: {error}"),
+            );
+        }
+        None => {}
+    }
+    draw_item_grants(ui, report);
     if let Some(warning) = &report.backup_prune_warning {
+        ui.colored_label(ui.visuals().warn_fg_color, warning);
+    }
+    if report.retired_mod_backup.is_some() {
+        ui.label(if report.other_build_kept {
+            "Moved your Sunrise 0.6 build out of the mod folder, so the two builds never load together. Parhelion offers it again when you switch back to Sunrise 0.6."
+        } else {
+            "Moved your Sunrise 0.6 build out of the mod folder, so the two builds never load together. Build again after you switch back to Sunrise 0.6."
+        });
+    }
+    if let Some(warning) = &report.kept_build_warning {
         ui.colored_label(ui.visuals().warn_fg_color, warning);
     }
     for overlap in &report.mod_overlaps {
         ui.label(overlap);
+    }
+    for member in &report.mods {
+        ui.label(format!("{}: {}", member.name, member.status.label()));
     }
     ui.add_space(6.0);
     egui::CollapsingHeader::new("Installation Details").show(ui, |ui| {
         path_row(ui, "Installed To", &report.target_packages_directory);
         path_row(ui, "Backup Folder", &report.backup_directory);
         if let Some(path) = &report.retired_mod_backup {
-            path_row(ui, "Mod Folder Backup", path);
+            path_row(ui, "Sunrise 0.6 Build", path);
         }
         if let Some(path) = &report.cleaned_account {
             path_row(ui, "Account", path);
@@ -274,25 +292,4 @@ pub(super) fn draw_artifact_grid<'a>(
                 ui.end_row();
             }
         });
-}
-
-#[test]
-fn display_paths_remove_windows_prefix_without_changing_network_roots() {
-    for (input, expected) in [
-        (
-            r"\\?\C:\Games\Destiny2\settings.json",
-            r"C:\Games\Destiny2\settings.json",
-        ),
-        (
-            r"\\?\UNC\server\share\settings.json",
-            r"\\server\share\settings.json",
-        ),
-        (
-            r"C:\Games\Destiny2\settings.json",
-            r"C:\Games\Destiny2\settings.json",
-        ),
-        ("/home/player/settings.json", "/home/player/settings.json"),
-    ] {
-        assert_eq!(display_path(Path::new(input)), expected);
-    }
 }

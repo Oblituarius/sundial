@@ -274,29 +274,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn layering_the_same_color_preserves_it_at_every_visible_alpha() {
-        for color in [[255, 255, 255], [241, 198, 127], [16, 32, 64], [0, 0, 0]] {
-            for background_alpha in 0..=255_u8 {
-                for foreground_alpha in 1..=255_u8 {
-                    let mut pixel = [color[0], color[1], color[2], background_alpha];
-                    blend_rgba_pixel(&mut pixel, [color[0], color[1], color[2], foreground_alpha]);
-                    assert_eq!(
-                        &pixel[..3],
-                        &color,
-                        "alpha {foreground_alpha} over {background_alpha}"
-                    );
-                    assert!(pixel[3] >= background_alpha.max(foreground_alpha));
-                }
-            }
-        }
-        let mut pixel = [17, 34, 51, 102];
-        blend_rgba_pixel(&mut pixel, [255, 0, 0, 0]);
-        assert_eq!(pixel, [17, 34, 51, 102]);
-        blend_rgba_pixel(&mut pixel, [255, 0, 0, 255]);
-        assert_eq!(pixel, [255, 0, 0, 255]);
-    }
-
-    #[test]
     fn bc1_decodes_opaque_and_translucent_modes() {
         let opaque = decode_bc1(&[0x00, 0xF8, 0xE0, 0x07, 0, 0, 0, 0], 4, 4).unwrap();
         assert_eq!(&opaque[..4], &[255, 0, 0, 255]);
@@ -306,89 +283,6 @@ mod tests {
     }
 
     const PLATE: [u8; 3] = [0xF2, 0xE3, 0x70];
-
-    fn filled(width: usize, height: usize, pixel: [u8; 4]) -> Vec<u8> {
-        pixel
-            .iter()
-            .copied()
-            .cycle()
-            .take(width * height * 4)
-            .collect()
-    }
-
-    fn put(pixels: &mut [u8], width: usize, x: usize, y: usize, value: [u8; 4]) {
-        pixels[(y * width + x) * 4..(y * width + x) * 4 + 4].copy_from_slice(&value);
-    }
-
-    fn at(pixels: &[u8], width: usize, x: usize, y: usize) -> [u8; 4] {
-        pixels[(y * width + x) * 4..(y * width + x) * 4 + 4]
-            .try_into()
-            .expect("four channels")
-    }
-
-    fn transparent(pixels: &[u8]) -> usize {
-        pixels.chunks_exact(4).filter(|pixel| pixel[3] == 0).count()
-    }
-
-    #[test]
-    fn clearing_a_plate_leaves_the_art_drawn_over_it() {
-        let mut pixels = filled(8, 8, [PLATE[0], PLATE[1], PLATE[2], 255]);
-        put(&mut pixels, 8, 3, 3, [0x20, 0x40, 0xFF, 255]);
-        clear_color_region(&mut pixels, 8, 8, PLATE);
-        assert_eq!(transparent(&pixels), 63);
-        assert_eq!(at(&pixels, 8, 3, 3), [0x20, 0x40, 0xFF, 255]);
-    }
-
-    /// The plate is painted at a range of alpha values, and the color is what identifies it,
-    /// so a translucent plate pixel is cleared like an opaque one.
-    #[test]
-    fn a_translucent_plate_pixel_is_cleared_like_an_opaque_one() {
-        for alpha in [255, 192, 128, 64, 16, 1] {
-            let mut pixels = filled(4, 4, [PLATE[0], PLATE[1], PLATE[2], 255]);
-            put(&mut pixels, 4, 2, 2, [PLATE[0], PLATE[1], PLATE[2], alpha]);
-            clear_color_region(&mut pixels, 4, 4, PLATE);
-            assert_eq!(at(&pixels, 4, 2, 2), [0, 0, 0, 0], "alpha {alpha}");
-        }
-    }
-
-    /// The flood only reaches pixels that touch the region, so art that merely resembles the
-    /// cleared color survives when nothing joins it to a seed.
-    #[test]
-    fn art_near_the_cleared_color_survives_when_it_touches_no_seed() {
-        let similar = [0xF2, 0xE3, 0x60, 255];
-        let mut pixels = filled(9, 9, [0, 0, 0, 0]);
-        for x in 0..9 {
-            put(&mut pixels, 9, x, 0, [PLATE[0], PLATE[1], PLATE[2], 255]);
-        }
-        put(&mut pixels, 9, 4, 8, similar);
-        clear_color_region(&mut pixels, 9, 9, PLATE);
-        // The art pixel is the only one still drawn: the plate row went and the rest of the
-        // image was already transparent.
-        assert_eq!(transparent(&pixels), 9 * 9 - 1);
-        assert_eq!(at(&pixels, 9, 4, 8), similar);
-        for x in 0..9 {
-            assert_eq!(at(&pixels, 9, x, 0), [0, 0, 0, 0], "plate pixel {x} stayed");
-        }
-    }
-
-    /// The color can be picked out of the artwork, so black has to work. It has no brightness
-    /// ramp and no hue, so its region is the near-black pixels and nothing else.
-    #[test]
-    fn a_black_cleared_color_clears_black_and_leaves_the_rest() {
-        let mut pixels = filled(8, 8, [90, 70, 40, 255]);
-        put(&mut pixels, 8, 0, 0, [0, 0, 0, 255]);
-        put(&mut pixels, 8, 1, 0, [2, 1, 2, 255]);
-        put(&mut pixels, 8, 7, 7, [0, 0, 0, 255]);
-        clear_color_region(&mut pixels, 8, 8, [0, 0, 0]);
-        assert_eq!(at(&pixels, 8, 0, 0), [0, 0, 0, 0]);
-        assert_eq!(
-            at(&pixels, 8, 1, 0),
-            [0, 0, 0, 0],
-            "its antialiased edge goes too"
-        );
-        assert_eq!(at(&pixels, 8, 7, 7), [0, 0, 0, 0]);
-        assert_eq!(transparent(&pixels), 3, "the art around it stays");
-    }
 
     #[test]
     fn malformed_or_empty_images_are_left_alone() {

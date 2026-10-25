@@ -17,6 +17,7 @@ pub use model::{
     WeaponSocketColumnOverride, WeaponSocketPlugVariantOverride, WeaponVariableDamage,
 };
 pub(crate) use model::{SubclassBuildDetails, SubclassEntryBuild, WeaponBuildDetails};
+pub(crate) use model::{follow_choices, follow_moved_variants, moved_choices};
 mod custom_runtime;
 pub(crate) use custom_runtime::{BarrelDefaults, barrel_defaults, splice_writes};
 mod emission;
@@ -31,6 +32,8 @@ mod stat_group;
 #[cfg(test)]
 mod tests;
 use crate::weapon::{rig, variable_damage};
+#[cfg(feature = "d2-model-importer")]
+pub(crate) use custom_runtime::validate_imported_projectile;
 use custom_runtime::*;
 pub(crate) use custom_runtime::{preflight_runtime_edits, runtime_hud_key};
 mod localization;
@@ -88,12 +91,12 @@ use sundial::package_authoring::{
         SANDBOX_PATTERN_ENTITY_ASSIGNMENT_CLASS, SANDBOX_PATTERN_ENTITY_ASSIGNMENT_TAG,
         SANDBOX_PATTERN_GLOBAL_ID_OFFSET, SANDBOX_PATTERN_INDEX_ROW_CLASS,
         SANDBOX_PATTERN_INDEX_ROW_SIZE, SANDBOX_PATTERN_NESTED_CLASS,
-        SANDBOX_PATTERN_NESTED_OFFSET, SANDBOX_PATTERN_ROW_CLASS, SANDBOX_PATTERN_ROW_SIZE,
-        SandboxPatternIdentity, WEAPON_ENTITY_CLASS, append_weapon_entity_assignment,
-        graft_weapon_component_bindings_or_rewire, retarget_weapon_component_owner,
-        retarget_weapon_component_owner_payload, sandbox_pattern_identity,
-        sandbox_pattern_identity_at, validate_weapon_entity, weapon_component_bindings,
-        weapon_entity_assignment,
+        SANDBOX_PATTERN_NESTED_OFFSET, SANDBOX_PATTERN_OBJECT_OFFSET, SANDBOX_PATTERN_ROW_CLASS,
+        SANDBOX_PATTERN_ROW_SIZE, SandboxPatternIdentity, WEAPON_ENTITY_CLASS,
+        append_weapon_entity_assignment, graft_weapon_component_bindings_or_rewire,
+        retarget_weapon_component_owner, retarget_weapon_component_owner_payload,
+        sandbox_pattern_identity, sandbox_pattern_identity_at, validate_weapon_entity,
+        weapon_component_bindings, weapon_entity_assignment,
     },
     fnv1_name_hash,
     investment_schema::{
@@ -756,6 +759,9 @@ struct ResolvedSocketColumn {
     reusable_plug_set_index: Option<u16>,
     randomized_plug_set_index: Option<u16>,
     randomized_selection_program: Vec<WeaponNumericInstruction>,
+    /// The leading choices the embedded list holds. Every choice belongs to the private
+    /// randomized set, whose index the plug set plan fills in.
+    reusable_choices: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -817,6 +823,9 @@ struct KeyedAuxiliaryLayout {
     row_class: u32,
     nested_offset: usize,
     nested_class: u32,
+    /// A row's self-relative pointer to an object outside the arrays, which moves with the bytes
+    /// after the rows when a row is inserted.
+    object_offset: Option<usize>,
     secondary_class: Option<u32>,
     index_row_size: usize,
     index_row_class: u32,
@@ -889,11 +898,14 @@ struct ItemHashIndexArray {
     rows_end: usize,
 }
 
+/// Offsets of the 32-bit fields that hold `value`. Payload fields are naturally aligned. An
+/// unaligned window spans two fields, so a value with equal halves would also match across a
+/// neighbor, as `821F821F` does after `821F8220`.
 fn matching_u32_offsets(data: &[u8], value: u32) -> Vec<usize> {
     let bytes = value.to_le_bytes();
-    data.windows(bytes.len())
+    data.chunks_exact(bytes.len())
         .enumerate()
-        .filter_map(|(offset, window)| (window == bytes).then_some(offset))
+        .filter_map(|(index, field)| (field == bytes).then_some(index * bytes.len()))
         .collect()
 }
 
