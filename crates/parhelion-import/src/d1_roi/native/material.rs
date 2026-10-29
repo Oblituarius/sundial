@@ -43,9 +43,17 @@ fn vectors(data: &Payload, field: usize) -> Result<Vec<u8>> {
 /// Stock techniques a PS4 draw borrows whole, by draw stage and native layout, since its
 /// GCN programs have no translation. Each is the stock gear (sandbox or investment
 /// package) technique drawn by the most models at that stage and layout among those with
-/// no object inputs, which would index the stock entity's channels. Of about 830,000 stock
+/// no object inputs, which would index the stock entity's channels, and with no expression
+/// reading an extern other than frame, view, `4E` or the gear extern. Of about 830,000 stock
 /// draws only 111 bind a technique without a vertex program, and a PS4 item whose draws
-/// all did froze or crashed the game on view.
+/// all did froze or crashed the game on view. Stages 1, 7, 8 and 9 on layout 139 skip the
+/// most drawn techniques, which read externs `2C` or `03`, which the imported item's draw
+/// context also leaves unbound. Every texture a borrowed technique binds is a plain 2D
+/// texture (type 32, subtype 1): the texture streaming callback (`0x1202830`) resolves only
+/// those and passes any other kind's invalid result straight to a lookup, which crashed the
+/// game on view of a weapon borrowing `815B37F1` and `80EF8E3D`, whose cubemap is
+/// `80C1B780`. No gear technique for stages 7 and 9 on layout 123 qualifies, so those two
+/// come from the globals package, drawn by 15 rigid models each.
 const BORROWED_TECHNIQUES: [(usize, u16, u32); 30] = [
     (0, 30, 0x80EFAC1B),
     (0, 123, 0x80FC7DF6),
@@ -55,19 +63,19 @@ const BORROWED_TECHNIQUES: [(usize, u16, u32); 30] = [
     (1, 30, 0x80C1901B),
     (1, 123, 0x815B3521),
     (1, 138, 0x80C1CAFF),
-    (1, 139, 0x80EF91D3),
+    (1, 139, 0x80C1CB18),
     (3, 30, 0x80EF938B),
     (3, 138, 0x80EF9389),
     (3, 139, 0x80EF3C7A),
     (3, 143, 0x80C68445),
     (7, 30, 0x80EF0F75),
-    (7, 123, 0x815B37F1),
+    (7, 123, 0x80FDAE8B),
     (7, 138, 0x81531C4A),
-    (7, 139, 0x81532F58),
+    (7, 139, 0x815321AD),
     (7, 143, 0x80EFA482),
-    (8, 139, 0x80C1DFD8),
-    (9, 123, 0x80EF8E3D),
-    (9, 139, 0x81532F59),
+    (8, 139, 0x8161F38F),
+    (9, 123, 0x80FDAE8C),
+    (9, 139, 0x80C1AB2D),
     (10, 30, 0x80BF8671),
     (10, 138, 0x80C1CAFE),
     (10, 139, 0x80BF8667),
@@ -78,6 +86,60 @@ const BORROWED_TECHNIQUES: [(usize, u16, u32); 30] = [
     (12, 143, 0x80EF4E84),
     (14, 139, 0x80EF5148),
 ];
+
+/// The gear extern, a single vector that every stock gear pixel program on layouts 30 and
+/// 138 reads. Only the gear feature renderer binds it, to zero, for each batch it draws
+/// (`0x11B94E3` in the Shadowkeep executable). An imported item draws through the rigid
+/// object renderer, which leaves the slot null, and the expression's read of it crashed the
+/// game on view.
+const GEAR_EXTERN: u8 = 0x56;
+
+/// Shadowkeep expression operand sizes, as the native emission reader decodes them.
+fn operand_bytes(op: u8) -> Result<usize> {
+    Ok(match op {
+        0x01..=0x21 | 0x23..=0x33 => 0,
+        0x22 | 0x34..=0x3B | 0x42..=0x4E => 1,
+        0x3C..=0x41 | 0x51..=0x53 => 2,
+        _ => anyhow::bail!("Unsupported stock expression opcode {op:02X}"),
+    })
+}
+
+/// The stock technique, with each stage expression's read of the gear extern replaced by
+/// a push of the zero vector the gear renderer binds to it.
+fn zero_gear_extern(stock: &Payload) -> Result<Vec<u8>> {
+    let mut out = stock.0.clone();
+    for to in [0x48, 0xE8, 0x188, 0x228, 0x2C8] {
+        let code = &stock.0[stock.array_range(to + 0x20, 1, Some(0x80800009))?];
+        let mut constants = vectors(stock, to + 0x30)?;
+        let zero = u8::try_from(constants.len() / 16)
+            .context("Borrowed stage has no free constant index")?;
+        let mut rewritten = Vec::with_capacity(code.len());
+        let mut at = 0;
+        while at < code.len() {
+            let op = code[at];
+            let instruction = code
+                .get(at..at + 1 + operand_bytes(op)?)
+                .context("Truncated stock expression instruction")?;
+            if (0x3C..=0x41).contains(&op) && instruction[1] == GEAR_EXTERN {
+                ensure!(
+                    op == 0x3D && instruction[2] == 0,
+                    "Borrowed technique reads the gear extern with opcode {op:02X}"
+                );
+                rewritten.extend([0x34, zero]);
+            } else {
+                rewritten.extend_from_slice(instruction);
+            }
+            at += instruction.len();
+        }
+        if rewritten != code {
+            constants.extend([0; 16]);
+            array(&mut out, to + 0x20, 0x80800009, &rewritten, 1)?;
+            array(&mut out, to + 0x30, 0x80800090, &constants, 16)?;
+        }
+    }
+    size(&mut out)?;
+    Ok(out)
+}
 
 struct StageInputs {
     textures: BTreeMap<u32, String>,
@@ -190,7 +252,8 @@ impl Assembly<'_> {
         );
         self.evidence.push(json!({"material":tag,"symbol":symbol,"pass":pass,"layout":layout,"borrowed_technique":technique}));
         let template = self.class_template(0x808071E8)?;
-        self.node(symbol, template, &stock.0, None, &[])
+        let bytes = zero_gear_extern(&stock)?;
+        self.node(symbol, template, &bytes, None, &[])
     }
 
     pub(super) fn material(
