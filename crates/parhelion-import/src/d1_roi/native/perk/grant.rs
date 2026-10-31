@@ -125,7 +125,10 @@ impl Catalog {
                         && data.u32(settings + 16)? == pair.0,
                     "Source ability bank pair is not reciprocal"
                 );
-                let rows = data.array(settings + 0xA0, 40, Some(0x80802A84))?;
+                // PS4 settings keep this array 0x10 earlier than Xbox One. Measured on all
+                // 46 PS4 property banks; the row layout itself is unchanged.
+                let rows =
+                    data.array(settings + source.field(0xA0, 0x90), 40, Some(0x80802A84))?;
                 found = Some((bank, data, rows));
             }
             let (bank, data, rows) =
@@ -378,7 +381,8 @@ fn modifiers(
                 "Source ability parameter has an enable driver"
             );
             let settings = data.pointer(24)?;
-            let parameters = data.array(settings + 0xB0, 16, Some(0x80802122))?;
+            let parameters =
+                data.array(settings + source.field(0xB0, 0xA0), 16, Some(0x80802122))?;
             let start = usize::try_from(data.u32(at + 16)?)?;
             let count = usize::try_from(data.u32(at + 20)?)?;
             let end = start

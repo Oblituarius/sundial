@@ -10,6 +10,7 @@ use sundial::package_authoring::{
 mod connected;
 mod dynamic;
 mod nested;
+mod presented;
 mod status;
 
 struct Modifier {
@@ -57,8 +58,10 @@ fn input(component: u8, source: u16) -> Result<u16> {
     // Original compiled stat programs also qualify accuracy, both projectile-speed
     // inputs and the full recoil range. Barrel ordinals diverge after Damage.
     // Ability consumers preserve recharge input 0 and active drain input 2. Their
-    // slot is carried separately. Player Mobility needs the additive tier-to-point
-    // conversion below. Other player stat units stay closed.
+    // slot is carried separately. Player stats need the additive tier-to-point
+    // conversion below. Both builds order them Armor, Agility, Recovery: MIDA's
+    // Mobility is input 1, and Twilight Garrison's "Increased Armor" and "Increased
+    // Recovery" talents modify inputs 0 and 2.
     Ok(match (component, source) {
         (0, 0..=6 | 9..=15 | 17 | 19..=21)
         | (1, 0..=4)
@@ -68,7 +71,7 @@ fn input(component: u8, source: u16) -> Result<u16> {
         | (5, 0..=7 | 9)
         | (9, 0 | 2)
         | (10, 5 | 6)
-        | (13, 1)
+        | (13, 0..=2)
         | (14, 0 | 1 | 3..=11 | 13..=15 | 17 | 18) => source,
         (2, 33) => 36,
         (2, 34) => 39,
@@ -120,6 +123,17 @@ fn modifier_owner(source: &Source, graph: &Payload, owner: u32) -> Result<Vec<Mo
     let p = source.read(owner)?;
     let runtime = p.pointer(16)?;
     let settings = p.pointer(24)?;
+    // Each parameter slot is a relative pointer, a name hash and a trailing word. Xbox One
+    // keeps the trailing word as its own u64. PS4 packs it as a u32 into the hash's padding,
+    // so every later field moves eight bytes earlier. Measured on all 219 PS4 banks.
+    let ps4 = source.platform() == 7;
+    let trailing = |at: usize| -> Result<u64> {
+        if ps4 {
+            Ok(u64::from(p.u32(at)?))
+        } else {
+            p.u64(at)
+        }
+    };
     ensure!(
         p.u32(runtime - 4)? == 0x808021F1
             && p.u32(settings - 4)? == 0x808020DE
@@ -129,12 +143,12 @@ fn modifier_owner(source: &Source, graph: &Payload, owner: u32) -> Result<Vec<Mo
             && p.u32(settings)? == owner
             && p.u64(settings + 8)? == runtime as u64
             && p.u32(settings + 16)? == 0x808021F1
-            && p.u64(settings + 0x80)? == 0
-            && p.u64(settings + 0x98)? == 0
-            && p.u64(settings + 0xA0)? == 1,
+            && trailing(settings + source.field(0x80, 0x7C))? == 0
+            && trailing(settings + source.field(0x98, 0x8C))? == 0
+            && p.u64(settings + source.field(0xA0, 0x90))? == 1,
         "Source modifier bank has an unsupported pair or enable driver"
     );
-    let rows = p.array(settings + 0x60, 96, Some(0x8080205F))?;
+    let rows = p.array(settings + 0x60, source.field(96, 80), Some(0x8080205F))?;
     let instances = p.array(runtime + 0x30, 120, Some(0x80802B7B))?;
     ensure!(
         rows.len() == instances.len(),
@@ -150,18 +164,18 @@ fn modifier_owner(source: &Source, graph: &Payload, owner: u32) -> Result<Vec<Mo
                 && p.u32(instance)? == owner
                 && p.u64(instance + 8)? == at as u64
                 && p.u32(instance + 16)? == 0x8080205F
-                && p.u64(at + 0x28)? == 0
-                && p.u64(at + 0x48)? == 1
-                && p.bytes::<3>(at + 0x35)? == [0; 3]
-                && p.bytes::<3>(at + 0x55)? == [0; 3]
-                && p.u32(at + 0x58)? == 0
-                && p.u32(at + 0x5C)? == u32::MAX
+                && trailing(at + source.field(0x28, 0x24))? == 0
+                && trailing(at + source.field(0x48, 0x3C))? == 1
+                && p.bytes::<3>(at + source.field(0x35, 0x2D))? == [0; 3]
+                && p.bytes::<3>(at + source.field(0x55, 0x45))? == [0; 3]
+                && p.u32(at + source.field(0x58, 0x48))? == 0
+                && p.u32(at + source.field(0x5C, 0x4C))? == u32::MAX
                 && p.f32(instance + 0x40)? == 1.0
                 && p.bytes::<4>(instance + 0x44)? == [1, 0, 0, 0],
             "Source modifier has stateful weight, metadata or a nonreciprocal pair"
         );
-        let component = p.u8(at + 0x54)?;
-        let ability = p.u16(at + 0x50)?;
+        let component = p.u8(at + source.field(0x54, 0x44))?;
+        let ability = p.u16(at + source.field(0x50, 0x40))?;
         let ability = if component == 9 {
             // Both dispatchers select an ability reference before its numeric input.
             // Grenade, Super and Melee retain slots 0, 1 and 2. The source controller
@@ -178,9 +192,9 @@ fn modifier_owner(source: &Source, graph: &Payload, owner: u32) -> Result<Vec<Mo
             );
             u16::MAX
         };
-        let input = input(component, p.u16(at + 0x52)?)?;
-        let operation = p.u8(at + 0x34)?;
-        let mut value = p.f32(at + 0x30)?;
+        let input = input(component, p.u16(at + source.field(0x52, 0x42))?)?;
+        let operation = p.u8(at + source.field(0x34, 0x2C))?;
+        let mut value = p.f32(at + source.field(0x30, 0x28))?;
         ensure!(
             value.is_finite() && operation <= 1,
             "Unsupported source modifier operation"
@@ -241,10 +255,15 @@ fn modifier_owner(source: &Source, graph: &Payload, owner: u32) -> Result<Vec<Mo
         "Source modifier pattern exposes additional behavior"
     );
     let mut covered = BTreeSet::new();
-    let mut expected_exports =
-        BTreeSet::from([(runtime, settings + 0x70), (runtime, settings + 0x88)]);
+    let mut expected_exports = BTreeSet::from([
+        (runtime, settings + 0x70),
+        (runtime, settings + source.field(0x88, 0x80)),
+    ]);
     for (&row, &instance) in rows.iter().zip(&instances) {
-        expected_exports.extend([(instance, row + 0x18), (instance, row + 0x38)]);
+        expected_exports.extend([
+            (instance, row + 0x18),
+            (instance, row + source.field(0x38, 0x30)),
+        ]);
     }
     for (&export, &reference) in exports.iter().zip(&references) {
         if graph.u32(export + 16)? != owner {
@@ -308,6 +327,16 @@ pub(super) fn armor_attachment_inner(
                     return Host::Armor.validate_action_inner(source, child, ancestors);
                 }
             }
+            if let Some(presented) = presented::bank(source, &graph)? {
+                // Player stat rows are lowered onto the player itself, see `read`.
+                let rows = &presented.rows;
+                ensure!(
+                    rows.iter().all(|row| matches!(row.component, 5 | 9 | 10))
+                        || rows.iter().all(|row| row.component == 13),
+                    "Source armor owner attachment requires player component modifiers"
+                );
+                return Ok(());
+            }
             let rows = if owners.len() == 2 {
                 let owner = source.read(graph.u32(owners[0])?)?;
                 ensure!(
@@ -358,6 +387,45 @@ pub(super) fn read(
         "Source attachment is not a pattern"
     );
     let source_graph = source.read(source_tag)?;
+    if let Some(presented) = presented::bank(source, &source_graph)? {
+        *omitted_presentation = omitted_presentation
+            .checked_add(presented.omitted)
+            .context("Presentation record count overflow")?;
+        let player_stats = presented.rows.iter().all(|row| row.component == 13);
+        let (tag, patches, appends, hud_status) = match presented.status {
+            Some((owner, status)) => status::presented(
+                source,
+                native,
+                &status,
+                owner,
+                (presented.bank, presented.rows),
+            )?,
+            None => {
+                let (tag, patches) = modifier_patch(native, &presented.rows)?;
+                (tag, patches, Vec::new(), None)
+            }
+        };
+        let mut action = attachment(p, at, tag, hud_status)?;
+        // Player stats belong to the player whichever item owns the bank, and an armor item
+        // has no native contract for them on itself, so the bank attaches to the player.
+        if p.u8(at + 2)? == 0
+            && player_stats
+            && let Action::Attach { mode, .. } = &mut action
+        {
+            *mode = AttachmentTarget::Player;
+        }
+        return Ok(vec![(
+            action,
+            NativeAssetPatch {
+                action_index: 0,
+                source_graph: tag,
+                patches,
+                appends,
+                remove_owners: Vec::new(),
+                programs: Vec::new(),
+            },
+        )]);
+    }
     let source_owners = source_graph.array(32, 12, Some(0x80800715))?;
     ensure!(
         matches!(source_owners.len(), 1 | 2),

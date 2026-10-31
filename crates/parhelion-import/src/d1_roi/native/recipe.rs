@@ -73,6 +73,100 @@ impl Assembly<'_> {
     }
 }
 
+/// The Stat Allocation sockets of Shadowkeep armor, as its exotic chests carry them (Hallowfire
+/// Heart 471A10E6): socket type, randomized plug set and the set's even split. Top set 413 holds
+/// Mobility, Resilience and Recovery combinations, Bottom set 414 Discipline, Intellect and
+/// Strength, 64 plugs each totalling 14 to 17 points. Each stock socket selects from its set
+/// with the one-instruction program `[11 0]`.
+const STAT_ALLOCATION: [(u16, u16, u32); 4] = [
+    (760, 413, 0x8D7F_89DB),
+    (761, 413, 0x8D7F_89DB),
+    (762, 414, 0x6BB6_C22D),
+    (763, 414, 0x6BB6_C22D),
+];
+
+/// Shadowkeep armor's socket order up to its stat sockets: the perk sockets, the intrinsic, then
+/// the shader. A Rise of Iron exotic's talent columns after its first become the perk sockets in
+/// column order and its signature talent the intrinsic, so the item reads as Shadowkeep armor does
+/// rather than as the donor's year-two layout. The donor's other sockets, such as its armor mod
+/// and tier, have no source counterpart; see `disable_remaining`. Talent choices follow their
+/// columns to the new lanes.
+fn armor_order(native: &Value, columns: &[Value], variants: &mut [Value]) -> Result<Vec<Value>> {
+    let sockets = native["sockets"].as_array().context("Native sockets")?;
+    let find = |role: fn(&[Value]) -> bool| {
+        sockets.iter().position(|socket| {
+            socket["choices"]
+                .as_array()
+                .is_some_and(|choices| !choices.is_empty() && role(choices))
+        })
+    };
+    let intrinsic = find(|choices| {
+        choices
+            .iter()
+            .all(|c| c["category"].as_u64() == Some(perk::INTRINSIC_CATEGORY))
+    })
+    .context("Native armor has no intrinsic socket")?;
+    let shader = find(|choices| {
+        choices
+            .iter()
+            .any(|c| c["default"] == true && c["item_kind"] == SHADER_ITEM_KIND)
+    })
+    .context("Native armor has no shader socket")?;
+    let mut lanes = Vec::new();
+    for variant in variants.iter() {
+        let lane = usize::try_from(variant["socket_index"].as_u64().context("Talent socket")?)?;
+        if lane != intrinsic && !lanes.contains(&lane) {
+            lanes.push(lane);
+        }
+    }
+    lanes.extend([intrinsic, shader]);
+    let mut ordered = Vec::new();
+    for (position, &lane) in lanes.iter().enumerate() {
+        let mut column = columns.get(lane).cloned().unwrap_or(Value::Null);
+        // A talent column past the donor's sockets already names its own socket type.
+        let Some(socket) = sockets.get(lane) else {
+            ordered.push(column);
+            continue;
+        };
+        if column.is_null() && position != lane {
+            // A donor socket the layout moves keeps its own choices, default first.
+            let choices = socket["choices"].as_array().context("Native socket choices")?;
+            let hashes = choices
+                .iter()
+                .filter(|c| c["default"] == true)
+                .chain(choices.iter().filter(|c| c["default"] != true))
+                .map(|c| Ok(format!("0x{:08X}", number(&c["hash"])?)))
+                .collect::<Result<Vec<_>>>()?;
+            column = json!({"choices":hashes});
+        }
+        if !column.is_null() && column.get("socket_type").is_none() {
+            column["socket_type"] = socket["socket_type"].clone();
+        }
+        ordered.push(column);
+    }
+    for variant in variants.iter_mut() {
+        let lane = usize::try_from(variant["socket_index"].as_u64().context("Talent socket")?)?;
+        let position = lanes
+            .iter()
+            .position(|&l| l == lane)
+            .context("Talent socket left the armor layout")?;
+        variant["socket_index"] = json!(position);
+    }
+    Ok(ordered)
+}
+
+/// The item kind of shader plugs.
+const SHADER_ITEM_KIND: u64 = 14;
+
+/// Disable the donor sockets past the finished layout, so none of its own plugs remain.
+fn disable_remaining(native: &Value, columns: &mut Vec<Value>) -> Result<()> {
+    let count = native["sockets"].as_array().context("Native sockets")?.len();
+    while columns.len() < count {
+        columns.push(json!({"choices":[],"socket_type":u16::MAX}));
+    }
+    Ok(())
+}
+
 impl Source {
     /// Convert both source bodies and linked ornaments into a portable native recipe.
     pub fn prepare_armor(
@@ -191,11 +285,26 @@ impl Source {
             damage.is_none(),
             "Armor talents cannot set the item's damage type"
         );
-        let mut columns = columns.as_array().context("Armor talent columns")?.clone();
         let mut variants = variants
             .as_array()
             .context("Armor talent variants")?
             .clone();
+        let native_sockets = crate::tiger::shadowkeep::sockets(&mut assembly.native, donor_hash)?;
+        let mut columns = armor_order(
+            &native_sockets,
+            columns.as_array().context("Armor talent columns")?,
+            &mut variants,
+        )?;
+        // Shadowkeep armor rolls its stats from two Top and two Bottom Stat Allocation sockets.
+        // Rise of Iron rolled Intellect, Discipline and Strength from the item's stat budget,
+        // which no source record fixes as numbers, so each socket starts on its set's even split.
+        for &(socket_type, set, plug) in &STAT_ALLOCATION {
+            crate::tiger::shadowkeep::item_tag(&mut assembly.native, plug)
+                .with_context(|| format!("Stat allocation plug {plug:08X}"))?;
+            columns.push(json!({"choices":[format!("0x{plug:08X}")],"socket_type":socket_type,
+                "randomized_plug_set_index":set,
+                "randomized_selection_program":[{"opcode":11,"operand":0}]}));
+        }
         progress(format!("Converting {}", armor.name));
         let mut reference = assembly.armor_graph(
             &armor,
@@ -207,8 +316,9 @@ impl Source {
             &ornaments,
         )?;
         if let Some(socket) = socket.filter(|_| !ornaments.is_empty()) {
-            let socket_index =
-                usize::try_from(socket["index"].as_u64().context("Ornament socket index")?)?;
+            // The ornament socket closes Shadowkeep armor's layout, after the stat sockets.
+            let socket_index = columns.len();
+            columns.push(Value::Null);
             let candidates = socket["choices"]
                 .as_array()
                 .context("Native appearance choices")?;
@@ -299,16 +409,9 @@ impl Source {
                 choices.push(json!(format!("0x{plug:08X}")));
                 variants.push(json!({"socket_index":socket_index,"choice_index":choice,"source_plug_hash":format!("0x{plug:08X}"),"name":source_item.name,"description":"Changes this armor's appearance. Select the default ornament to restore its original appearance.","replace_effects":true,"sandbox_perks":[]}));
             }
-            ensure!(
-                socket_index < columns.len(),
-                "Ornament socket exceeds the armor columns"
-            );
-            ensure!(
-                columns[socket_index].is_null(),
-                "Armor perk layout overlaps its ornament socket"
-            );
             columns[socket_index] = json!({"choices":choices,"socket_type":socket["socket_type"],"choice_conditions":[],"choice_weight_bits":[],"randomized_selection_program":[]});
         }
+        disable_remaining(&native_sockets, &mut columns)?;
         let manifest = reference.directory.join("asset-graph.json");
         let mut graph: Value = serde_json::from_slice(&fs::read(&manifest)?)?;
         graph["source_talents"] = talents;

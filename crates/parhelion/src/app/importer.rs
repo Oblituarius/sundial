@@ -1472,6 +1472,14 @@ fn save_imported_recipe(
             if updated.overrides.fired_graph.is_none() && updated.overrides.projectile.is_none() {
                 updated.overrides.fired_graph = recipe.overrides.fired_graph.clone();
             }
+            // A translated perk can need another weapon's firing graph, such as Zhalo
+            // Supercell's chain lightning Riskrunner's graph reads. The conversion's graft comes
+            // with its sockets unless the saved entry already grafts behaviors of its own.
+            if updated.overrides.additional_behaviors.is_empty() {
+                updated.overrides.additional_behaviors =
+                    recipe.overrides.additional_behaviors.clone();
+                updated.overrides.skip_behavior_perks = recipe.overrides.skip_behavior_perks;
+            }
             melee::merge(&recipe, &mut updated)
                 .map_err(|error| format!("Import melee activation: {error:#}"))?;
         }

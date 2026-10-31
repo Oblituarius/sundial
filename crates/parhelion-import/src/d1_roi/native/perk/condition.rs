@@ -3,9 +3,23 @@ use super::*;
 use sundial::package_authoring::sandbox_perk::action::native::{Block, Graph, NodeKind};
 mod ability_event;
 mod accumulator;
+mod damage_taken;
 mod event_filter;
 mod group;
 mod player;
+
+/// A whole condition list that translates as a set rather than node by node.
+pub(super) fn list(
+    source: &Source,
+    p: &Payload,
+    nodes: &[usize],
+    native: Option<&mut Reader>,
+) -> Result<Option<Vec<NativeNode>>> {
+    match native {
+        Some(native) if !nodes.is_empty() => ability_event::element(source, native, p, nodes),
+        _ => Ok(None),
+    }
+}
 
 pub(super) fn read(
     source: &Source,
@@ -18,7 +32,7 @@ pub(super) fn read(
     }
     let class = p.u32(at - 4)?;
     let kind = p.u8(at + 5)?;
-    if (class, kind) == (0x808031BF, 10) {
+    if matches!((class, kind), (0x808031BF, 10) | (0x8080308E, 11)) {
         return ability_event::read(
             source,
             native.context("Source ability events need native ability definitions")?,
@@ -26,6 +40,9 @@ pub(super) fn read(
             at,
         )
         .map(Some);
+    }
+    if (class, kind) == (0x8080313D, 5) {
+        return damage_taken::read(source, p, at, native).map(Some);
     }
     if (class, kind) == (0x80802917, 32) {
         return group::read(source, p, at, native).map(Some);

@@ -125,6 +125,22 @@ fn adjustments(
                 .as_str()
                 .context("Source stat adjustment bytes")?,
         )?);
+        if host == Host::Armor
+            && let Some(value) = budget_share(hash, &bytes)?
+        {
+            let index = *definitions
+                .get(&hash)
+                .with_context(|| format!("Source stat {hash:08X} has no Shadowkeep stat definition"))?;
+            ensure!(
+                indices.insert(index),
+                "Source stat {hash:08X} is adjusted twice"
+            );
+            stats.push(json!({"definition_index":index,"value":value}));
+            report.push(json!({"source_hash":hash,"source_index":row["index"],
+                "definition_index":index,"budget_share":bytes.f32(4)?,
+                "budget_points":ARMOR_STAT_BUDGET,"value":value}));
+            continue;
+        }
         ensure!(
             bytes.0.len() == 16
                 && bytes.u32(4)? == 0x3F80_0000
@@ -168,6 +184,42 @@ fn adjustments(
     Ok((stats, report))
 }
 
+/// Shadowkeep points one whole Rise of Iron armor stat budget stands for. Rise of Iron rolled
+/// Intellect, Discipline and Strength as shares of a budget its quality tables set, and no source
+/// record fixes it as a number. A base-roll stat takes 0.5 to 0.6 of it, so twenty points puts that
+/// stat at the 10 a Shadowkeep stat holds on its Stat Allocation sockets' even split, and an
+/// "Increase" talent's quarter share at 5, a minor stat mod.
+const ARMOR_STAT_BUDGET: f32 = 20.0;
+
+/// The fixed points of an armor stat row that adds a share of the item's stat budget to the stat
+/// its selector names (05 Intellect, 06 Discipline, 07 Strength), as "Increase" talents do. The
+/// hidden base roll instead draws each stat of a pair from a range of shares, with a pair slot in
+/// place of FF, which the Stat Allocation sockets replace.
+fn budget_share(hash: u32, bytes: &Payload) -> Result<Option<i32>> {
+    const SELECTORS: [(u32, u8); 3] = [
+        (0x089E_7467, 0x05),
+        (0x6775_DCE1, 0x06),
+        (0xFCFE_F4B2, 0x07),
+    ];
+    let Some(&(_, selector)) = SELECTORS.iter().find(|(stat, _)| *stat == hash) else {
+        return Ok(None);
+    };
+    if bytes.0.len() != 16
+        || bytes.u32(0)? != 0
+        || bytes.u32(4)? != bytes.u32(8)?
+        || bytes.bytes::<4>(12)? != [selector, 0xFF, 0, 0]
+    {
+        return Ok(None);
+    }
+    let share = bytes.f32(4)?;
+    ensure!(
+        share > 0.0 && share <= 1.0,
+        "Source stat {hash:08X} budget share is out of range"
+    );
+    #[allow(clippy::cast_possible_truncation)]
+    Ok(Some((share * ARMOR_STAT_BUDGET).round() as i32))
+}
+
 struct Lowered {
     programs: Vec<Value>,
     raw: Vec<Program>,
@@ -195,10 +247,17 @@ fn conditions(
     descriptor: usize,
     mut native: Option<&mut Reader>,
 ) -> Result<Vec<NativeNode>> {
-    data.array(descriptor, 8, None)?
+    let nodes = data
+        .array(descriptor, 8, None)?
         .into_iter()
-        .map(|at| {
-            let node = data.pointer(at)?;
+        .map(|at| data.pointer(at))
+        .collect::<Result<Vec<_>>>()?;
+    if let Some(list) = condition::list(source, data, &nodes, native.as_deref_mut())? {
+        return Ok(list);
+    }
+    nodes
+        .into_iter()
+        .map(|node| {
             if let Some(translated) = condition::read(source, data, node, native.as_deref_mut())? {
                 return Ok(translated);
             }
@@ -484,7 +543,7 @@ fn action_program(
 
 /// Intrinsic plugs (`67FBA961`) set a native weapon's frame, a fixed perk Rise of Iron never had.
 /// An exotic's signature perk is the one fixed perk its grid holds, so only that takes the socket.
-const INTRINSIC_CATEGORY: u64 = 0x67FB_A961;
+pub(super) const INTRINSIC_CATEGORY: u64 = 0x67FB_A961;
 /// The source item rarity of an exotic. A legendary's first column can also hold one fixed perk,
 /// such as Burning Eye's Snapshot or Abyss Defiant's Hive Disruptor, which stays a perk column.
 const EXOTIC_RARITY: u64 = 5;
@@ -497,6 +556,62 @@ const LEGACY_FRAME_DESCRIPTION: &str = "A relic of an older age, pulled through 
 const LEGACY_FRAME_ICON: &str = "0x80B47ED5";
 /// Weapon perk plugs, as opposed to shaders (14), masterworks and trackers (13) and mods (37).
 const PERK_ITEM_KIND: u64 = 15;
+/// Year-one armor trait mods: Plasteel Reinforcement and Restorative Mod. They are Shadowkeep's
+/// own choice, not a Rise of Iron talent, so an armor import disables the socket.
+const ARMOR_TRAIT_CATEGORY: u64 = 0xC57B_725E;
+
+/// Weapon properties whose only gameplay consumer is another weapon's firing graph, and the
+/// behavior that grafts it. Zhalo Supercell's chain lightning writes `chain_enabled`, which
+/// Riskrunner's firing graph 80BC10AF reads in its projectile controller 8152C79F. Riskrunner's
+/// own Superconductor writes it only while Arc Conductor holds `perk_active`, but the source
+/// program writes it on its own, with `perk_active` beside it (see `PROPERTY_COMPANIONS`), so
+/// the graft leaves both Riskrunner perks out.
+const PROPERTY_BEHAVIORS: [(u32, &str); 1] = [(0x65D8_F47E, "riskrunner-graph")];
+
+/// Weapon properties a grafted firing graph reads together, and the one a source program writes
+/// alone. Riskrunner's projectile controller 8152C79F and its effect graph 8152C7A1 read
+/// `perk_active` (A43A8C2E) beside `chain_enabled`: Arc Conductor (perk 493, action 80BBCA57)
+/// holds `perk_active` at 1 while it runs, and Superconductor (495) writes `chain_enabled` only
+/// then. Zhalo Supercell's source proc chains on its own, so the same proc holds both, written
+/// the way Arc Conductor writes it, without bringing Arc Conductor's damage resistance or ammo.
+const PROPERTY_COMPANIONS: [(u32, u32); 1] = [(0x65D8_F47E, 0xA43A_8C2E)];
+
+/// Add the companion write after each weapon property write that needs one.
+fn companions(program: &mut Program) {
+    let mut index = 0;
+    while index < program.actions.len() {
+        if let Action::Property { key, target: 0, .. } = program.actions[index]
+            && let Some(&(_, companion)) = PROPERTY_COMPANIONS.iter().find(|(k, _)| *k == key)
+            && !program.actions.iter().any(
+                |action| matches!(action, Action::Property { key, target: 0, .. } if *key == companion),
+            )
+        {
+            let mut write = program.actions[index].clone();
+            if let Action::Property { key, .. } = &mut write {
+                *key = companion;
+            }
+            index += 1;
+            program.actions.insert(index, write);
+        }
+        index += 1;
+    }
+}
+
+/// The behavior graphs the translated weapon programs need, by catalogue identifier.
+fn property_behaviors(programs: &[Program]) -> Vec<&'static str> {
+    let mut behaviors = Vec::new();
+    for program in programs {
+        for action in &program.actions {
+            if let Action::Property { key, target: 0, .. } = action
+                && let Some(&(_, behavior)) = PROPERTY_BEHAVIORS.iter().find(|(k, _)| k == key)
+                && !behaviors.contains(&behavior)
+            {
+                behaviors.push(behavior);
+            }
+        }
+    }
+    behaviors
+}
 
 /// The damage type a source choice gives the weapon, when setting it is all the choice does.
 fn damage_type(programs: &[Program]) -> Option<&'static str> {
@@ -581,6 +696,33 @@ fn perk_sockets(
         let Some(choices) = socket["choices"].as_array() else {
             continue;
         };
+        // An armor base's intrinsic is a stat package rather than a perk plug. Only an exotic's
+        // signature talent takes it, see `translate`, so its stat plugs serve as the layout.
+        if host == Host::Armor
+            && intrinsic.is_none()
+            && !choices.is_empty()
+            && choices
+                .iter()
+                .all(|choice| choice["category"].as_u64() == Some(INTRINSIC_CATEGORY))
+        {
+            let mut plugs = Vec::new();
+            for choice in choices
+                .iter()
+                .filter(|choice| choice["hash"] == socket["curated_fallback"])
+                .chain(choices)
+            {
+                let hash = u32::try_from(choice["hash"].as_u64().context("Native plug identity")?)?;
+                if !plugs.contains(&hash) {
+                    plugs.push(hash);
+                }
+            }
+            intrinsic = Some(PerkSocket {
+                index,
+                socket_type: &socket["socket_type"],
+                plugs,
+            });
+            continue;
+        }
         // Randomized trait sockets can omit a default entirely. Their homogeneous
         // perk pool still supplies a socket layout for private source choices.
         // Mixed or cosmetic pools cannot establish that role without a default.
@@ -713,6 +855,29 @@ fn roll<'a>(members: Vec<&'a Choice>, unsupported: &mut Vec<Value>) -> (Vec<&'a 
     (ordered, reusable)
 }
 
+/// A column's choices without repeats. Rise of Iron's nodes can each roll the same talent, as
+/// Twilight Garrison's two Increase nodes both hold Increase Discipline, and a column that offers
+/// every step keeps one choice for each distinct talent.
+fn distinct<'a>(members: Vec<&'a Choice>, merged: &mut Vec<Value>) -> Vec<&'a Choice> {
+    let mut kept: Vec<&Choice> = Vec::new();
+    for choice in members {
+        let same = |other: &Choice| {
+            other.name == choice.name
+                && other.description == choice.description
+                && other.lowered.programs == choice.lowered.programs
+                && other.lowered.stats == choice.lowered.stats
+                && other.lowered.stock == choice.lowered.stock
+        };
+        if let Some(first) = kept.iter().find(|other| same(other)) {
+            merged.push(json!({"node":choice.node,"step":choice.report["step"],"name":choice.name,
+                "same_as":{"node":first.node,"step":first.report["step"]}}));
+        } else {
+            kept.push(choice);
+        }
+    }
+    kept
+}
+
 /// Translate the source talent grid onto the base's perk sockets. On an exotic, a first source
 /// column that holds one single-step node, its signature perk, takes the intrinsic socket.
 /// Otherwise the intrinsic holds Legacy Frame, since a native frame would describe a perk the
@@ -796,11 +961,29 @@ pub(super) fn translate(
         equivalents.insert(source, (plug, perks));
     }
     let mut columns = sockets.iter().map(|_| Value::Null).collect::<Vec<_>>();
-    for socket in intrinsic.iter().chain(&perk_sockets) {
+    // An armor intrinsic keeps its stat package unless the signature talent takes it.
+    for socket in intrinsic
+        .iter()
+        .filter(|_| host == Host::Weapon)
+        .chain(&perk_sockets)
+    {
         columns[socket.index] = json!({"choices":[],"socket_type":u16::MAX});
+    }
+    if host == Host::Armor {
+        for (index, socket) in sockets.iter().enumerate() {
+            if socket["choices"].as_array().is_some_and(|choices| {
+                !choices.is_empty()
+                    && choices.iter().all(|choice| {
+                        choice["category"].as_u64() == Some(ARMOR_TRAIT_CATEGORY)
+                    })
+            }) {
+                columns[index] = json!({"choices":[],"socket_type":u16::MAX});
+            }
+        }
     }
     let mut choices = Vec::new();
     let mut unsupported = Vec::new();
+    let mut merged = Vec::new();
     let mut damage = None;
     let mut grant_catalog = None;
     for node in nodes {
@@ -871,8 +1054,11 @@ pub(super) fn translate(
                         stock_plugs.push(format!("{plug:08X}"));
                         continue;
                     }
-                    let (program, omitted) =
+                    let (mut program, omitted) =
                         program(assembly.source, tag, name, Some(&mut assembly.native))?;
+                    if host == Host::Weapon {
+                        companions(&mut program);
+                    }
                     auxiliary += omitted;
                     let carrier = templates.get(programs.len()).context(
                         "The base has no further finished perk to carry this source perk",
@@ -1021,8 +1207,18 @@ pub(super) fn translate(
             .collect::<Vec<_>>();
         members.sort_by_key(|choice| (choice.row, choice.node));
         // Damage alternatives are steps of one node, which a roll would cut to its first step.
-        // Every damage type stays selectable instead.
-        let (members, reusable) = if column == i64::MAX {
+        // Every damage type stays selectable instead. Armor offers every step of each talent
+        // the same way, as an owned piece can take any plug of its column's pool.
+        let (members, reusable) = if column == i64::MAX || host == Host::Armor {
+            let mut members = if host == Host::Armor {
+                distinct(members, &mut merged)
+            } else {
+                members
+            };
+            for choice in members.drain(ROLL_POOL.min(members.len())..) {
+                unsupported.push(json!({"node":choice.node,"step":choice.report["step"],
+                    "name":choice.name,"reason":"The column's roll pool is full"}));
+            }
             let count = members.len();
             (members, count)
         } else {
@@ -1100,6 +1296,7 @@ pub(super) fn translate(
     );
     let mut legacy = false;
     if signature.is_none()
+        && host == Host::Weapon
         && let Some(socket) = &intrinsic
         && let Some(&plug) = socket.plugs.first()
     {
@@ -1132,7 +1329,12 @@ pub(super) fn translate(
     Ok((
         columns,
         json!(variants),
-        json!({"translated":translated,"unsupported":unsupported,"damage_type":damage,
+        json!({"translated":translated,"unsupported":unsupported,"merged":merged,"damage_type":damage,
+        "behaviors":if host == Host::Weapon {
+            property_behaviors(&choices.iter().flat_map(|c| c.lowered.raw.iter().cloned()).collect::<Vec<_>>())
+        } else {
+            Vec::new()
+        },
         "native_defaults":native_defaults,
         "status":if translated.is_empty() { "unsupported" } else if unsupported.is_empty() { "translated" } else { "partial" },
         "intrinsic":intrinsic,

@@ -27,7 +27,7 @@ pub(super) fn pair(
     Ok(())
 }
 
-fn constant(p: &Payload, at: usize, indefinite: bool) -> Result<[u8; 16]> {
+pub(super) fn constant(p: &Payload, at: usize, indefinite: bool) -> Result<[u8; 16]> {
     let code = p
         .array(at + 24, 1, Some(0x80800009))?
         .into_iter()
@@ -56,8 +56,9 @@ fn constant(p: &Payload, at: usize, indefinite: bool) -> Result<[u8; 16]> {
 struct Status {
     competition: [u8; 8],
     hud: [u8; 12],
-    duration: [u8; 20],
-    timer: [u8; 8],
+    /// Duration and timer policy, kept only where the full host contract was checked.
+    duration: Option<[u8; 20]>,
+    timer: Option<[u8; 8]>,
     count: [u8; 16],
     seconds: [u8; 16],
 }
@@ -281,8 +282,8 @@ fn validate(
     Ok(Status {
         competition,
         hud: p.bytes(hud + 0x88)?,
-        duration: p.bytes(duration + 0xA0)?,
-        timer: p.bytes(controller + 0x78)?,
+        duration: Some(p.bytes(duration + 0xA0)?),
+        timer: Some(p.bytes(controller + 0x78)?),
         count,
         seconds,
     })
@@ -332,6 +333,69 @@ pub(super) fn read(
         companion.as_ref(),
         bank.as_ref().map(|(tag, rows)| (*tag, rows.len())),
     )?;
+    emit(source, native, &status, companion, bank)
+}
+
+/// A status host whose outputs only drive presentation the lowering leaves out, beside the
+/// pattern's modifier bank. The native envelope keeps its own duration and timer policy:
+/// only the HUD buff, its competition, the stack count and the duration in seconds carry over.
+/// Both builds keep these four in the same sub-records. PS4 packs each parameter slot in 16
+/// bytes instead of 24, so the sub-records sit earlier.
+pub(super) fn presented(
+    source: &Source,
+    native: &mut Reader,
+    p: &Payload,
+    owner: u32,
+    bank: (u32, Vec<Modifier>),
+) -> Result<Hosted> {
+    let settings = p.pointer(24)?;
+    let hud = settings + source.field(0xF0, 0xD0);
+    let count = hud + source.field(0xA0, 0x80);
+    let duration = hud + source.field(0x160, 0x140);
+    let seconds = duration + source.field(0x138, 0xF0);
+    for (at, class) in [
+        (hud, 0x8080278D),
+        (count, 0x8080084D),
+        (duration, 0x8080255D),
+        (seconds, 0x808008AC),
+    ] {
+        ensure!(
+            p.u32(at)? == owner && p.u32(at + 16)? == class,
+            "Source status has a different layout"
+        );
+    }
+    let flags = settings + source.field(0xA8, 0x90);
+    ensure!(
+        p.u32(flags)? == 0x3C18FBCE && p.u32(flags + 4)? == 0 && matches!(p.u64(flags + 8)?, 0 | 4),
+        "Source status host has unqualified competition flags"
+    );
+    let hud = p.bytes::<12>(hud + source.field(0x88, 0x68))?;
+    let priority = i32::from_le_bytes(hud[4..8].try_into()?);
+    ensure!(
+        (-16_777_216..=16_777_216).contains(&priority),
+        "Source status competition priority cannot be represented exactly"
+    );
+    let mut competition = [0; 8];
+    competition[0] = p.u8(flags + 8)?;
+    competition[4..].copy_from_slice(&(priority as f32).to_le_bytes());
+    let status = Status {
+        competition,
+        hud,
+        duration: None,
+        timer: None,
+        count: constant(p, count, false)?,
+        seconds: constant(p, seconds, true)?,
+    };
+    emit(source, native, &status, None, Some(bank))
+}
+
+fn emit(
+    source: &Source,
+    native: &mut Reader,
+    status: &Status,
+    companion: Option<conditional::Companion>,
+    bank: Option<(u32, Vec<Modifier>)>,
+) -> Result<Hosted> {
     let name = u32::from_le_bytes(status.hud[..4].try_into()?);
     let hud_status = hud::read(source, native, name)?;
     let tag = if let Some((_, rows)) = &bank {
@@ -440,8 +504,12 @@ pub(super) fn read(
     } else {
         replace(h + 0x80, status.hud.to_vec())?;
     }
-    replace(d + 0x98, status.duration.to_vec())?;
-    replace(d + 0xB0 + 0x70, status.timer.to_vec())?;
+    if let Some(duration) = status.duration {
+        replace(d + 0x98, duration.to_vec())?;
+    }
+    if let Some(timer) = status.timer {
+        replace(d + 0xB0 + 0x70, timer.to_vec())?;
+    }
     for (at, bytes) in [(h + 0x98, status.count), (d + 0x128, status.seconds)] {
         let values = target.array(at + 0x20, 16, Some(0x80800090))?;
         let code = target

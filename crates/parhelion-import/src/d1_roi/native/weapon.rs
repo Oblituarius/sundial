@@ -302,6 +302,15 @@ impl Source {
         if let Some(damage) = damage {
             recipe["overrides"]["modern_damage_type"] = json!(damage);
         }
+        // A property another weapon's firing graph consumes needs that graph, but not that
+        // weapon's perks, which would replace the source talents in their sockets.
+        if let Some(behaviors) = perks["behaviors"].as_array().filter(|b| !b.is_empty()) {
+            recipe["overrides"]["additional_behaviors"] = behaviors
+                .iter()
+                .map(|behavior| json!({"behavior":behavior}))
+                .collect();
+            recipe["overrides"]["skip_behavior_perks"] = json!(true);
+        }
         if let Some(group) = stats.group {
             recipe["overrides"]["custom_stat_group"] = group;
         }
