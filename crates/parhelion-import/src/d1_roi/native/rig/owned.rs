@@ -109,8 +109,14 @@ fn convert(
         let original = native.tag(native_skeleton, Some(0x80809C36))?;
         let sb = if fp { &source_full } else { &source_weapon };
         let nb = if fp { &native_full } else { &native_weapon };
-        let (ns, changed_bones) =
-            skeleton::convert(&ss, &original, sb, nb, if fp { arms } else { 0 }, input.field(0x98, 0x88))?;
+        let (ns, changed_bones) = skeleton::convert(
+            &ss,
+            &original,
+            sb,
+            nb,
+            if fp { arms } else { 0 },
+            input.field(0x98, 0x88),
+        )?;
         let sc = input.read(source_controls)?;
         let original = native.tag(native_controls, Some(0x80809C36))?;
         let (nc, changed_slots) = controls::convert(&sc, &original, &changed_bones)?;

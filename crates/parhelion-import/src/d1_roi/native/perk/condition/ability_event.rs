@@ -18,7 +18,13 @@ const ELEMENTS: [(&str, [u32; 3], &[u32]); 3] = [
         // Fist of Havoc, Arc Blade, Stormtrance.
         [0xC964_C642, 0x95A5_C27D, 0x59DF_5745],
         // Arc Staff, Fists of Havoc, Thundercrash, Stormtrance, Chaos Reach.
-        &[0x644B_77ED, 0xC964_C642, 0xE081_C63F, 0x59DF_5745, 0xED9C_409C],
+        &[
+            0x644B_77ED,
+            0xC964_C642,
+            0xE081_C63F,
+            0x59DF_5745,
+            0xED9C_409C,
+        ],
     ),
     (
         "Solar",
@@ -39,7 +45,13 @@ const ELEMENTS: [(&str, [u32; 3], &[u32]); 3] = [
         // Nova Bomb, Ward of Dawn, Shadowshot.
         [0x073B_5B17, 0x5E4C_7A19, 0x6440_9AED],
         // Shadowshot, Spectral Blades, Sentinel Shield, Nova Bomb, Nova Warp.
-        &[0x6440_9AED, 0x3966_2427, 0x290C_FB64, 0x073B_5B17, 0x800A_D2D6],
+        &[
+            0x6440_9AED,
+            0x3966_2427,
+            0x290C_FB64,
+            0x073B_5B17,
+            0x800A_D2D6,
+        ],
     ),
 ];
 
@@ -65,7 +77,8 @@ pub(super) fn element(
     let first = *nodes.first().context("Empty source condition list")?;
     let kind = p.u8(first + 5)?;
     if !nodes.iter().all(|&at| {
-        p.u32(at - 4).is_ok_and(|class| KINDS.contains(&(class, kind)))
+        p.u32(at - 4)
+            .is_ok_and(|class| KINDS.contains(&(class, kind)))
             && p.u8(at + 5).ok() == Some(kind)
     }) {
         return Ok(None);

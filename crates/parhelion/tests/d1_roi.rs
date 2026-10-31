@@ -238,6 +238,7 @@ fn source_armor_and_ornaments_survive_portable_reload_and_native_staging()
     let donors = json!({"gear":catalog.gear_donors(ItemKind::Armor.bucket_hashes()).into_iter().map(|d| json!({"hash":d.hash,"name":d.name,"bucket_hash":d.bucket_hash,"class_type":catalog.item_class_type(d.hash),"collection_backed":d.collection_backed})).collect::<Vec<_>>()});
     let options = NativeOptions {
         xg_library: Some(configured("PARHELION_D1_XG")?),
+        namespace: None,
     };
     let mut stock = Reader::new(&native, &output.join("stock-readback"), false)?;
     let mut recipes = Vec::new();

@@ -55,7 +55,11 @@ pub(super) fn bank(source: &Source, graph: &Payload) -> Result<Option<Presented>
     let hud = settings + source.field(0xF0, 0xD0);
     let duration = hud + source.field(0x160, 0x140);
     let seconds = duration + source.field(0x138, 0xF0);
-    for (at, class) in [(hud, 0x8080278D), (duration, 0x8080255D), (seconds, 0x808008AC)] {
+    for (at, class) in [
+        (hud, 0x8080278D),
+        (duration, 0x8080255D),
+        (seconds, 0x808008AC),
+    ] {
         ensure!(
             p.u32(at)? == status && p.u32(at + 16)? == class,
             "Source presented status has a different layout"

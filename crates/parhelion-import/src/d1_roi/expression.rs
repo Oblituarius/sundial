@@ -6,6 +6,9 @@ pub(super) struct Globals {
     pub channels: BTreeMap<u8, Channel>,
     pub scopes: BTreeMap<u8, u8>,
     pub dyes: [DyeScope; 3],
+    /// Scope index of the gear plates, which only the gear renderer's own code binds. Only
+    /// PS4 draws, which borrow stock gear programs, need it.
+    pub plated: Option<u32>,
     pub depth: Depth,
 }
 
@@ -74,6 +77,19 @@ pub(super) struct DyeScope {
     pub tag: u32,
     pub index: u32,
     pub slot: u32,
+    /// Pixel texture slots of the detail diffuse and detail normal its program binds, when
+    /// that program is the two extern texture pushes PS4 draws rely on.
+    pub textures: Option<[u32; 2]>,
+}
+
+/// The two pixel texture slots a native dye scope binds, each from one extern texture push.
+fn dye_textures(scope: &Payload) -> Option<[u32; 2]> {
+    let code = &scope.0[scope.array_range(0x58, 1, Some(0x80800009)).ok()?];
+    (code.len() == 10
+        && code
+            .chunks_exact(5)
+            .all(|row| row[0] == 0x3F && row[3] == 0x47 && row[4] >> 5 == 1))
+    .then(|| [u32::from(code[4] & 31), u32::from(code[9] & 31)])
 }
 
 pub(super) enum Channel {
@@ -158,8 +174,14 @@ impl Globals {
                 tag,
                 index: index as u32,
                 slot,
+                textures: dye_textures(&scope),
             });
         }
+        let plated = native_scopes
+            .iter()
+            .position(|name| name == "gear_plated_textures")
+            .and_then(|index| u32::try_from(index).ok())
+            .filter(|index| *index < 32);
         let source_scopes = scopes(&from)?;
         let source_index = source_scopes
             .iter()
@@ -223,6 +245,7 @@ impl Globals {
             channels,
             scopes,
             dyes: dyes.try_into().ok().context("Native dye banks")?,
+            plated,
             depth,
         })
     }

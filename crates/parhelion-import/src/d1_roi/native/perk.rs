@@ -128,9 +128,9 @@ fn adjustments(
         if host == Host::Armor
             && let Some(value) = budget_share(hash, &bytes)?
         {
-            let index = *definitions
-                .get(&hash)
-                .with_context(|| format!("Source stat {hash:08X} has no Shadowkeep stat definition"))?;
+            let index = *definitions.get(&hash).with_context(|| {
+                format!("Source stat {hash:08X} has no Shadowkeep stat definition")
+            })?;
             ensure!(
                 indices.insert(index),
                 "Source stat {hash:08X} is adjusted twice"
@@ -556,6 +556,8 @@ const LEGACY_FRAME_DESCRIPTION: &str = "A relic of an older age, pulled through 
 const LEGACY_FRAME_ICON: &str = "0x80B47ED5";
 /// Weapon perk plugs, as opposed to shaders (14), masterworks and trackers (13) and mods (37).
 const PERK_ITEM_KIND: u64 = 15;
+/// Shader plugs.
+pub(super) const SHADER_ITEM_KIND: u64 = 14;
 /// Year-one armor trait mods: Plasteel Reinforcement and Restorative Mod. They are Shadowkeep's
 /// own choice, not a Rise of Iron talent, so an armor import disables the socket.
 const ARMOR_TRAIT_CATEGORY: u64 = 0xC57B_725E;
@@ -869,8 +871,10 @@ fn distinct<'a>(members: Vec<&'a Choice>, merged: &mut Vec<Value>) -> Vec<&'a Ch
                 && other.lowered.stock == choice.lowered.stock
         };
         if let Some(first) = kept.iter().find(|other| same(other)) {
-            merged.push(json!({"node":choice.node,"step":choice.report["step"],"name":choice.name,
-                "same_as":{"node":first.node,"step":first.report["step"]}}));
+            merged.push(
+                json!({"node":choice.node,"step":choice.report["step"],"name":choice.name,
+                "same_as":{"node":first.node,"step":first.report["step"]}}),
+            );
         } else {
             kept.push(choice);
         }
@@ -961,6 +965,19 @@ pub(super) fn translate(
         equivalents.insert(source, (plug, perks));
     }
     let mut columns = sockets.iter().map(|_| Value::Null).collect::<Vec<_>>();
+    // Rise of Iron items offer only the Default Shader, not the donor's own shader list.
+    for (index, socket) in sockets.iter().enumerate() {
+        let default = socket["choices"].as_array().and_then(|choices| {
+            choices.iter().find(|c| {
+                c["default"] == true && c["item_kind"].as_u64() == Some(SHADER_ITEM_KIND)
+            })
+        });
+        if let Some(default) = default {
+            let hash = default["hash"].as_u64().context("Native shader hash")?;
+            columns[index] =
+                json!({"choices":[format!("0x{hash:08X}")],"socket_type":socket["socket_type"]});
+        }
+    }
     // An armor intrinsic keeps its stat package unless the signature talent takes it.
     for socket in intrinsic
         .iter()
@@ -973,9 +990,9 @@ pub(super) fn translate(
         for (index, socket) in sockets.iter().enumerate() {
             if socket["choices"].as_array().is_some_and(|choices| {
                 !choices.is_empty()
-                    && choices.iter().all(|choice| {
-                        choice["category"].as_u64() == Some(ARMOR_TRAIT_CATEGORY)
-                    })
+                    && choices
+                        .iter()
+                        .all(|choice| choice["category"].as_u64() == Some(ARMOR_TRAIT_CATEGORY))
             }) {
                 columns[index] = json!({"choices":[],"socket_type":u16::MAX});
             }

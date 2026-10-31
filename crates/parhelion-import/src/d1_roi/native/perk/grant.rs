@@ -127,8 +127,7 @@ impl Catalog {
                 );
                 // PS4 settings keep this array 0x10 earlier than Xbox One. Measured on all
                 // 46 PS4 property banks; the row layout itself is unchanged.
-                let rows =
-                    data.array(settings + source.field(0xA0, 0x90), 40, Some(0x80802A84))?;
+                let rows = data.array(settings + source.field(0xA0, 0x90), 40, Some(0x80802A84))?;
                 found = Some((bank, data, rows));
             }
             let (bank, data, rows) =

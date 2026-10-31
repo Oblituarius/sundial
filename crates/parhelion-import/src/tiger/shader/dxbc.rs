@@ -514,6 +514,95 @@ pub(crate) fn declarations(container: &[u8]) -> Result<(Vec<u32>, Vec<u32>)> {
     Ok((buffers, resources))
 }
 
+/// Move whole constant buffers into another one: each `(slot, base)` buffer's reads become
+/// reads of `target` at `base` plus their vector, its declaration is dropped, and `target`
+/// is declared with `size` vectors (taking the first folded declaration's place when the
+/// program declared none). Only immediately indexed reads can move.
+pub(crate) fn fold_constant_buffers(
+    container: &[u8],
+    target: u32,
+    folds: &[(u32, u32)],
+    size: u32,
+) -> Result<Vec<u8>> {
+    let range = match chunk(container, b"SHEX")? {
+        Some(range) => range,
+        None => chunk(container, b"SHDR")?.context("shader has no program chunk")?,
+    };
+    let mut tokens: Vec<u32> = container[range]
+        .chunks_exact(4)
+        .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+        .collect();
+    let instructions = walk(&tokens)?;
+    let declared = |slot: u32| {
+        instructions.iter().any(|i| {
+            i.opcode == DCL_CONSTANT_BUFFER
+                && i.operands
+                    .first()
+                    .and_then(|o| o.indices.first().copied().flatten())
+                    .is_some_and(|at| tokens[at] == slot)
+        })
+    };
+    let mut target_declared = declared(target);
+    for (slot, _) in folds {
+        ensure!(
+            *slot != target && declared(*slot),
+            "folded constant buffer {slot} is not declared apart from {target}"
+        );
+    }
+    let mut kept = Vec::with_capacity(instructions.len());
+    for instruction in &instructions {
+        let operand = instruction.operands.first();
+        if instruction.opcode == DCL_CONSTANT_BUFFER {
+            let operand = operand.context("constant buffer declaration operand")?;
+            let (Some(slot), Some(Some(vectors))) = (
+                operand.indices.first().copied().flatten(),
+                operand.indices.get(1).copied(),
+            ) else {
+                bail!("constant buffer declaration is not immediate");
+            };
+            let folded = folds.iter().any(|(from, _)| *from == tokens[slot]);
+            if tokens[slot] == target || (folded && !target_declared) {
+                tokens[slot] = target;
+                tokens[vectors] = size;
+                target_declared = true;
+            } else if folded {
+                continue;
+            }
+            kept.push(instruction);
+            continue;
+        }
+        for operand in &instruction.operands {
+            if operand.kind != CONSTANT_BUFFER {
+                continue;
+            }
+            let Some(slot) = operand.indices.first().copied().flatten() else {
+                continue;
+            };
+            let Some((_, base)) = folds.iter().find(|(from, _)| *from == tokens[slot]) else {
+                continue;
+            };
+            let vector = operand
+                .indices
+                .get(1)
+                .copied()
+                .flatten()
+                .context("folded constant buffer read is relatively indexed")?;
+            tokens[slot] = target;
+            tokens[vector] = tokens[vector]
+                .checked_add(*base)
+                .filter(|vector| *vector < size)
+                .context("folded constant buffer read exceeds its new extent")?;
+        }
+        kept.push(instruction);
+    }
+    let mut output = tokens[..2].to_vec();
+    for instruction in kept {
+        output.extend_from_slice(&tokens[instruction.start..instruction.end]);
+    }
+    output[1] = u32::try_from(output.len())?;
+    rebuild(container, &output, None)
+}
+
 /// Input or output signature elements: (semantic, index, register, mask). `OSG5` elements
 /// carry a leading stream index.
 pub(crate) fn signature(container: &[u8], name: &[u8; 4]) -> Result<Vec<(String, u32, u32, u8)>> {

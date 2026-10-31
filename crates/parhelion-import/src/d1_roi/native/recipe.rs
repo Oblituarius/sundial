@@ -109,7 +109,7 @@ fn armor_order(native: &Value, columns: &[Value], variants: &mut [Value]) -> Res
     let shader = find(|choices| {
         choices
             .iter()
-            .any(|c| c["default"] == true && c["item_kind"] == SHADER_ITEM_KIND)
+            .any(|c| c["default"] == true && c["item_kind"] == perk::SHADER_ITEM_KIND)
     })
     .context("Native armor has no shader socket")?;
     let mut lanes = Vec::new();
@@ -130,7 +130,9 @@ fn armor_order(native: &Value, columns: &[Value], variants: &mut [Value]) -> Res
         };
         if column.is_null() && position != lane {
             // A donor socket the layout moves keeps its own choices, default first.
-            let choices = socket["choices"].as_array().context("Native socket choices")?;
+            let choices = socket["choices"]
+                .as_array()
+                .context("Native socket choices")?;
             let hashes = choices
                 .iter()
                 .filter(|c| c["default"] == true)
@@ -155,12 +157,12 @@ fn armor_order(native: &Value, columns: &[Value], variants: &mut [Value]) -> Res
     Ok(ordered)
 }
 
-/// The item kind of shader plugs.
-const SHADER_ITEM_KIND: u64 = 14;
-
 /// Disable the donor sockets past the finished layout, so none of its own plugs remain.
 fn disable_remaining(native: &Value, columns: &mut Vec<Value>) -> Result<()> {
-    let count = native["sockets"].as_array().context("Native sockets")?.len();
+    let count = native["sockets"]
+        .as_array()
+        .context("Native sockets")?
+        .len();
     while columns.len() < count {
         columns.push(json!({"choices":[],"socket_type":u16::MAX}));
     }
@@ -301,9 +303,11 @@ impl Source {
         for &(socket_type, set, plug) in &STAT_ALLOCATION {
             crate::tiger::shadowkeep::item_tag(&mut assembly.native, plug)
                 .with_context(|| format!("Stat allocation plug {plug:08X}"))?;
-            columns.push(json!({"choices":[format!("0x{plug:08X}")],"socket_type":socket_type,
+            columns.push(
+                json!({"choices":[format!("0x{plug:08X}")],"socket_type":socket_type,
                 "randomized_plug_set_index":set,
-                "randomized_selection_program":[{"opcode":11,"operand":0}]}));
+                "randomized_selection_program":[{"opcode":11,"operand":0}]}),
+            );
         }
         progress(format!("Converting {}", armor.name));
         let mut reference = assembly.armor_graph(

@@ -1,6 +1,9 @@
 use super::super::expression;
 use super::*;
-use crate::tiger::shader::identity::Stage;
+use crate::tiger::shader::{
+    identity::Stage,
+    program::{Program, Template},
+};
 
 /// Stock sight materials `80BA7DA2` and `80EF364B`, whose reticle quads match the D1
 /// quad's dimensions, subtract this from the quad's z before the reticle projection.
@@ -8,6 +11,8 @@ const NATIVE_SIGHT_DEPTH: f32 = 2.5;
 
 pub(super) struct Equipment {
     pub plates: [String; 3],
+    /// The gearstack plate in the stock gear convention, for PS4 draws.
+    pub gear_stack: String,
     pub dyes: BTreeMap<u8, u32>,
 }
 
@@ -141,6 +146,112 @@ fn zero_gear_extern(stock: &Payload) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// The normal plate unpack of stock gear pixel programs (`81532DEA` row 2): scale, bias and
+/// an occlusion bias added to the stored normal's third channel. D1 normal plates are two
+/// channel BC5, whose third channel reads zero, which this bias would turn into 0.4 occlusion.
+/// The stored bias is `0x3ECCCCCC`, one unit below the nearest float to 0.4.
+const GEAR_NORMAL_UNPACK: [u32; 4] = [0x3FFF_0000, 0xBF80_0000, 0x3ECC_CCCC, 0];
+
+fn put_lanes(rows: &mut [u8], row: usize, lanes: &[(usize, f32)]) -> Result<()> {
+    for (lane, value) in lanes {
+        put(rows, row * 16 + lane * 4, &value.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+/// The gear dye vectors that a borrowed program reads from one native dye scope, which only
+/// the gear renderer binds: the scope's defaults, with the draw's source dye. Stock program
+/// `81532DEA` reads rows 0 and 1 as the detail transforms, row 2 as the detail normal unpack,
+/// rows 9 and 17 as the colours its gearstack alpha selects between (13 and 21 being their
+/// wear targets), and the x, y and z lanes of rows 10, 14, 20 and 24 as detail diffuse,
+/// detail normal and detail smoothness weights. The scope defaults are debug colours with
+/// no detail.
+fn dye_vectors(
+    defaults: &Payload,
+    dye: Option<&Payload>,
+    secondary: bool,
+    detail: bool,
+) -> Result<Vec<u8>> {
+    let mut rows = vectors(defaults, 0x88)?;
+    ensure!(rows.len() == 27 * 16, "Native armor dye vectors differ");
+    // Source detail normals carry no occlusion channel either.
+    put_lanes(&mut rows, 2, &[(2, 1.0)])?;
+    let Some(dye) = dye else {
+        // The overlay of stock and source gear leaves a colour unchanged under 0.25.
+        for row in [9, 13, 17, 21] {
+            put_lanes(&mut rows, row, &[(0, 0.25), (1, 0.25), (2, 0.25), (3, 1.0)])?;
+        }
+        return Ok(rows);
+    };
+    let transform = dye.bytes::<16>(0x70)?;
+    let colour = dye.bytes::<16>(if secondary { 0xA0 } else { 0x90 })?;
+    for (row, value) in [0, 1]
+        .map(|row| (row, transform))
+        .into_iter()
+        .chain([9, 13, 17, 21].map(|row| (row, colour)))
+    {
+        put(&mut rows, row * 16, &value)?;
+    }
+    if detail {
+        // Source programs apply the detail colour and smoothness fully and scale the
+        // detail normal by its normal vector's x.
+        let normal = dye.f32(0x80)?;
+        for row in [10, 14, 20, 24] {
+            put_lanes(&mut rows, row, &[(0, 1.0), (1, normal), (2, 1.0)])?;
+        }
+    }
+    Ok(rows)
+}
+
+/// What a borrowed stage's program reads from the gear renderer's bindings.
+struct GearReads {
+    shader: u32,
+    code: Vec<u8>,
+    /// Plate texture slots (0 albedo, 1 normal, 2 gearstack) the stage leaves unbound.
+    plates: Vec<u32>,
+    /// Dye detail texture slots the stage leaves unbound.
+    details: Vec<u32>,
+    /// Dye scopes whose constant buffer the program declares.
+    folds: Vec<expression::DyeScope>,
+    /// The program declares no constant buffer zero.
+    target_free: bool,
+    /// The technique's own texture rows: slot and identity.
+    bound: BTreeMap<u32, String>,
+}
+
+/// Rewrite a stage's texture rows with the gear textures added, and its resource set hash,
+/// which covers every bound texture identity.
+fn texture_rows(
+    out: &mut Vec<u8>,
+    patches: &mut Vec<(usize, String)>,
+    to: usize,
+    bound: &BTreeMap<u32, String>,
+    gear: &BTreeMap<u32, String>,
+) -> Result<()> {
+    let mut identities = bound.clone();
+    identities.extend(gear.iter().map(|(slot, symbol)| (*slot, symbol.clone())));
+    let mut rows = Vec::new();
+    let mut hash = 0xCBF29CE484222325u64;
+    for (slot, identity) in &identities {
+        let tag = if gear.contains_key(slot) {
+            u32::MAX
+        } else {
+            u32::from_str_radix(identity, 16)?
+        };
+        rows.extend(slot.to_le_bytes().into_iter().chain(tag.to_le_bytes()));
+        for byte in slot.to_le_bytes().into_iter().chain(identity.bytes()) {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001B3);
+        }
+    }
+    let start = array(out, to + 8, 0x80807211, &rows, 8)?;
+    for (index, slot) in identities.keys().enumerate() {
+        if let Some(symbol) = gear.get(slot) {
+            patches.push((start + index * 8 + 4, symbol.clone()));
+        }
+    }
+    put(out, to + 0x18, &hash.to_le_bytes())
+}
+
 struct StageInputs {
     textures: BTreeMap<u32, String>,
     samplers: Vec<String>,
@@ -229,14 +340,257 @@ impl Assembly<'_> {
         })
     }
 
-    /// Copy the stock technique that draws this stage with the same vertex elements.
+    /// A single-level 4x4 texture of one colour.
+    fn flat_texture(&mut self, symbol: &str, colour: [u8; 4]) -> Result<String> {
+        if self.symbols.contains(symbol) {
+            return Ok(symbol.to_owned());
+        }
+        self.texture_bytes(
+            symbol,
+            super::super::texture::Texture {
+                format: 28,
+                width: 4,
+                height: 4,
+                depth: 1,
+                layers: 1,
+                mips: 1,
+                bytes: colour.repeat(16),
+            },
+        )
+    }
+
+    /// The gear resources a borrowed stage's program reads that the technique does not bind.
+    fn gear_reads(&mut self, stock: &Payload, to: usize) -> Result<Option<GearReads>> {
+        let shader = stock.u32(to)?;
+        if matches!(shader, 0 | u32::MAX) {
+            return Ok(None);
+        }
+        let used = stock.u32(0x18)?;
+        let code = self
+            .native
+            .tag(self.native.reference(shader)?, None)?
+            .0
+            .clone();
+        let (buffers, resources) = crate::tiger::shader::dxbc::declarations(&code)?;
+        let bound = stock
+            .array(to + 8, 8, Some(0x80807211))?
+            .into_iter()
+            .map(|row| Ok((stock.u32(row)?, format!("{:08X}", stock.u32(row + 4)?))))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let plated = self
+            .globals
+            .plated
+            .context("Native plated texture scope is missing")?;
+        let wanted = resources
+            .iter()
+            .copied()
+            .filter(|slot| !bound.contains_key(slot))
+            .collect::<BTreeSet<_>>();
+        let plates = if used & (1 << plated) != 0 {
+            [0, 1, 2]
+                .into_iter()
+                .filter(|slot| wanted.contains(slot))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut scopes = Vec::new();
+        for scope in self.globals.dyes {
+            if used & (1 << scope.index) != 0 {
+                let textures = scope
+                    .textures
+                    .context("Native armor dye texture program differs")?;
+                scopes.push((scope, textures));
+            }
+        }
+        let reads = GearReads {
+            shader,
+            code,
+            folds: scopes
+                .iter()
+                .map(|(scope, _)| *scope)
+                .filter(|scope| buffers.contains(&scope.slot))
+                .collect(),
+            details: scopes
+                .iter()
+                .flat_map(|(_, textures)| *textures)
+                .filter(|slot| wanted.contains(slot))
+                .collect(),
+            plates,
+            target_free: !buffers.contains(&0),
+            bound,
+        };
+        Ok(
+            (!reads.folds.is_empty() || !reads.plates.is_empty() || !reads.details.is_empty())
+                .then_some(reads),
+        )
+    }
+
+    /// The textures that replace the gear renderer's plate and dye detail bindings.
+    fn gear_textures(
+        &mut self,
+        reads: &GearReads,
+        equipment: &Equipment,
+        dye: Option<&Payload>,
+    ) -> Result<(BTreeMap<u32, String>, bool)> {
+        let mut gear = BTreeMap::new();
+        let plates = [
+            &equipment.plates[0],
+            &equipment.plates[1],
+            &equipment.gear_stack,
+        ];
+        for &slot in &reads.plates {
+            let plate = plates[slot as usize];
+            ensure!(
+                !plate.is_empty(),
+                "Borrowed gear program needs an absent plate"
+            );
+            gear.insert(slot, plate.clone());
+        }
+        let mut detail = self.detail_textures(dye)?;
+        let source_detail = detail.iter().all(|symbol| !symbol.is_empty());
+        if !reads.details.is_empty() && !source_detail {
+            // Neutral under both the detail overlay and the detail normal unpack.
+            detail = [
+                self.flat_texture("neutral-detail-diffuse", [64; 4])?,
+                self.flat_texture("neutral-detail-normal", [128, 128, 255, 255])?,
+            ];
+        }
+        for scope in self.globals.dyes {
+            for (slot, texture) in scope.textures.into_iter().flatten().zip(&detail) {
+                if reads.details.contains(&slot) {
+                    gear.insert(slot, texture.clone());
+                }
+            }
+        }
+        Ok((gear, source_detail))
+    }
+
+    /// Fold the dye buffers a borrowed pixel program reads into its own constant buffer, as
+    /// a private copy of the program. Returns the folded layout and the unpack rows changed.
+    #[allow(clippy::too_many_arguments)]
+    fn fold_dye_buffers(
+        &mut self,
+        stock: &Payload,
+        out: &mut Vec<u8>,
+        patches: &mut Vec<(usize, String)>,
+        to: usize,
+        reads: &GearReads,
+        symbol: &str,
+        dye: Option<&Payload>,
+        (secondary, source_detail): (bool, bool),
+    ) -> Result<(Vec<(u32, u32)>, usize)> {
+        let mut values = vectors(stock, to + 0x50)?;
+        let mut target = stock.u32(to + 0x80)?;
+        if values.is_empty() {
+            ensure!(
+                reads.target_free,
+                "Borrowed program declares a constant buffer its stage does not bind"
+            );
+            target = 0;
+        }
+        let unpack = GEAR_NORMAL_UNPACK.map(u32::to_le_bytes).concat();
+        let mut unpacks = 0;
+        if reads.plates.contains(&1) {
+            for row in values.chunks_exact_mut(16).filter(|row| **row == *unpack) {
+                row[8..12].copy_from_slice(&1f32.to_le_bytes());
+                unpacks += 1;
+            }
+        }
+        let mut layout = Vec::new();
+        for scope in &reads.folds {
+            layout.push((scope.slot, u32::try_from(values.len() / 16)?));
+            let defaults = self.native.tag(scope.tag, Some(0x808071F3))?;
+            values.extend(dye_vectors(&defaults, dye, secondary, source_detail)?);
+        }
+        if !layout.is_empty() {
+            let size = u32::try_from(values.len() / 16)?;
+            let code = crate::tiger::shader::dxbc::fold_constant_buffers(
+                &reads.code,
+                target,
+                &layout,
+                size,
+            )?;
+            let template = Template::read(&mut self.native, reads.shader)?;
+            let name = format!("{symbol}-pixel");
+            let assets = Program::new(Stage::Pixel, code)?.assets(&name, &template)?;
+            let data = format!("{name}-bytecode");
+            self.node(
+                &data,
+                assets.bytecode_template,
+                &assets.bytecode,
+                Some(&name),
+                &[],
+            )?;
+            self.node(
+                &name,
+                assets.header_template,
+                &assets.header,
+                Some(&data),
+                &[],
+            )?;
+            put(out, to, &u32::MAX.to_le_bytes())?;
+            patches.push((to, name));
+            put(out, to + 0x80, &target.to_le_bytes())?;
+            out[to + 0x74] = 0x10;
+        }
+        if !layout.is_empty() || unpacks > 0 {
+            array(out, to + 0x50, 0x80800090, &values, 16)?;
+        }
+        Ok((layout, unpacks))
+    }
+
+    /// Bind the gear resources of a borrowed stage itself. The stage's program reads the
+    /// plates and dye scopes that only the gear renderer binds, and an imported item draws
+    /// through the rigid object renderer, which left them unbound or holding another draw's
+    /// resources: the item drew black and flickered. Returns the stage's evidence.
+    #[allow(clippy::too_many_arguments)]
+    fn bind_gear_stage(
+        &mut self,
+        stock: &Payload,
+        out: &mut Vec<u8>,
+        patches: &mut Vec<(usize, String)>,
+        (stage, to): (Stage, usize),
+        symbol: &str,
+        equipment: &Equipment,
+        dye: Option<&Payload>,
+        secondary: bool,
+    ) -> Result<Option<Value>> {
+        let Some(reads) = self.gear_reads(stock, to)? else {
+            return Ok(None);
+        };
+        ensure!(
+            stage == Stage::Pixel,
+            "Borrowed {stage:?} program reads gear resources"
+        );
+        let (gear, source_detail) = self.gear_textures(&reads, equipment, dye)?;
+        let (layout, unpacks) = self.fold_dye_buffers(
+            stock,
+            out,
+            patches,
+            to,
+            &reads,
+            symbol,
+            dye,
+            (secondary, source_detail),
+        )?;
+        texture_rows(out, patches, to, &reads.bound, &gear)?;
+        Ok(Some(
+            json!({"stage":stage,"shader":reads.shader,"textures":gear,
+            "folded_dye_buffers":layout,"normal_occlusion_bias":unpacks,"source_detail":source_detail}),
+        ))
+    }
+
+    /// Copy the stock technique that draws this stage with the same vertex elements, and bind
+    /// the gear resources its programs read to the converted plates and the draw's dye.
     fn borrowed_technique(
         &mut self,
         tag: u32,
         symbol: &str,
-        pass: usize,
-        layout: u16,
+        draw: &Draw,
+        equipment: &Equipment,
     ) -> Result<String> {
+        let (pass, layout) = (draw.stage, draw.layout);
         let technique = BORROWED_TECHNIQUES
             .iter()
             .find(|(stage, stock, _)| *stage == pass && self.layouts.same_elements(layout, *stock))
@@ -247,13 +601,40 @@ impl Assembly<'_> {
                 )
             })?;
         let stock = self.native.tag(technique, Some(0x808071E8))?;
+        let dye_tag = equipment.dyes.get(&(draw.dye / 2)).copied();
+        let dye = dye_tag.map(|tag| self.source.read(tag)).transpose()?;
+        let mut out = zero_gear_extern(&stock)?;
+        let mut patches = Vec::new();
+        let mut stages = Vec::new();
+        for stage in [
+            (Stage::Vertex, 0x48),
+            (Stage::Hull, 0xE8),
+            (Stage::Domain, 0x188),
+            (Stage::Geometry, 0x228),
+            (Stage::Pixel, 0x2C8),
+        ] {
+            stages.extend(self.bind_gear_stage(
+                &stock,
+                &mut out,
+                &mut patches,
+                stage,
+                symbol,
+                equipment,
+                dye.as_ref(),
+                !draw.dye.is_multiple_of(2),
+            )?);
+        }
+        size(&mut out)?;
         self.approximations.insert(
-            "PS4 source shaders are GCN and are not translated: each draw borrows a stock Shadowkeep gear technique for its stage and vertex layout, so this item renders with stock surfaces".to_owned(),
+            "PS4 source shaders are GCN and are not translated: each draw borrows a stock Shadowkeep gear technique for its stage and vertex layout, bound to the converted plates, the draw's dye and a gearstack rewritten in the stock convention without occlusion or emission".to_owned(),
         );
-        self.evidence.push(json!({"material":tag,"symbol":symbol,"pass":pass,"layout":layout,"borrowed_technique":technique}));
+        if dye.is_none() && !stages.is_empty() {
+            self.approximations
+                .insert("PS4 draws without a source dye use a neutral dye colour".to_owned());
+        }
+        self.evidence.push(json!({"material":tag,"symbol":symbol,"pass":pass,"layout":layout,"borrowed_technique":technique,"gear_bindings":stages}));
         let template = self.class_template(0x808071E8)?;
-        let bytes = zero_gear_extern(&stock)?;
-        self.node(symbol, template, &bytes, None, &[])
+        self.node(symbol, template, &out, None, &patches)
     }
 
     pub(super) fn material(
@@ -279,7 +660,7 @@ impl Assembly<'_> {
             "Source material class differs"
         );
         if ps4_source {
-            return self.borrowed_technique(tag, symbol, pass, layout);
+            return self.borrowed_technique(tag, symbol, &draw, equipment);
         }
         let source = self.source.read(tag)?;
         let dye_tag = equipment.dyes.get(&(dye / 2)).copied();
