@@ -38,6 +38,109 @@ fn primitives(indices: &[u32], primitive: u16, restart: u32) -> Result<u32> {
 }
 
 impl Assembly<'_> {
+    /// Store each constant source vertex offset (`vertex_bakes`) in the positions its draws
+    /// read. Stock program `80C0CEC3` adds `(COLOR - 0.5) * scale` after the model transform
+    /// (`v0 * cb11[5].w + cb11[5].xyz`), so the offset is divided by the uniform model scale
+    /// at transform +0x1C before it joins the Int16-normalized position. Rewrites the
+    /// position stream's data file, which `buffer` derives from the source again on reuse.
+    fn bake_vertex_offsets(
+        &mut self,
+        draws: &[(String, u16, std::ops::Range<usize>)],
+        indices: &[u32],
+        restart: u32,
+        streams: &[Option<(String, Vec<u8>)>; 4],
+        vertices: usize,
+        transform: &[u8; 48],
+    ) -> Result<()> {
+        if !draws.iter().any(|(m, ..)| self.vertex_bakes.contains_key(m)) {
+            return Ok(());
+        }
+        let mut scales: BTreeMap<usize, [f32; 3]> = BTreeMap::new();
+        let mut plain = BTreeSet::new();
+        let mut layouts = BTreeSet::new();
+        for (material, layout, range) in draws {
+            let baked = self.vertex_bakes.get(material);
+            if baked.is_some() {
+                layouts.insert(*layout);
+            }
+            for &index in &indices[range.clone()] {
+                if index == restart {
+                    continue;
+                }
+                let index = index as usize;
+                match baked {
+                    Some(scale) => ensure!(
+                        *scales.entry(index).or_insert(*scale) == *scale,
+                        "A source vertex has two constant offsets"
+                    ),
+                    None => {
+                        plain.insert(index);
+                    }
+                }
+            }
+        }
+        ensure!(
+            scales.keys().all(|vertex| !plain.contains(vertex)),
+            "Source vertices with a constant offset are also drawn without it"
+        );
+        let [layout] = layouts.into_iter().collect::<Vec<_>>()[..] else {
+            anyhow::bail!("Offset source vertices are drawn with several layouts");
+        };
+        let (Some((ps, po, 11)), Some((cs, co, 5))) = (
+            self.layouts.element(layout, 0, 0)?,
+            self.layouts.element(layout, 8, 0)?,
+        ) else {
+            anyhow::bail!("Offset source vertices need Int16 positions and UNorm8 colours");
+        };
+        let (symbol, mut data) = streams[ps]
+            .clone()
+            .context("Offset source position stream is absent")?;
+        let colours = &streams[cs]
+            .as_ref()
+            .context("Offset source colour stream is absent")?
+            .1;
+        let model_scale = f32::from_le_bytes(transform[0x1C..0x20].try_into()?);
+        ensure!(
+            model_scale.is_finite() && model_scale > 0.0,
+            "Offset source model has no uniform scale"
+        );
+        // `model` checked that every stream holds `vertices` records and every index is below it.
+        let position_stride = data.len() / vertices;
+        let colour_stride = colours.len() / vertices;
+        ensure!(
+            po + 8 <= position_stride && co + 4 <= colour_stride,
+            "Offset source elements exceed their streams"
+        );
+        let (mut moved, mut clamped) = (0f32, 0f32);
+        for (&vertex, scale) in &scales {
+            let colour = &colours[vertex * colour_stride + co..][..3];
+            let at = vertex * position_stride + po;
+            let mut displacement = 0f32;
+            for axis in 0..3 {
+                let field = at + axis * 2;
+                let stored = i16::from_le_bytes(data[field..field + 2].try_into()?);
+                let delta = (f32::from(colour[axis]) / 255.0 - 0.5) * scale[axis];
+                displacement += delta * delta;
+                let wanted = (f32::from(stored) / 32767.0).max(-1.0) + delta / model_scale;
+                let kept = wanted.clamp(-1.0, 1.0);
+                clamped = clamped.max((wanted - kept).abs() * model_scale);
+                let value = (kept * 32767.0).round() as i16;
+                data[field..field + 2].copy_from_slice(&value.to_le_bytes());
+            }
+            moved = moved.max(displacement.sqrt());
+        }
+        fs::write(self.folder.join(format!("{symbol}-data.bin")), &data)?;
+        if clamped > 0.0 {
+            self.approximations.insert(
+                "Baked vertex offsets past the model's packed range are clamped to its bounds"
+                    .to_owned(),
+            );
+        }
+        self.evidence.push(json!({"baked_vertex_offset":{"buffer":symbol,"layout":layout,
+            "vertices":scales.len(),"max_displacement":moved,"max_clamped":clamped}}));
+        Ok(())
+    }
+
     fn buffer(
         &mut self,
         tag: u32,
@@ -167,6 +270,7 @@ impl Assembly<'_> {
             );
             let to = mesh_start + mesh_index * 136;
             let mut strides = [0; 4];
+            let mut streams: [Option<(String, Vec<u8>)>; 4] = Default::default();
             let mut vertices = None;
             for (index, stride) in strides.iter_mut().enumerate() {
                 put(&mut out, to + index * 4, &u32::MAX.to_le_bytes())?;
@@ -177,6 +281,7 @@ impl Assembly<'_> {
                 let (symbol, data, size) = self.buffer(tag, false, index == 0)?;
                 *stride = size;
                 let count = data.0.len() / size;
+                streams[index] = Some((symbol.clone(), data.0));
                 if let Some(previous) = vertices {
                     ensure!(
                         count == previous,
@@ -226,6 +331,7 @@ impl Assembly<'_> {
             let parts = source.array(mesh + 0x48, 36, Some(0x80801AEF))?;
             let mut rows = Vec::new();
             let mut materials = Vec::new();
+            let mut draws = Vec::new();
             let mut covered = 0;
             for stage in 0..23 {
                 let (start, end) = if stage < 19 {
@@ -301,6 +407,7 @@ impl Assembly<'_> {
                     let draw = indices
                         .get(start..start.checked_add(count).context("Source draw overflow")?)
                         .context("Source draw exceeds the index buffer")?;
+                    draws.push((mat.clone(), layout, start..start + count));
                     put(
                         &mut row,
                         16,
@@ -362,6 +469,7 @@ impl Assembly<'_> {
                 }
                 covered = end;
             }
+            self.bake_vertex_offsets(&draws, &indices, restart, &streams, vertices, &transform)?;
             put(
                 &mut out,
                 to + 0x56,

@@ -284,6 +284,8 @@ pub(super) struct Inputs<'a> {
     pub objects: usize,
     /// The body's channel names by ordinal, which object inputs index.
     pub object_channels: &'a [u32],
+    /// Object channels with no Shadowkeep producer, loaded as these fixed values instead.
+    pub fixed_objects: &'a [(u32, f32)],
     pub outputs: usize,
     pub samplers: usize,
     pub stage: u8,
@@ -317,6 +319,76 @@ impl Program {
             self.code.extend([0x43, 0]);
         }
         Ok(())
+    }
+
+    /// The output bank after one evaluation, when the program reads only its own constants.
+    /// `values` is the initial bank. Returns `None` for any input, binding or unknown
+    /// operation. Arithmetic follows the native interpreter (as `src/expression.rs` in the
+    /// application crate): operands in push order, `right` the most recent.
+    pub(super) fn constant_outputs(&self, values: &[u8]) -> Option<Vec<[f32; 4]>> {
+        let vector = |bytes: &[u8]| -> [f32; 4] {
+            std::array::from_fn(|i| {
+                f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
+            })
+        };
+        let mut outputs = values.chunks_exact(16).map(vector).collect::<Vec<_>>();
+        let mut stack: Vec<[f32; 4]> = Vec::new();
+        let mut at = 0;
+        while at < self.code.len() {
+            let op = self.code[at];
+            at += 1;
+            let lanes = |f: &dyn Fn(f32) -> f32, v: [f32; 4]| v.map(f);
+            match op {
+                0x34 => {
+                    let index = usize::from(*self.code.get(at)?);
+                    at += 1;
+                    stack.push(vector(self.constants.get(index * 16..index * 16 + 16)?));
+                }
+                0x43 => {
+                    let index = usize::from(*self.code.get(at)?);
+                    at += 1;
+                    let value = stack.pop()?;
+                    if outputs.len() <= index {
+                        outputs.resize(index + 1, [0.0; 4]);
+                    }
+                    outputs[index] = value;
+                }
+                0x01..=0x04 | 0x08 | 0x09 => {
+                    let b = stack.pop()?;
+                    let a = stack.pop()?;
+                    stack.push(std::array::from_fn(|i| match op {
+                        0x01 => a[i] + b[i],
+                        0x02 => a[i] - b[i],
+                        0x03 => a[i] * b[i],
+                        0x04 => a[i] / b[i],
+                        0x08 => a[i].min(b[i]),
+                        _ => a[i].max(b[i]),
+                    }));
+                }
+                0x10..=0x13 => {
+                    let c = stack.pop()?;
+                    let b = stack.pop()?;
+                    let a = stack.pop()?;
+                    stack.push(std::array::from_fn(|i| match op {
+                        0x10 => a[i] + c[i] * (b[i] - a[i]),
+                        0x11 => (a[i] + c[i] * (b[i] - a[i])).clamp(0.0, 1.0),
+                        0x12 => a[i] * b[i] + c[i],
+                        _ => a[i].max(b[i]).min(c[i]),
+                    }));
+                }
+                0x15 | 0x1D | 0x21 | 0x23 => {
+                    let v = stack.pop()?;
+                    stack.push(match op {
+                        0x15 => lanes(&f32::abs, v),
+                        0x1D => lanes(&|x| -x, v),
+                        0x21 => [v[0]; 4],
+                        _ => lanes(&|x| x.clamp(0.0, 1.0), v),
+                    });
+                }
+                _ => return None,
+            }
+        }
+        (stack.is_empty() && outputs.iter().flatten().all(|v| v.is_finite())).then_some(outputs)
     }
 
     fn constant(&mut self, value: [u8; 16]) -> Result<()> {
@@ -510,6 +582,14 @@ pub(super) fn translate(code: &[u8], constants: Vec<u8>, inputs: &Inputs<'_>) ->
                     usize::from(args[0]) < inputs.objects,
                     "Source object input exceeds its declared table"
                 );
+                let fixed = inputs
+                    .object_channels
+                    .get(usize::from(args[0]))
+                    .and_then(|name| inputs.fixed_objects.iter().find(|(n, _)| n == name));
+                if let Some(&(_, value)) = fixed {
+                    result.constant(vector([value; 4]))?;
+                    continue;
+                }
                 result.code.extend([0x4D, args[0]]);
                 // The stock weapon bank derives channel 0E36F79F from the Power level
                 // (0.65 times the level, normalised against 500 by the sight-glow curves,

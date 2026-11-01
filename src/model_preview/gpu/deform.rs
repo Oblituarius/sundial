@@ -35,7 +35,7 @@ impl Prepared {
             cloth_offsets.push((base, stride));
             cloth.extend(samples);
         }
-        let mut source = Vec::with_capacity(model.vertices.len() * 6);
+        let mut source = Vec::with_capacity(model.vertices.len() * 7);
         for (index, &point) in model.vertices.iter().enumerate() {
             let normal = model.normals.get(index).copied();
             let tangent = model.tangents.get(index).copied();
@@ -52,6 +52,7 @@ impl Prepared {
             source.push(weights.map_or([0.0; 4], |w| w.values.map(f32::from)));
             source.push(weights.map_or([0.0; 4], |w| w.bones.map(f32::from)));
             source.push(mapping[index]);
+            source.push(model.colors.get(index).copied().unwrap_or([1.0; 4]));
         }
         let (shader, rows) = source_code(model);
         Some(Self {
@@ -308,7 +309,7 @@ fn source_code(model: &Model) -> (String, usize) {
     for (index, motion) in model.motions.iter().enumerate() {
         shader.push_str(&motion.gpu_source(&format!("motion{index}")));
     }
-    shader.push_str("void main(){int vertex=gl_VertexID;vec4 original=texelFetch(uSource,vertex*6),basis=texelFetch(uSource,vertex*6+1);vec3 p=original.xyz,n=basis.xyz;vec4 t=texelFetch(uSource,vertex*6+2);\n");
+    shader.push_str("void main(){int vertex=gl_VertexID;vec4 original=texelFetch(uSource,vertex*7),basis=texelFetch(uSource,vertex*7+1);vec3 p=original.xyz,n=basis.xyz;vec4 t=texelFetch(uSource,vertex*7+2);nColor=texelFetch(uSource,vertex*7+6);\n");
     let mut rows = 0;
     for (index, motion) in model.motions.iter().enumerate() {
         writeln!(shader, "if(vertex>={}&&vertex<{}&&texelFetch(uPalette,{rows}).x!=0.0){{constantBase={};motion{index}(p,n,t);}}", motion.vertices.start, motion.vertices.end, rows+1).unwrap();
@@ -327,7 +328,7 @@ fn source_code(model: &Model) -> (String, usize) {
         .unwrap();
         rows += rig.animation.bone_count() * 2;
     }
-    writeln!(shader, "vec4 cloth=texelFetch(uSource,vertex*6+5);if(cloth.x>=0.0){{vec4 time=texelFetch(uPalette,{rows}+int(cloth.x));int a=int(cloth.y+time.x),b=int(cloth.y+time.y);p=texelFetch(uCloth,a).xyz*(1.0-time.z)+texelFetch(uCloth,b).xyz*time.z;n=texelFetch(uCloth,a+1).xyz*(1.0-time.z)+texelFetch(uCloth,b+1).xyz*time.z;t.xyz=texelFetch(uCloth,a+2).xyz*(1.0-time.z)+texelFetch(uCloth,b+2).xyz*time.z;}}oPosition=vec4(p,original.w);oNormal=vec4(n,basis.w);oTangent=t;gl_Position=vec4(0.0);}}").unwrap();
+    writeln!(shader, "vec4 cloth=texelFetch(uSource,vertex*7+5);if(cloth.x>=0.0){{vec4 time=texelFetch(uPalette,{rows}+int(cloth.x));int a=int(cloth.y+time.x),b=int(cloth.y+time.y);p=texelFetch(uCloth,a).xyz*(1.0-time.z)+texelFetch(uCloth,b).xyz*time.z;n=texelFetch(uCloth,a+1).xyz*(1.0-time.z)+texelFetch(uCloth,b+1).xyz*time.z;t.xyz=texelFetch(uCloth,a+2).xyz*(1.0-time.z)+texelFetch(uCloth,b+2).xyz*time.z;}}oPosition=vec4(p,original.w);oNormal=vec4(n,basis.w);oTangent=t;gl_Position=vec4(0.0);}}").unwrap();
     (shader, rows + model.cloth.len())
 }
 
@@ -336,6 +337,7 @@ const HEADER: &str = r#"#version 330 core
 uniform samplerBuffer uSource,uPalette,uCloth;
 out vec4 oPosition,oNormal,oTangent;
 int constantBase;
+vec4 nColor;
 vec4 nConstant(int buffer,int index){
  if(buffer==0)return (index>=0&&index<128)?texelFetch(uPalette,constantBase+index):vec4(0.0);
  if(buffer==11){if(index==5||index==7)return vec4(0,0,0,1);if(index==6)return vec4(1,1,0,0);if(index>=8&&index<=10){vec4 v=vec4(0);v[index-8]=1.0;return v;}}
@@ -344,7 +346,7 @@ vec4 nConstant(int buffer,int index){
 vec3 rotateBone(vec4 q,vec3 p){vec3 t=2.0*cross(q.xyz,p);return p+q.w*t+cross(q.xyz,t);}
 vec3 safeNormal(vec3 p){float len=length(p);return len>1e-8&&!isinf(len)?p/len:vec3(0);}
 void skin(int vertex,int base,inout vec3 p,inout vec3 n,inout vec4 t){
- vec4 weights=texelFetch(uSource,vertex*6+3),bones=texelFetch(uSource,vertex*6+4);
+ vec4 weights=texelFetch(uSource,vertex*7+3),bones=texelFetch(uSource,vertex*7+4);
  float total=weights.x+weights.y+weights.z+weights.w;if(total==0.0)return;
  vec3 point=vec3(0),normal=vec3(0),tangent=vec3(0);
  for(int i=0;i<4;i++){if(weights[i]==0.0)continue;int bone=base+int(bones[i])*2;

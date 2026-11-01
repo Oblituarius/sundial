@@ -43,6 +43,9 @@ struct Assembly<'a> {
     /// The current body's channel bank names in ordinal order, which its materials' object
     /// inputs index.
     object_channels: Vec<u32>,
+    /// Converted material symbols whose source vertex offset is constant, with its object-space
+    /// scale. The geometry stores those draws' vertices already offset.
+    vertex_bakes: BTreeMap<String, [f32; 3]>,
     palette: u32,
     /// Source equipment index to native index. Present only when runtime palettes differ.
     bone_map: Option<Vec<u16>>,
@@ -86,6 +89,7 @@ impl<'a> Assembly<'a> {
             evidence: vec![rig],
             approximations: BTreeSet::new(),
             object_channels: Vec::new(),
+            vertex_bakes: BTreeMap::new(),
             palette,
             bone_map,
             weapon: weapon.is_some(),

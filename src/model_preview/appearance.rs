@@ -464,6 +464,16 @@ fn load_detail(manager: &PackageManager, tag: u32, model: &mut Model) -> Option<
     }
 }
 
+/// The assignment the preview draws from a masculine/feminine pair of singles: the masculine
+/// one unless it is empty.
+fn single_body([masculine, feminine]: [u32; 2]) -> u32 {
+    if [0, u32::MAX, 0x811C_9DC5].contains(&masculine) {
+        feminine
+    } else {
+        masculine
+    }
+}
+
 fn assignment_hashes(table: &[u8], index: u16) -> Result<BTreeSet<u32>, String> {
     let (count, rows) = array(table, 8, 0x8080_5DFB, 0x20, 65536)?;
     if usize::from(index) >= count {
@@ -472,8 +482,10 @@ fn assignment_hashes(table: &[u8], index: u16) -> Result<BTreeSet<u32>, String> 
     let row = rows + usize::from(index) * 0x20;
     let mut hashes = BTreeSet::new();
     if u64_at(table, row + 0x10)? == 0 {
-        hashes.insert(u32_at(table, row + 8)?);
-        hashes.insert(u32_at(table, row + 12)?);
+        // The two singles are the masculine (+8) and feminine (+12) bodies of one piece, not
+        // parts drawn together (Charm `S808055D4`). Drawing both overlaid them, and every
+        // place their shapes differ showed twice. Show the masculine body when it exists.
+        hashes.insert(single_body([u32_at(table, row + 8)?, u32_at(table, row + 12)?]));
     } else {
         let (count, rows) = array(table, row + 0x10, 0x8080_5DFE, 8, 4096)?;
         for index in 0..count {

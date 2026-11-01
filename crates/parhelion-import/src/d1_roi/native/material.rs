@@ -59,13 +59,20 @@ fn vectors(data: &Payload, field: usize) -> Result<Vec<u8>> {
 /// game on view of a weapon borrowing `815B37F1` and `80EF8E3D`, whose cubemap is
 /// `80C1B780`. No gear technique for stages 7 and 9 on layout 123 qualifies, so those two
 /// come from the globals package, drawn by 15 rigid models each.
-const BORROWED_TECHNIQUES: [(usize, u16, u32); 30] = [
+///
+/// Every vertex program here reads a bone's three rows at `cb11[8 + 3 * bone]`, which is how
+/// the imported item's renderer packs them. Some stock vertex programs instead read four rows
+/// at `cb11[8 + 4 * bone]` (`80C0CEC3`, `80BFDF96`, `815B8609`): those draw correctly only
+/// on bone 0, and Twilight Garrison's pistons, rigid on bone 11, never appeared in game while
+/// stage 0 on layout 143 borrowed `80BDFD59` (`80C0CEC3`). The table takes the next most drawn
+/// three-row technique instead (`80C1CB27`, `80C1CB26`, `80C1CB24`). Layout 143 has none at
+/// stages 0 and 10, so its draws use layout 139's ([`Layouts::feeds`]).
+const BORROWED_TECHNIQUES: [(usize, u16, u32); 28] = [
     (0, 30, 0x80EFAC1B),
     (0, 123, 0x80FC7DF6),
     (0, 138, 0x80C1D687),
     (0, 139, 0x80EF4DC0),
-    (0, 143, 0x80BDFD59),
-    (1, 30, 0x80C1901B),
+    (1, 30, 0x80C1CB27),
     (1, 123, 0x815B3521),
     (1, 138, 0x80C1CAFF),
     (1, 139, 0x80C1CB18),
@@ -81,10 +88,9 @@ const BORROWED_TECHNIQUES: [(usize, u16, u32); 30] = [
     (8, 139, 0x8161F38F),
     (9, 123, 0x80FDAE8C),
     (9, 139, 0x80C1AB2D),
-    (10, 30, 0x80BF8671),
+    (10, 30, 0x80C1CB26),
     (10, 138, 0x80C1CAFE),
-    (10, 139, 0x80BF8667),
-    (10, 143, 0x80BDFD5B),
+    (10, 139, 0x80C1CB24),
     (12, 30, 0x80EFAD53),
     (12, 138, 0x80EFAD50),
     (12, 139, 0x80EFB192),
@@ -151,6 +157,17 @@ fn zero_gear_extern(stock: &Payload) -> Result<Vec<u8>> {
 /// channel BC5, whose third channel reads zero, which this bias would turn into 0.4 occlusion.
 /// The stored bias is `0x3ECCCCCC`, one unit below the nearest float to 0.4.
 const GEAR_NORMAL_UNPACK: [u32; 4] = [0x3FFF_0000, 0xBF80_0000, 0x3ECC_CCCC, 0];
+
+/// Object channels a source vertex offset reads that no Shadowkeep producer feeds to a
+/// converted armor part, and the value each loads instead. Twilight Garrison's offset scale is
+/// `(0.11 * 270E8F60 + 0.12 * (1 - 270E8F60)) * saturate(69EA00AA)`. `69EA00AA` is a state
+/// selector (see `activation`), and in game it read zero, so the pistons stayed at their stored,
+/// retracted pose while their unmoved ring glows (`80A7CD30`) sat 0.05 to 0.06 past the stored
+/// tops. Selector one extends each piston 0.064 to 0.080 along its axis, just past its ring, as
+/// D1 shows it. `270E8F60` keeps the zero an absent channel reads. With both fixed the scale
+/// is constant and is baked into the vertices: the first build carried it as a vertex-stage
+/// expression instead, and in game the pistons still drew at their initial zero scale.
+const FIXED_VERTEX_CHANNELS: [(u32, f32); 2] = [(0x69EA_00AA, 1.0), (0x270E_8F60, 0.0)];
 
 fn put_lanes(rows: &mut [u8], row: usize, lanes: &[(usize, f32)]) -> Result<()> {
     for (lane, value) in lanes {
@@ -581,6 +598,150 @@ impl Assembly<'_> {
         ))
     }
 
+    /// Carry a source vertex offset. Twilight Garrison's D1 vertex program `80A0770A` adds
+    /// `(COLOR + cb[0]) * cb[1]` to the object-space position, with cb[0] a fixed bias and
+    /// cb[1] written by its expression from object channels (`FIXED_VERTEX_CHANNELS`). A
+    /// constant scale is recorded in `vertex_bakes` for the geometry to apply, and the borrowed
+    /// program draws the stored positions. Otherwise a borrowed vertex program with a colour
+    /// input, such as shadow `815B91F9` or depth `80FDBC7C`, gets the offset added
+    /// (`dxbc::add_vertex_offset`), its buffer written by the translated expression. Stock
+    /// `80C0CEC3` has the same offset built in but reads four bone rows (see
+    /// `BORROWED_TECHNIQUES`), so it is not borrowed. Returns the stage's evidence.
+    fn vertex_offset(
+        &mut self,
+        tag: u32,
+        stock: &Payload,
+        out: &mut Vec<u8>,
+        patches: &mut Vec<(usize, String)>,
+        symbol: &str,
+    ) -> Result<Option<Value>> {
+        const BIAS: [f32; 4] = [-0.5, -0.5, -0.5, 1.0];
+        let (from, to) = (0x28, 0x48);
+        let source = self.source.read(tag)?;
+        let code = source
+            .array(from + 0x28, 1, Some(0x80800009))?
+            .into_iter()
+            .map(|at| source.u8(at))
+            .collect::<Result<Vec<_>>>()?;
+        if code.is_empty() {
+            return Ok(None);
+        }
+        let values = vectors(&source, from + 0x58)?;
+        let bias = BIAS.map(f32::to_le_bytes).concat();
+        if !(matches!(source.u32(from + 0x84)?, 0 | u32::MAX)
+            && source.array(from + 0x10, 8, Some(0x80801B28))?.is_empty()
+            && source.array(from + 0x48, 16, Some(0x80801ACC))?.is_empty()
+            && values.len() == 32
+            && values[..16] == *bias)
+        {
+            self.approximations.insert(format!(
+                "PS4 source vertex expressions other than the stock vertex offset are not translated (material {tag:08X})"
+            ));
+            return Ok(None);
+        }
+        let shader = stock.u32(to)?;
+        let objects = source.u32(from + 0x78)? as usize;
+        ensure!(
+            objects <= 256,
+            "Source object input count exceeds native indices"
+        );
+        let mut program = expression::translate(
+            &code,
+            vectors(&source, from + 0x38)?,
+            &expression::Inputs {
+                globals: &self.globals,
+                dye: None,
+                empty_palette: true,
+                secondary: false,
+                plates: &[String::new(), String::new(), String::new()],
+                detail: &[String::new(), String::new()],
+                objects,
+                object_channels: &self.object_channels,
+                fixed_objects: &FIXED_VERTEX_CHANNELS,
+                outputs: 2,
+                samplers: 0,
+                stage: 2,
+                reticle: false,
+                light: false,
+            },
+        )?;
+        program.initialize(&values)?;
+        ensure!(
+            program.textures.is_empty(),
+            "Source vertex expression binds textures"
+        );
+        // With every object input fixed the scale is a constant. The geometry then stores the
+        // offset vertices (`geometry::bake_vertex_offsets`) and every pass draws them with a
+        // zero runtime scale, so the result needs no expression to run in game.
+        if let Some(scale) = program
+            .constant_outputs(&values)
+            .and_then(|outputs| outputs.get(1).copied())
+        {
+            self.vertex_bakes
+                .insert(symbol.to_owned(), [scale[0], scale[1], scale[2]]);
+            self.approximations.insert(
+                "Constant source vertex offsets are stored in the converted vertex positions"
+                    .to_owned(),
+            );
+            // The borrowed program, which has no offset, draws the stored positions.
+            return Ok(Some(
+                json!({"stage":"vertex","shader":shader,"baked_scale":scale,"offset_added":false}),
+            ));
+        }
+        let bytecode = self
+            .native
+            .tag(self.native.reference(shader)?, None)?
+            .0
+            .clone();
+        let (buffers, _) = crate::tiger::shader::dxbc::declarations(&bytecode)?;
+        ensure!(
+            !buffers.contains(&0),
+            "Borrowed vertex program {shader:08X} has its own constant buffer"
+        );
+        let Some(colour) = crate::tiger::shader::dxbc::signature(&bytecode, b"ISGN")?
+            .into_iter()
+            .find(|(semantic, index, ..)| semantic == "COLOR" && *index == 0)
+            .map(|input| input.2)
+        else {
+            self.approximations.insert(format!(
+                "PS4 source vertex offsets driven at runtime are not drawn by borrowed vertex programs without a colour input (material {tag:08X})"
+            ));
+            return Ok(None);
+        };
+        let code = crate::tiger::shader::dxbc::add_vertex_offset(&bytecode, colour, 0)?;
+        let template = Template::read(&mut self.native, shader)?;
+        let name = format!("{symbol}-vertex");
+        let assets = Program::new(Stage::Vertex, code)?.assets(&name, &template)?;
+        let data = format!("{name}-bytecode");
+        self.node(
+            &data,
+            assets.bytecode_template,
+            &assets.bytecode,
+            Some(&name),
+            &[],
+        )?;
+        self.node(
+            &name,
+            assets.header_template,
+            &assets.header,
+            Some(&data),
+            &[],
+        )?;
+        put(out, to, &u32::MAX.to_le_bytes())?;
+        patches.push((to, name));
+        array(out, to + 0x20, 0x80800009, &program.code, 1)?;
+        array(out, to + 0x30, 0x80800090, &program.constants, 16)?;
+        array(out, to + 0x50, 0x80800090, &values, 16)?;
+        put(out, to + 0x70, &(objects as u32).to_le_bytes())?;
+        out[to + 0x74] = 0x10;
+        put(out, to + 0x80, &0u32.to_le_bytes())?;
+        put(out, to + 0x84, &u32::MAX.to_le_bytes())?;
+        Ok(Some(
+            json!({"stage":"vertex","shader":shader,"offset_added":true,"object_inputs":objects,
+            "defaulted_source_globals":program.defaulted_globals}),
+        ))
+    }
+
     /// Copy the stock technique that draws this stage with the same vertex elements, and bind
     /// the gear resources its programs read to the converted plates and the draw's dye.
     fn borrowed_technique(
@@ -591,10 +752,14 @@ impl Assembly<'_> {
         equipment: &Equipment,
     ) -> Result<String> {
         let (pass, layout) = (draw.stage, draw.layout);
-        let technique = BORROWED_TECHNIQUES
-            .iter()
-            .find(|(stage, stock, _)| *stage == pass && self.layouts.same_elements(layout, *stock))
-            .map(|(.., technique)| *technique)
+        let borrowed = |fits: &dyn Fn(u16) -> bool| {
+            BORROWED_TECHNIQUES
+                .iter()
+                .find(|(stage, stock, _)| *stage == pass && fits(*stock))
+                .map(|(.., technique)| *technique)
+        };
+        let technique = borrowed(&|stock| self.layouts.same_elements(layout, stock))
+            .or_else(|| borrowed(&|stock| self.layouts.feeds(layout, stock)))
             .with_context(|| {
                 format!(
                     "No stock technique draws stage {pass} with the elements of layout {layout}"
@@ -624,6 +789,7 @@ impl Assembly<'_> {
                 !draw.dye.is_multiple_of(2),
             )?);
         }
+        stages.extend(self.vertex_offset(tag, &stock, &mut out, &mut patches, symbol)?);
         size(&mut out)?;
         self.approximations.insert(
             "PS4 source shaders are GCN and are not translated: each draw borrows a stock Shadowkeep gear technique for its stage and vertex layout, bound to the converted plates, the draw's dye and a gearstack rewritten in the stock convention without occlusion or emission".to_owned(),
@@ -754,6 +920,7 @@ impl Assembly<'_> {
                     detail: &detail,
                     objects,
                     object_channels: &self.object_channels,
+                    fixed_objects: &[],
                     outputs: values.len() / 16,
                     samplers: samplers.len(),
                     stage: packed,

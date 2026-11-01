@@ -221,13 +221,22 @@ fn scene(
         .as_array()
         .ok_or("Imported appearance selectors missing")?;
     let selected: Vec<u32> = if slots.is_empty() {
-        row["singles"]
+        let singles = row["singles"]
             .as_array()
             .filter(|values| values.len() == 2)
             .ok_or("Imported appearance assignments missing")?
             .iter()
             .map(word)
-            .collect::<Result<_, _>>()?
+            .collect::<Result<Vec<_>, _>>()?;
+        // The singles are one piece's masculine and feminine bodies (Charm `S808055D4`), not
+        // parts drawn together. Overlaid, every difference between them showed twice, such as
+        // Twilight Garrison's pistons. Show the masculine body unless it is empty.
+        let masculine = singles[0];
+        vec![if [0, u32::MAX, 0x811c9dc5].contains(&masculine) {
+            singles[1]
+        } else {
+            masculine
+        }]
     } else {
         let mut selected = Vec::new();
         for slot in slots {

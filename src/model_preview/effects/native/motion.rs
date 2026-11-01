@@ -5,9 +5,17 @@ use program::{Instruction, Operand, Program as Code};
 
 pub(crate) struct Motion {
     pub vertices: std::ops::Range<usize>,
-    code: Code,
+    kind: Kind,
     constants: Vec<[f32; 4]>,
     expression: Option<Program>,
+}
+
+enum Kind {
+    /// The geometry slice of a stored deformation.
+    Slice(Code),
+    /// The stock rigid gear offset `position += (COLOR + cb0[0]) * cb0[1]`, in object space
+    /// before skinning, as stock `80C0CEC3` applies it.
+    Offset,
 }
 
 impl Motion {
@@ -25,13 +33,16 @@ impl Motion {
     /// Emit the accepted geometry slice with the same input contract as `vertex::evaluate`.
     pub(in crate::model_preview) fn gpu_source(&self, name: &str) -> String {
         use std::fmt::Write;
-        let mut source = self.code.glsl(&format!("{name}Code"));
+        let Kind::Slice(code) = &self.kind else {
+            return format!("void {name}(inout vec3 p,inout vec3 n,inout vec4 t){{p+=(nColor.xyz+nConstant(0,0).xyz)*nConstant(0,1).xyz;}}\n");
+        };
+        let mut source = code.glsl(&format!("{name}Code"));
         // Slicing deliberately omits the original return instruction. Capture the registers
         // on fallthrough as well, as the CPU evaluator does for this straight-line program.
         source.truncate(source.len() - 2);
         source.push_str("for(int i=0;i<16;i++)result[i]=uintBitsToFloat(o[i]);}\n");
         writeln!(source, "void {name}(inout vec3 p,inout vec3 n,inout vec4 t){{vec4 v[16],o[16];for(int i=0;i<16;i++)v[i]=vec4(0.0);").unwrap();
-        for semantic in &self.code.inputs {
+        for semantic in &code.inputs {
             let value = match semantic.name.as_str() {
                 "POSITION" => "vec4(p,0.0)",
                 "NORMAL" => "vec4(n,0.0)",
@@ -57,6 +68,15 @@ impl Motion {
         }) {
             return;
         }
+        let Kind::Slice(code) = &self.kind else {
+            for index in self.vertices.clone() {
+                let color = model.colors.get(index).copied().unwrap_or([1.0; 4]);
+                for lane in 0..3 {
+                    pose.positions[index][lane] += (color[lane] + frame[0][lane]) * frame[1][lane];
+                }
+            }
+            return;
+        };
         for index in self.vertices.clone() {
             let input = Input {
                 vertex_id: model.vertex_ids.get(index).copied().unwrap_or(index as u32),
@@ -67,7 +87,7 @@ impl Motion {
                 uv: model.uvs[index],
                 detail_uv: model.detail_uvs.get(index).copied().unwrap_or([0.0; 2]),
             };
-            let Some(values) = vertex::evaluate(&self.code, &input, &frame) else {
+            let Some(values) = vertex::evaluate(code, &input, &frame) else {
                 continue;
             };
             if values[..3].iter().flatten().any(|v| !v.is_finite()) {
@@ -305,6 +325,54 @@ fn read_source(
     }
 }
 
+/// Whether the program offsets its object-space position by `(COLOR + cb0[0]) * cb0[1]`:
+/// `add rA.xyz, COLOR.xyz, cb0[0].xyz` then `mad rB.xyz, rA.xyz, cb0[1].xyz, rP.xyz`. Stock
+/// gear program `80C0CEC3` does this, and the importer adds it to shadow and depth programs.
+fn colour_offset(code: &Code) -> bool {
+    let Some(colour) = code
+        .inputs
+        .iter()
+        .find(|s| s.name == "COLOR" && s.index == 0)
+        .map(|s| s.register as u32)
+    else {
+        return false;
+    };
+    let constant = |s: &Operand, row| {
+        s.kind == 8
+            && s.indices.len() == 2
+            && s.indices[0].base == 0
+            && s.indices[1].base == row
+            && s.indices.iter().all(|i| i.relative.is_none())
+            && s.lanes[..3] == [0, 1, 2]
+            && s.modifier == 0
+    };
+    code.instructions.iter().enumerate().any(|(at, add)| {
+        let [sum, input, bias] = &add.operands[..] else {
+            return false;
+        };
+        add.code == 0
+            && !add.saturate
+            && sum.kind == 0
+            && sum.mask & 7 == 7
+            && input.kind == 1
+            && input.indices[0].base == colour
+            && input.lanes[..3] == [0, 1, 2]
+            && input.modifier == 0
+            && constant(bias, 0)
+            && code.instructions[at + 1..].iter().any(|mad| {
+                let [_, scaled, scale, _] = &mad.operands[..] else {
+                    return false;
+                };
+                mad.code == 50
+                    && !mad.saturate
+                    && same_register(scaled, sum)
+                    && scaled.lanes[..3] == [0, 1, 2]
+                    && scaled.modifier == 0
+                    && constant(scale, 1)
+            })
+    })
+}
+
 fn slice(mut code: Code) -> Option<Code> {
     if !stored(&code) {
         return None;
@@ -361,11 +429,19 @@ pub(in crate::model_preview) fn load(
     let Ok(code) = Code::read_stored(&shader) else {
         return Ok(None);
     };
-    let Some(code) = slice(code) else {
-        return Ok(None);
-    };
     let constants = super::super::read::stage_constants(manager, &bytes, 0x48)?;
-    check_constants(&code, &constants)?;
+    let kind = if colour_offset(&code) {
+        if constants.len() < 2 {
+            return Err("The vertex offset has no bias and scale constants".into());
+        }
+        Kind::Offset
+    } else {
+        let Some(code) = slice(code) else {
+            return Ok(None);
+        };
+        check_constants(&code, &constants)?;
+        Kind::Slice(code)
+    };
     let globals = crate::dyes::material::global_channels(manager);
     let expression = Program::material(&bytes, 0x48, &globals, objects, 0, constants.len())?;
     if let Some(program) = &expression {
@@ -373,7 +449,7 @@ pub(in crate::model_preview) fn load(
     }
     Ok(Some(Motion {
         vertices: 0..0,
-        code,
+        kind,
         constants,
         expression,
     }))

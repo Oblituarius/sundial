@@ -141,20 +141,58 @@ impl Layouts {
             .context("Source stream declaration has no byte-compatible native layout")
     }
 
+    /// The stream, byte offset and native format of a native layout's element.
+    pub fn element(&self, layout: u16, semantic: u8, index: u8) -> Result<Option<(usize, usize, u8)>> {
+        let streams = self
+            .native
+            .get(&layout)
+            .context("Missing native stream declaration")?;
+        for (stream, elements) in streams.iter().enumerate() {
+            let mut offset = 0;
+            for element in elements {
+                if element.semantic == semantic && element.index == index {
+                    return Ok(Some((stream, offset, element.format)));
+                }
+                offset += match element.format {
+                    1 | 5 | 6 | 7 | 10 | 12 | 14 | 15 | 16 | 17 | 18 | 21 | 31 | 32 => 4,
+                    2 | 8 | 9 | 11 | 13 | 19 | 22 | 33 => 8,
+                    3 => 12,
+                    4 | 20 | 23 => 16,
+                    24 => 2,
+                    25 => 1,
+                    other => anyhow::bail!("Unsupported native vertex element format {other}"),
+                };
+            }
+        }
+        Ok(None)
+    }
+
+    fn elements(&self, layout: u16) -> Option<Vec<(u8, u8, u8)>> {
+        self.native.get(&layout).map(|streams| {
+            let mut all = streams
+                .iter()
+                .flatten()
+                .map(|e| (e.semantic, e.index, e.format))
+                .collect::<Vec<_>>();
+            all.sort_unstable();
+            all
+        })
+    }
+
     /// Whether two native layouts declare the same elements, whatever their stream split.
     /// A vertex program binds its inputs by semantic, so either layout feeds it.
     pub fn same_elements(&self, a: u16, b: u16) -> bool {
-        let elements = |layout| {
-            self.native.get(&layout).map(|streams: &Streams| {
-                let mut all = streams
-                    .iter()
-                    .flatten()
-                    .map(|e| (e.semantic, e.index, e.format))
-                    .collect::<Vec<_>>();
-                all.sort_unstable();
-                all
-            })
+        self.elements(a)
+            .is_some_and(|a| Some(a) == self.elements(b))
+    }
+
+    /// Whether `layout` declares `stock`'s elements plus only vertex colour (semantic 8), so
+    /// a vertex program written for `stock`, which reads no colour, binds every input from it.
+    pub fn feeds(&self, layout: u16, stock: u16) -> bool {
+        let (Some(mut layout), Some(stock)) = (self.elements(layout), self.elements(stock)) else {
+            return false;
         };
-        elements(a).is_some_and(|a| Some(a) == elements(b))
+        layout.retain(|&(semantic, ..)| semantic != 8);
+        layout == stock
     }
 }

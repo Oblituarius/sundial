@@ -558,6 +558,9 @@ const LEGACY_FRAME_ICON: &str = "0x80B47ED5";
 const PERK_ITEM_KIND: u64 = 15;
 /// Shader plugs.
 pub(super) const SHADER_ITEM_KIND: u64 = 14;
+/// Shadowkeep's Default Shader plug (4248210736). A donor's shader socket can default to one of
+/// its own shader presets instead, such as 4F98F7A7 on Twilight Garrison's donor.
+const DEFAULT_SHADER: u64 = 0xFD36_8D30;
 /// Year-one armor trait mods: Plasteel Reinforcement and Restorative Mod. They are Shadowkeep's
 /// own choice, not a Rise of Iron talent, so an armor import disables the socket.
 const ARMOR_TRAIT_CATEGORY: u64 = 0xC57B_725E;
@@ -967,15 +970,16 @@ pub(super) fn translate(
     let mut columns = sockets.iter().map(|_| Value::Null).collect::<Vec<_>>();
     // Rise of Iron items offer only the Default Shader, not the donor's own shader list.
     for (index, socket) in sockets.iter().enumerate() {
-        let default = socket["choices"].as_array().and_then(|choices| {
-            choices.iter().find(|c| {
+        let shader = socket["choices"].as_array().is_some_and(|choices| {
+            choices.iter().any(|c| {
                 c["default"] == true && c["item_kind"].as_u64() == Some(SHADER_ITEM_KIND)
             })
         });
-        if let Some(default) = default {
-            let hash = default["hash"].as_u64().context("Native shader hash")?;
-            columns[index] =
-                json!({"choices":[format!("0x{hash:08X}")],"socket_type":socket["socket_type"]});
+        if shader {
+            columns[index] = json!({
+                "choices":[format!("0x{DEFAULT_SHADER:08X}")],
+                "socket_type":socket["socket_type"]
+            });
         }
     }
     // An armor intrinsic keeps its stat package unless the signature talent takes it.

@@ -603,6 +603,111 @@ pub(crate) fn fold_constant_buffers(
     rebuild(container, &output, None)
 }
 
+/// Offset the object-space position by a vertex input, as stock gear vertex program `80C0CEC3`
+/// does: after `mad rN.xyz, v0.xyzx, cb11[5].wwww, cb11[5].xyzx` scales the position, add
+/// `(v[input].xyz + cb[slot][0].xyz) * cb[slot][1].xyz`. Declares the input, the two-vector
+/// buffer and one more temporary; the program must use neither the input nor the buffer.
+pub(crate) fn add_vertex_offset(container: &[u8], input: u32, slot: u32) -> Result<Vec<u8>> {
+    const MAD: u32 = 0x32;
+    const DCL_TEMPS: u32 = 0x68;
+    let range = match chunk(container, b"SHEX")? {
+        Some(range) => range,
+        None => chunk(container, b"SHDR")?.context("shader has no program chunk")?,
+    };
+    let tokens: Vec<u32> = container[range]
+        .chunks_exact(4)
+        .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+        .collect();
+    let instructions = walk(&tokens)?;
+    let index = |operand: &Operand, dimension: usize| {
+        operand
+            .indices
+            .get(dimension)
+            .copied()
+            .flatten()
+            .map(|at| tokens[at])
+    };
+    let mut position = None;
+    let mut temps = None;
+    let mut buffer_template = None;
+    let mut input_template = None;
+    for (at, instruction) in instructions.iter().enumerate() {
+        let operands = &instruction.operands;
+        match instruction.opcode {
+            DCL_CONSTANT_BUFFER => {
+                let operand = operands.first().context("constant buffer declaration")?;
+                ensure!(
+                    index(operand, 0) != Some(slot),
+                    "vertex offset buffer {slot} is already declared"
+                );
+                // An immediately indexed declaration, whose access bit is clear.
+                if tokens[instruction.start] & 0x800 == 0 {
+                    buffer_template = Some(instruction);
+                }
+            }
+            DCL_INPUT => {
+                let operand = operands.first().context("input declaration")?;
+                ensure!(
+                    index(operand, 0) != Some(input),
+                    "vertex offset input {input} is already declared"
+                );
+                input_template = Some(at);
+            }
+            DCL_TEMPS => temps = Some(instruction),
+            MAD if operands.len() == 4
+                && operands[0].kind == 0
+                && (tokens[operands[0].token_at] >> 4) & 0xF == 0b0111
+                && operands[1].kind == INPUT
+                && index(&operands[1], 0) == Some(0)
+                && operands[2..].iter().all(|o| {
+                    o.kind == CONSTANT_BUFFER && index(o, 0) == Some(11) && index(o, 1) == Some(5)
+                }) =>
+            {
+                ensure!(position.is_none(), "vertex position is scaled twice");
+                position = Some((at, index(&operands[0], 0).context("position register")?));
+            }
+            _ => {}
+        }
+    }
+    let (position, register) = position.context("vertex program does not scale its position")?;
+    let temps = temps.context("vertex program declares no temporaries")?;
+    let buffer = buffer_template.context("vertex program has no immediate buffer declaration")?;
+    let input_at = input_template.context("vertex program declares no inputs")?;
+    let input_operand = &instructions[input_at].operands[0];
+    let temporary = tokens[temps.start + 1];
+    let (xyz, xyzx) = (0x0010_0072, 0x0010_0246);
+    let mut output = tokens[..2].to_vec();
+    for (at, instruction) in instructions.iter().enumerate() {
+        if std::ptr::eq(instruction, buffer) {
+            let mut declaration = tokens[instruction.start..instruction.end].to_vec();
+            let operand = &instruction.operands[0];
+            declaration[operand.indices[0].context("buffer slot")? - instruction.start] = slot;
+            declaration[operand.indices[1].context("buffer extent")? - instruction.start] = 2;
+            output.extend(declaration);
+        }
+        if instruction.opcode == DCL_TEMPS {
+            output.extend([tokens[instruction.start], temporary + 1]);
+        } else {
+            output.extend_from_slice(&tokens[instruction.start..instruction.end]);
+        }
+        if at == input_at {
+            // The template's operand with an xyz mask and the offset input's register.
+            let token = (tokens[input_operand.token_at] & !0xFC) | 0x70;
+            output.extend([tokens[instruction.start], token, input]);
+        }
+        if at == position {
+            let buffer = |vector: u32| [0x0020_8246, slot, vector];
+            output.extend([0x0800_0000, xyz, temporary, 0x0010_1246, input]);
+            output.extend(buffer(0));
+            output.extend([0x0A00_0032, xyz, register, xyzx, temporary]);
+            output.extend(buffer(1));
+            output.extend([xyzx, register]);
+        }
+    }
+    output[1] = u32::try_from(output.len())?;
+    rebuild(container, &output, None)
+}
+
 /// Input or output signature elements: (semantic, index, register, mask). `OSG5` elements
 /// carry a leading stream index.
 pub(crate) fn signature(container: &[u8], name: &[u8; 4]) -> Result<Vec<(String, u32, u32, u8)>> {

@@ -4,12 +4,14 @@ use super::material::Equipment;
 use super::*;
 
 /// D1 gearstack BC1 blocks rewritten in the stock gear convention as BC3. D1 gear pixel
-/// programs (such as `80A0881C`) read only red, a dye and detail mask, and green, the
-/// smoothness. Stock gear program `81532DEA` reads ambient occlusion from red, smoothness
-/// from green, nothing from blue, and dyes where alpha is at least 40/255 (smaller alphas
-/// are emissive codes). D1 has no per-texel occlusion or emission, so red is one, alpha is
-/// a dye selector at the D1 mask's midpoint, and the green palette is re-quantized. BC3
-/// colour blocks always use four colours.
+/// programs (such as `80A0881C`) read red, a dye and detail mask, and green, the
+/// smoothness; D1 decal programs (such as `80A39D51`) read red and blue, the decal
+/// coverage. Stock gear program `81532DEA` reads ambient occlusion from red, smoothness
+/// from green and dyes where alpha is at least 40/255 (smaller alphas are emissive codes).
+/// Stock decal program `80C1CB29` reads its coverage as blue times 255/32. D1 has no
+/// per-texel occlusion or emission, so red is one, alpha is a dye selector at the D1
+/// mask's midpoint, and blue is scaled down by 255/32. BC3 colour blocks always use four
+/// colours, so a three-colour source block is refitted.
 fn native_gear_stack(blocks: &[u8]) -> Result<Vec<u8>> {
     ensure!(
         blocks.len().is_multiple_of(8),
@@ -25,42 +27,62 @@ fn native_gear_stack(blocks: &[u8]) -> Result<Vec<u8>> {
             u16::from_le_bytes([block[0], block[1]]),
             u16::from_le_bytes([block[2], block[3]]),
         ];
-        let [r0, r1] = ends.map(|c| expand(c >> 11, 5));
-        let [g0, g1] = ends.map(|c| expand((c >> 5) & 63, 6));
-        let (red, green) = if ends[0] > ends[1] {
-            (
-                [r0, r1, (2 * r0 + r1) / 3, (r0 + 2 * r1) / 3],
-                [g0, g1, (2 * g0 + g1) / 3, (g0 + 2 * g1) / 3],
-            )
-        } else {
-            ([r0, r1, (r0 + r1) / 2, 0], [g0, g1, (g0 + g1) / 2, 0])
+        let four = ends[0] > ends[1];
+        let channel = |shift: u16, bits: u32| {
+            let [e0, e1] = ends.map(|c| expand((c >> shift) & ((1 << bits) - 1), bits));
+            if four {
+                [e0, e1, (2 * e0 + e1) / 3, (e0 + 2 * e1) / 3]
+            } else {
+                [e0, e1, (e0 + e1) / 2, 0]
+            }
         };
+        let (red, green, blue) = (channel(11, 5), channel(5, 6), channel(0, 5));
         let indices = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
-        let texels = (0..16)
-            .map(|i| ((indices >> (2 * i)) & 3) as usize)
-            .map(|index| (green[index], red[index] >= 128))
-            .collect::<Vec<_>>();
+        let texel = |i: u32| ((indices >> (2 * i)) & 3) as usize;
         let mut alpha = 0u64;
-        for (i, (_, dyed)) in texels.iter().enumerate() {
-            alpha |= u64::from(!dyed) << (3 * i);
+        for i in 0..16 {
+            alpha |= u64::from(red[texel(i)] < 128) << (3 * i);
         }
         out.extend([255, 0]);
         out.extend(&alpha.to_le_bytes()[..6]);
-        let high = texels.iter().map(|t| t.0).max().unwrap_or(0);
-        let low = texels.iter().map(|t| t.0).min().unwrap_or(0);
-        let quantize = |value: u32| ((value * 63 + 127) / 255) as u16;
-        let (e0, e1) = (quantize(high), quantize(low));
-        let (q0, q1) = (expand(e0, 6), expand(e1, 6));
-        let palette = [q0, q1, (2 * q0 + q1) / 3, (q0 + 2 * q1) / 3];
+        if four {
+            // The same endpoints and indices interpolate green and the scaled blue exactly.
+            for end in ends {
+                let coverage = (u32::from(end & 31) * 32 + 127) / 255;
+                out.extend((0xF800 | (end & 0x07E0) | coverage as u16).to_le_bytes());
+            }
+            out.extend(indices.to_le_bytes());
+            continue;
+        }
+        let texels = (0..16)
+            .map(|i| [green[texel(i)], blue[texel(i)] * 32 / 255])
+            .collect::<Vec<_>>();
+        let distance =
+            |a: [u32; 2], b: [u32; 2]| a[0].abs_diff(b[0]).pow(2) + a[1].abs_diff(b[1]).pow(2);
+        let (mut far, mut span) = ((0, 0), 0);
+        for a in 0..16 {
+            for b in a + 1..16 {
+                if distance(texels[a], texels[b]) > span {
+                    (far, span) = ((a, b), distance(texels[a], texels[b]));
+                }
+            }
+        }
+        let quantize = |[g, b]: [u32; 2]| {
+            0xF800 | (((g * 63 + 127) / 255) as u16) << 5 | ((b * 31 + 127) / 255) as u16
+        };
+        let (e0, e1) = (quantize(texels[far.0]), quantize(texels[far.1]));
+        let [q0, q1] = [e0, e1].map(|e| [expand((e >> 5) & 63, 6), expand(e & 31, 5)]);
+        let mix = |a: u32, b: u32| [0, 1].map(|c| (a * q0[c] + b * q1[c]) / 3);
+        let palette = [q0, q1, mix(2, 1), mix(1, 2)];
         let mut selected = 0u32;
-        for (i, (value, _)) in texels.iter().enumerate() {
+        for (i, value) in texels.iter().enumerate() {
             let nearest = (0..4)
-                .min_by_key(|&index| palette[index].abs_diff(*value))
+                .min_by_key(|&index| distance(palette[index], *value))
                 .unwrap_or(0);
             selected |= (nearest as u32) << (2 * i);
         }
-        out.extend((0xF800 | (e0 << 5)).to_le_bytes());
-        out.extend((0xF800 | (e1 << 5)).to_le_bytes());
+        out.extend(e0.to_le_bytes());
+        out.extend(e1.to_le_bytes());
         out.extend(selected.to_le_bytes());
     }
     Ok(out)
@@ -263,5 +285,35 @@ mod tests {
         assert_eq!(out[..8], [255, 0, 0x08, 0x02, 0, 0, 0, 0]);
         // Full occlusion red, the source greens re-quantized, no blue.
         assert_eq!(out[8..], [0xE0, 0xFF, 0x00, 0xF8, 0xE4, 0, 0, 0]);
+    }
+
+    #[test]
+    fn gear_stack_scales_decal_coverage_into_the_stock_range() {
+        // Full blue against black: full coverage becomes 4/31, which the stock decal
+        // program reads as 33/255 times 255/32, saturated to one.
+        let block = [0x1F, 0, 0, 0, 0xE4, 0, 0, 0];
+        let out = native_gear_stack(&block).unwrap();
+        assert_eq!(out[8..], [0x04, 0xF8, 0x00, 0xF8, 0xE4, 0, 0, 0]);
+    }
+
+    #[test]
+    fn gear_stack_refits_three_colour_blocks() {
+        // Three-colour mode: green (0, 63, 0) and its half, then the black index 3.
+        let block = [0, 0, 0xE0, 0x07, 0xE4, 0, 0, 0];
+        let out = native_gear_stack(&block).unwrap();
+        let (e0, e1) = (
+            u16::from_le_bytes([out[8], out[9]]),
+            u16::from_le_bytes([out[10], out[11]]),
+        );
+        let selected = u32::from_le_bytes([out[12], out[13], out[14], out[15]]);
+        let green = |end: u16| (end >> 5) & 63;
+        let index = |i: u32| (selected >> (2 * i)) & 3;
+        // Texel 1 is full green, texels 0 and 3 black, texel 2 between them.
+        let full = if green(e0) == 63 { 0 } else { 1 };
+        assert_eq!(green([e0, e1][1 - full as usize]), 0);
+        assert_eq!(index(1), full);
+        assert_eq!(index(0), 1 - full);
+        assert_eq!(index(3), 1 - full);
+        assert!(matches!(index(2), 2 | 3));
     }
 }
