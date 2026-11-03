@@ -124,7 +124,12 @@ impl Assembly<'_> {
         })
     }
 
-    fn inputs(&mut self, source: &Payload, component: &mut Component) -> Result<()> {
+    /// The channel names of a model component's material inputs, in input order. A material's
+    /// object input `n` (expression op 0x4A) reads the component's input `n`, which the entity
+    /// connects to the bank channel of that name, not bank ordinal `n`. Twilight Garrison's
+    /// model `80A7CD0F` lists 270E8F60, CD6FA091, 69EA00AA while its bank `80A7CD29` declares
+    /// CD6FA091, 69EA00AA, 270E8F60.
+    fn input_names(&self, source: &Payload) -> Result<Vec<u32>> {
         let si = source.pointer(16)?;
         let sr = source.pointer(24)?;
         let inputs = source.array(si + 0x118, 88, Some(0x8080077D))?;
@@ -137,22 +142,10 @@ impl Assembly<'_> {
             inputs.len() == definitions.len(),
             "Source material input count differs"
         );
-        let old = &component.template;
-        let ni = old.pointer(16)?;
-        let parent = ni + 0x100;
-        let definition = usize::try_from(old.u64(parent + 8)?)? + 0x48;
-        let old_inputs = old.array(ni + 0x120, 96, Some(0x80809788))?;
-        let old_definitions = old.array(definition, 40, Some(0x80809789))?;
-        let ti = *old_inputs
-            .first()
-            .context("Native material input template absent")?;
-        let td = *old_definitions
-            .first()
-            .context("Native material input definition absent")?;
-        let mut names = Vec::new();
         // PS4 definitions are 40 bytes, with the 808003E8 marker as a word at +28 and the
         // name at +32.
         let ps4 = self.source.platform() == 7;
+        let mut names = Vec::new();
         for (input, def) in inputs.into_iter().zip(definitions) {
             let marker = if ps4 {
                 u64::from(source.u32(def + 28)?)
@@ -167,6 +160,23 @@ impl Assembly<'_> {
             );
             names.push(source.u32(def + self.source.field(40, 32))?);
         }
+        Ok(names)
+    }
+
+    fn inputs(&mut self, source: &Payload, component: &mut Component) -> Result<()> {
+        let names = self.input_names(source)?;
+        let old = &component.template;
+        let ni = old.pointer(16)?;
+        let parent = ni + 0x100;
+        let definition = usize::try_from(old.u64(parent + 8)?)? + 0x48;
+        let old_inputs = old.array(ni + 0x120, 96, Some(0x80809788))?;
+        let old_definitions = old.array(definition, 40, Some(0x80809789))?;
+        let ti = *old_inputs
+            .first()
+            .context("Native material input template absent")?;
+        let td = *old_definitions
+            .first()
+            .context("Native material input definition absent")?;
         let input_rows = old.0[ti..ti + 96].repeat(names.len());
         let definition_rows = old.0[td..td + 40].repeat(names.len());
         array(
@@ -230,19 +240,6 @@ impl Assembly<'_> {
         let mut components = Vec::new();
         let mut source_owners = BTreeMap::new();
         let mut bank = None;
-        // Materials index the body's channel bank by ordinal, so its names are read before
-        // any model component converts.
-        self.object_channels.clear();
-        for row in source_entity.array(0x20, 12, Some(0x80800715))? {
-            let source = self.source.read(source_entity.u32(row)?)?;
-            if source.u32(source.pointer(24)? - 4)? == 0x808008F6 {
-                self.object_channels = if self.source.platform() == 7 {
-                    channel::ps4::channel_names(&source, 0x20)?
-                } else {
-                    channel::channel_names(&source)?
-                };
-            }
-        }
         // PS4 banks take their receivers from optic feeds; Xbox One banks connect their
         // incoming channels through `channel_connections`.
         let ps4 = self.source.platform() == 7;
@@ -270,6 +267,8 @@ impl Assembly<'_> {
                     ensure!(!meshes.is_empty(), "Source model has no meshes");
                     ensure!(!cloth || meshes.len() == 1, "Multi-mesh source cloth requires an explicit buffer binding");
                     let equipment = self.equipment(&source, dyes)?;
+                    // Materials read their object inputs through this component's inputs.
+                    self.object_channels = self.input_names(&source)?;
                     // Native character setup has a fixed array of render components.
                     // Keep meshes with the same model transform in one component,
                     // including their separate layouts, buffers and draw stages.

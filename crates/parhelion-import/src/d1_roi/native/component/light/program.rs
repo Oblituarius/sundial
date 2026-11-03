@@ -61,7 +61,6 @@ impl Assembly<'_> {
                 detail: &Default::default(),
                 objects: names.len(),
                 object_channels: &[],
-                fixed_objects: &[],
                 outputs: 8,
                 samplers: 0,
                 stage: 1,

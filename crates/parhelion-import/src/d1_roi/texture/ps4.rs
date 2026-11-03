@@ -57,10 +57,15 @@ impl Descriptor {
     }
 }
 
-/// Linear mip chain (mip 0 first). Tiled storage pads each mip to a power of two when the T#
-/// requests it, then to whole 8x8 micro tiles of texels or blocks. Some textures, such as
-/// plate sources, are stored linear although their T# names a tile mode; the storage size
-/// decides, and `linear_hint` (Charm's rule) breaks a tie when both layouts have one size.
+/// Linear mip chain (mip 0 first), each mip holding its `slices` (six cube faces) in turn,
+/// the mip-major order of both GNM storage (freegnm `gpaComputeSurfaceSizeOffset`: a mip
+/// starts after every slice of the mips before it) and the native writer. Tiled storage pads
+/// each mip to a power of two when the T# requests it, then to whole 8x8 micro tiles of texels
+/// or blocks; with that padding a cube's slice count may also round up to eight (freegnm
+/// `gpaTpInit`), and the storage size decides. Some textures, such as plate sources, are
+/// stored linear although their T# names a tile mode; the storage size decides, and
+/// `linear_hint` (Charm's rule) breaks a tie when both layouts have one size.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn linear_chain(
     raw: &[u8],
     descriptor: &Descriptor,
@@ -68,8 +73,10 @@ pub(super) fn linear_chain(
     width: u16,
     height: u16,
     mips: u8,
+    slices: usize,
     linear_hint: bool,
 ) -> Result<Vec<u8>> {
+    ensure!(matches!(slices, 1 | 6), "Unsupported PS4 slice count {slices}");
     ensure!(mips > 0 && mips <= 16, "Invalid PS4 mip count {mips}");
     let dxgi = DxgiFormat::try_from(format)
         .map_err(|_| anyhow::anyhow!("Unsupported PS4 DXGI format {format}"))?;
@@ -96,8 +103,17 @@ pub(super) fn linear_chain(
             ))
         })
         .collect::<Result<Vec<_>>>()?;
-    let tiled_total = levels.iter().map(|l| l.4).sum::<usize>();
-    let linear_total = levels.iter().map(|l| l.5).sum::<usize>();
+    let tiled_slices = if raw.len() == levels.iter().map(|l| l.4).sum::<usize>() * slices {
+        slices
+    } else if descriptor.pow2pad
+        && raw.len() == levels.iter().map(|l| l.4).sum::<usize>() * slices.next_power_of_two()
+    {
+        slices.next_power_of_two()
+    } else {
+        slices
+    };
+    let tiled_total = levels.iter().map(|l| l.4).sum::<usize>() * tiled_slices;
+    let linear_total = levels.iter().map(|l| l.5).sum::<usize>() * slices;
     let linear = match (raw.len() == tiled_total, raw.len() == linear_total) {
         (true, true) => linear_hint,
         (true, false) => false,
@@ -118,17 +134,23 @@ pub(super) fn linear_chain(
     let mut result = Vec::with_capacity(linear_total);
     let mut offset = 0;
     for (w, h, tiled_w, tiled_h, tiled_bytes, _) in levels {
-        let mut source = raw[offset..offset + tiled_bytes].to_vec();
-        let mut padded = vec![0; tiled_bytes];
-        Ps4::deswizzle(&mut source, &mut padded, (tiled_w, tiled_h, 1), dxgi, false)
-            .map_err(|e| anyhow::anyhow!("PS4 detile failed: {e:?}"))?;
-        let (padded_row, _) = super::surface(format, tiled_w, tiled_h)?;
-        let (row, length) = super::surface(format, w, h)?;
-        for line in 0..length / row {
-            let at = line * padded_row;
-            result.extend_from_slice(&padded[at..at + row]);
+        for slice in 0..tiled_slices {
+            let at = offset + slice * tiled_bytes;
+            if slice >= slices {
+                continue;
+            }
+            let mut source = raw[at..at + tiled_bytes].to_vec();
+            let mut padded = vec![0; tiled_bytes];
+            Ps4::deswizzle(&mut source, &mut padded, (tiled_w, tiled_h, 1), dxgi, false)
+                .map_err(|e| anyhow::anyhow!("PS4 detile failed: {e:?}"))?;
+            let (padded_row, _) = super::surface(format, tiled_w, tiled_h)?;
+            let (row, length) = super::surface(format, w, h)?;
+            for line in 0..length / row {
+                let at = line * padded_row;
+                result.extend_from_slice(&padded[at..at + row]);
+            }
         }
-        offset += tiled_bytes;
+        offset += tiled_bytes * tiled_slices;
     }
     Ok(result)
 }

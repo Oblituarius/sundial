@@ -282,10 +282,8 @@ pub(super) struct Inputs<'a> {
     pub plates: &'a [String; 3],
     pub detail: &'a [String; 2],
     pub objects: usize,
-    /// The body's channel names by ordinal, which object inputs index.
+    /// The model component's input channel names, which object inputs index.
     pub object_channels: &'a [u32],
-    /// Object channels with no Shadowkeep producer, loaded as these fixed values instead.
-    pub fixed_objects: &'a [(u32, f32)],
     pub outputs: usize,
     pub samplers: usize,
     pub stage: u8,
@@ -582,14 +580,6 @@ pub(super) fn translate(code: &[u8], constants: Vec<u8>, inputs: &Inputs<'_>) ->
                     usize::from(args[0]) < inputs.objects,
                     "Source object input exceeds its declared table"
                 );
-                let fixed = inputs
-                    .object_channels
-                    .get(usize::from(args[0]))
-                    .and_then(|name| inputs.fixed_objects.iter().find(|(n, _)| n == name));
-                if let Some(&(_, value)) = fixed {
-                    result.constant(vector([value; 4]))?;
-                    continue;
-                }
                 result.code.extend([0x4D, args[0]]);
                 // The stock weapon bank derives channel 0E36F79F from the Power level
                 // (0.65 times the level, normalised against 500 by the sight-glow curves,

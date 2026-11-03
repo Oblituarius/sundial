@@ -167,6 +167,19 @@ impl Layouts {
         Ok(None)
     }
 
+    /// A native layout's elements, (semantic, index) in stream order: the order its vertex
+    /// buffer descriptors, and so a PS4 fetch shader's inputs, follow.
+    pub fn ordered(&self, layout: u16) -> Result<Vec<(u8, u8)>> {
+        Ok(self
+            .native
+            .get(&layout)
+            .context("Missing native stream declaration")?
+            .iter()
+            .flatten()
+            .map(|e| (e.semantic, e.index))
+            .collect())
+    }
+
     fn elements(&self, layout: u16) -> Option<Vec<(u8, u8, u8)>> {
         self.native.get(&layout).map(|streams| {
             let mut all = streams

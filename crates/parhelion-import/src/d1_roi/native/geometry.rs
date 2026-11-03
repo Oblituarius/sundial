@@ -376,9 +376,15 @@ impl Assembly<'_> {
                         flags & !0x777 == 0,
                         "Source draw flags need a native contract: {flags:04X}"
                     );
+                    // Only a cloth component's display bindings make a draw simulated. Source
+                    // flag 0x10 also marks draws of plain models, such as Twilight Garrison's
+                    // ring glow (80A7CD30) and Zhalo Supercell's arcs (80A76000, 80A76002),
+                    // whose vertex programs skin like their neighbours'. As simulated draws they
+                    // took the rigid-model scope, where the skinned program read no bones, and
+                    // the native cloth-output flag, which drew them at their stored pose.
                     let simulated = simulated_draws
                         .as_ref()
-                        .map_or(flags & 16 != 0, |draws| draws.contains(&index));
+                        .is_some_and(|draws| draws.contains(&index));
                     let material = source.u32(part)?;
                     ensure!(
                         !matches!(material, 0 | u32::MAX) && source.i16(part + 4)? == -1,
@@ -427,12 +433,10 @@ impl Assembly<'_> {
                     // source's inspect screen, so its views 7 and 8 are not the native
                     // ones, and mapped exclusions hid the Gjallarhorn's detail parts on the
                     // native inspect screen and in the world.
-                    let mut native_flags = (flags & 7) | ((flags & !15) >> 1);
-                    if simulated_draws.is_some() {
-                        // Native cloth's float-output role must agree with the display
-                        // binding and material scope, independently of source flag variants.
-                        native_flags = (native_flags & !8) | if simulated { 8 } else { 0 };
-                    }
+                    // Native cloth's float-output role must agree with the display binding and
+                    // material scope, independently of source flag variants.
+                    let mut native_flags =
+                        (((flags & 7) | ((flags & !15) >> 1)) & !8) | if simulated { 8 } else { 0 };
                     if weapon {
                         native_flags &= !0x180;
                     }

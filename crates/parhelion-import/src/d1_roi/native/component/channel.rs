@@ -260,12 +260,6 @@ fn lookup(rows: &[(u32, u32, usize)]) -> Result<Vec<u8>> {
         .map(|rows| rows.concat())
 }
 
-/// The declared channel names of a source bank in ordinal order, which a material's object
-/// inputs index.
-pub(super) fn channel_names(source: &Payload) -> Result<Vec<u32>> {
-    Ok(Bank::read(source)?.names)
-}
-
 impl Assembly<'_> {
     #[allow(clippy::cognitive_complexity)]
     pub(super) fn channel_bank(

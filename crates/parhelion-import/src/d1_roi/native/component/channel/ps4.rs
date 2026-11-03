@@ -609,12 +609,6 @@ fn write_receivers(
     Ok(())
 }
 
-/// The declared channel names of a source bank in ordinal order, which a material's object
-/// inputs index.
-pub(in super::super) fn channel_names(source: &Payload, shift: usize) -> Result<Vec<u32>> {
-    Ok(Bank::read(source, shift)?.names)
-}
-
 impl Assembly<'_> {
     /// The local constant row of `8152B5B7`, whichever bank template holds the rest.
     fn ps4_constant_row(&mut self) -> Result<[u8; 112]> {

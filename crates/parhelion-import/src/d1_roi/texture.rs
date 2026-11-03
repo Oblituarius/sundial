@@ -260,6 +260,16 @@ impl Source {
         })
     }
 
+    /// Whether a source texture is a cube map: T# type 11 on PS4, six layers on Xbox One.
+    pub(super) fn is_cube_texture(&self, tag: u32) -> Result<bool> {
+        let header = self.read(tag)?;
+        if self.platform() == 7 {
+            Ok(ps4::descriptor(&header.0)?.is_cube())
+        } else {
+            Ok(header.u16(0x36)? == 6)
+        }
+    }
+
     fn linear_texture_ps4(&self, tag: u32) -> Result<Texture> {
         let mut assets = BTreeMap::new();
         let metadata = self.texture(tag, &mut assets)?;
@@ -277,20 +287,31 @@ impl Source {
         let format = descriptor.dxgi()?;
         let width = header.u16(0x28)?;
         let height = header.u16(0x2A)?;
+        // A cube map stores its six faces as the slice count at +0x2E (`80A0856C`).
+        let layers = if descriptor.is_cube() { 6 } else { 1 };
         ensure!(
-            !descriptor.is_cube() && header.u16(0x2C)? == 1 && header.u16(0x2E)? == 1,
-            "PS4 cube, array and volume textures are not supported"
+            header.u16(0x2C)? == 1 && header.u16(0x2E)? == layers,
+            "PS4 array and volume textures are not supported"
         );
         let mips = header.u8(0x31)?;
         let linear_hint = header.u32(0x30)? & 0xF00 == 0x500;
-        let bytes = ps4::linear_chain(&raw, &descriptor, format, width, height, mips, linear_hint)
+        let bytes = ps4::linear_chain(
+            &raw,
+            &descriptor,
+            format,
+            width,
+            height,
+            mips,
+            usize::from(layers),
+            linear_hint,
+        )
             .with_context(|| format!("PS4 texture {tag:08X} ({width}x{height}, {mips} mips, format {format}, {} bytes)", raw.len()))?;
         Ok(Texture {
             format,
             width,
             height,
             depth: 1,
-            layers: 1,
+            layers,
             mips,
             bytes,
         })

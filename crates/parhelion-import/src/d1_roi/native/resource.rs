@@ -20,6 +20,9 @@ pub(super) struct Shader {
     pub depth: Option<super::super::expression::Depth>,
     /// The texture register of the reticle mask a pixel program loads.
     pub reticle_mask: Option<u32>,
+    /// SM5 bytecode lifted from a PS4 GCN program, which replaces the source program, and
+    /// the symbol suffix naming what the lift depended on.
+    pub lifted: Option<(Vec<u8>, String)>,
 }
 
 impl Shader {
@@ -48,8 +51,51 @@ impl Shader {
         if let Some(slot) = self.reticle_mask {
             symbol.push_str(&format!("-reticle-{slot}"));
         }
+        if let Some((_, suffix)) = &self.lifted {
+            symbol.push_str(&format!("-gcn{suffix}"));
+        }
         symbol
     }
+}
+
+/// The D3D11 sampler description (`D3D11_SAMPLER_DESC`, 52 bytes) of a GNM sampler, by
+/// freegnm's `GnmSampler` (`include/gnm/sampler.h`) and its enums (`types.h`).
+fn gnm_sampler(gnm: [u8; 16]) -> [u8; 52] {
+    let w = |i: usize| u32::from_le_bytes(gnm[i * 4..i * 4 + 4].try_into().unwrap());
+    let (w0, w1, w2, w3) = (w(0), w(1), w(2), w(3));
+    // GnmTexClamp: wrap, mirror, clamp to last texel, mirror once to last texel, clamp to
+    // half border, mirror once to half border, clamp to border, mirror once to border.
+    let address = |clamp: u32| -> u32 { [1, 2, 3, 5, 4, 5, 4, 5][clamp as usize & 7] };
+    let compare = (w0 >> 12) & 7;
+    let (magnify, minify, mip) = ((w2 >> 20) & 3, (w2 >> 22) & 3, (w2 >> 26) & 3);
+    let mut filter = if magnify >= 2 || minify >= 2 {
+        0x55
+    } else {
+        (u32::from(minify == 1) << 4) | (u32::from(magnify == 1) << 2) | u32::from(mip == 2)
+    };
+    if compare != 0 {
+        filter |= 0x80;
+    }
+    // LOD bias is signed 6.8 fixed point; minimum and maximum LOD unsigned 4.8.
+    let bias = (((w2 & 0x3FFF) << 18) as i32 >> 18) as f32 / 256.0;
+    let border = match w3 >> 30 {
+        1 => [0.0, 0.0, 0.0, 1.0],
+        2 => [1.0; 4],
+        _ => [0.0; 4],
+    };
+    let mut out = Vec::with_capacity(52);
+    for value in [filter, address(w0), address(w0 >> 3), address(w0 >> 6)] {
+        out.extend(value.to_le_bytes());
+    }
+    out.extend(bias.to_le_bytes());
+    out.extend((1u32 << ((w0 >> 9) & 7)).min(16).to_le_bytes());
+    out.extend(if compare == 0 { 8u32 } else { compare + 1 }.to_le_bytes());
+    for lane in border {
+        out.extend(f32::to_le_bytes(lane));
+    }
+    out.extend(((w1 & 0xFFF) as f32 / 256.0).to_le_bytes());
+    out.extend((((w1 >> 12) & 0xFFF) as f32 / 256.0).to_le_bytes());
+    out.try_into().unwrap()
 }
 
 impl Assembly<'_> {
@@ -131,11 +177,23 @@ impl Assembly<'_> {
             return Ok(symbol);
         }
         let header = self.source.read(tag)?;
-        let descriptor = self.source.read(self.source.reference(tag)?)?;
-        ensure!(
-            header.0 == [0; 8] && descriptor.0.len() == 60 && descriptor.0[52..] == [255; 8],
-            "Unknown source sampler storage"
-        );
+        let descriptor = if self.source.platform() == 7 {
+            // PS4 keeps its 16-byte GNM sampler inside the 24-byte header.
+            ensure!(
+                header.0.len() == 24
+                    && header.u64(0)? == 24
+                    && self.source.reference(tag)? == 0x80801A42,
+                "Unknown PS4 source sampler storage"
+            );
+            Payload(gnm_sampler(header.0[8..24].try_into().unwrap()).to_vec())
+        } else {
+            let descriptor = self.source.read(self.source.reference(tag)?)?;
+            ensure!(
+                header.0 == [0; 8] && descriptor.0.len() == 60 && descriptor.0[52..] == [255; 8],
+                "Unknown source sampler storage"
+            );
+            descriptor
+        };
         let template = self.template(34, 1)?;
         let native_header = self.native.tag(template, None)?;
         let data_template = self.native.reference(template)?;
@@ -155,6 +213,16 @@ impl Assembly<'_> {
         self.node(&symbol, template, &native_header.0, Some(&data), &[])
     }
 
+    /// A source program's SM5 bytecode: lifted from PS4 GCN, or stored in the program.
+    fn program_bytes(&self, tag: u32, lifted: Option<(Vec<u8>, String)>) -> Result<Vec<u8>> {
+        if let Some((code, _)) = lifted {
+            return Ok(code);
+        }
+        let source = self.source.read(tag)?;
+        let range = source.array_range(8, 1, Some(0x80800009))?;
+        Ok(source.0.get(range).context("Source GPU program")?.to_vec())
+    }
+
     pub(super) fn shader(&mut self, tag: u32, inputs: Shader) -> Result<String> {
         let symbol = inputs.symbol(tag);
         let no_detail_scale = inputs.no_detail_scale();
@@ -164,13 +232,12 @@ impl Assembly<'_> {
             layout,
             depth,
             reticle_mask,
+            lifted,
         } = inputs;
         if self.symbols.contains(&symbol) {
             return Ok(symbol);
         }
-        let source = self.source.read(tag)?;
-        let range = source.array_range(8, 1, Some(0x80800009))?;
-        let raw = source.0.get(range).context("Source GPU program")?;
+        let raw = &self.program_bytes(tag, lifted)?;
         if self.bone_map.is_some() && stage == Stage::Vertex {
             super::super::shader::rigid_indices(raw)
                 .with_context(|| format!("Source mapped vertex program {tag:08X}"))?;
@@ -263,5 +330,33 @@ impl Assembly<'_> {
                 &[],
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gnm_sampler;
+
+    fn field(desc: &[u8; 52], at: usize) -> u32 {
+        u32::from_le_bytes(desc[at..at + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn gnm_samplers_become_d3d11_descriptions() {
+        // PS4 samplers 80AAE177 (trilinear wrap) and 80AADBAB (4x anisotropic clamp).
+        let trilinear = gnm_sampler([
+            0, 0, 0, 0, 0, 0, 0xF0, 0, 0x80, 0x3F, 0x50, 0x0A, 0, 0, 0, 0,
+        ]);
+        assert_eq!(field(&trilinear, 0), 0x15);
+        assert_eq!([4, 8, 12].map(|at| field(&trilinear, at)), [1, 1, 1]);
+        assert_eq!(f32::from_bits(field(&trilinear, 16)), -0.5);
+        assert_eq!(field(&trilinear, 20), 1);
+        assert_eq!(f32::from_bits(field(&trilinear, 48)), 15.0);
+        let anisotropic = gnm_sampler([
+            0x92, 0x04, 0, 0, 0, 0, 0xF0, 0, 0x80, 0x3F, 0xF0, 0x0A, 0, 0, 0, 0,
+        ]);
+        assert_eq!(field(&anisotropic, 0), 0x55);
+        assert_eq!([4, 8, 12].map(|at| field(&anisotropic, at)), [3, 3, 3]);
+        assert_eq!(field(&anisotropic, 20), 4);
     }
 }

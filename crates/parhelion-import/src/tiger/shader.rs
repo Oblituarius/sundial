@@ -211,4 +211,32 @@ mod tests {
         assert!(vertex("void main() {}").is_err());
         assert!(pixel("void main() {}", [0, 0, 8, 8], [8, 8]).is_err());
     }
+
+    /// A gear-style program without a colour input gets one, then the source vertex offset.
+    #[cfg(windows)]
+    #[test]
+    fn adds_colour_input_for_vertex_offset() {
+        let text = "cbuffer model : register(b11) { float4 rows[8]; };\n\
+            float4 main(float4 position : POSITION, float2 uv : TEXCOORD0,\n\
+                out float2 texcoord : TEXCOORD0) : SV_POSITION {\n\
+                texcoord = uv;\n\
+                float3 p = position.xyz * rows[5].www + rows[5].xyz;\n\
+                return float4(dot(p, rows[0].xyz), dot(p, rows[1].xyz), dot(p, rows[2].xyz), 1);\n\
+            }";
+        let (code, _) = compile_bytecode(text, c"vs_5_0").unwrap();
+        let (with_input, register) = dxbc::add_input(&code, "COLOR", 0).unwrap();
+        assert_eq!(register, 2);
+        assert!(dxbc::add_input(&with_input, "COLOR", 0).is_err());
+        let signature = dxbc::signature(&with_input, b"ISGN").unwrap();
+        assert_eq!(signature.last().unwrap().0, "COLOR");
+        assert_eq!(&signature[..2], &dxbc::signature(&code, b"ISGN").unwrap()[..]);
+        let offset = dxbc::add_vertex_offset(&with_input, register, 0).unwrap();
+        assert_eq!(
+            dxbc::chunk(&offset, b"ISGN").unwrap().map(|r| offset[r].to_vec()),
+            dxbc::chunk(&with_input, b"ISGN").unwrap().map(|r| with_input[r].to_vec())
+        );
+        let text = disassemble(&offset).unwrap();
+        assert!(text.contains("dcl_input v2.xyz"), "{text}");
+        assert!(text.contains("dcl_constantbuffer CB0[2]"), "{text}");
+    }
 }

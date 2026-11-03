@@ -708,6 +708,99 @@ pub(crate) fn add_vertex_offset(container: &[u8], input: u32, slot: u32) -> Resu
     rebuild(container, &output, None)
 }
 
+/// Append a float four-vector input element to a vertex program's input signature, on the
+/// register after the last one. Declares nothing in the program: the element only lets an
+/// input layout feed the register (see `add_vertex_offset`). Returns the container and the
+/// register.
+pub(crate) fn add_input(container: &[u8], semantic: &str, index: u32) -> Result<(Vec<u8>, u32)> {
+    const STRIDE: usize = 24;
+    let range = chunk(container, b"ISGN")?.context("vertex input signature missing")?;
+    let data = &container[range];
+    let count = u32_at(data, 0)? as usize;
+    ensure!(
+        count < 32 && u32_at(data, 4)? == 8,
+        "vertex input signature layout differs"
+    );
+    let mut elements = Vec::with_capacity(count + 1);
+    for element in 0..count {
+        let at = 8 + element * STRIDE;
+        let row = data.get(at..at + STRIDE).context("signature element")?;
+        let name_at = u32_at(row, 0)? as usize;
+        let tail = data.get(name_at..).context("shader semantic name")?;
+        let end = tail
+            .iter()
+            .position(|b| *b == 0)
+            .context("unterminated shader semantic")?;
+        ensure!(
+            !(tail[..end] == *semantic.as_bytes() && u32_at(row, 4)? == index),
+            "vertex input {semantic}{index} is already in the signature"
+        );
+        elements.push((tail[..end].to_vec(), row[4..].to_vec()));
+    }
+    let register = elements
+        .iter()
+        .map(|(_, row)| u32_at(row, 12))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .max()
+        .map_or(0, |last| last + 1);
+    let mut row = Vec::with_capacity(STRIDE - 4);
+    row.extend(index.to_le_bytes());
+    row.extend(0u32.to_le_bytes()); // No system value.
+    row.extend(3u32.to_le_bytes()); // float32
+    row.extend(register.to_le_bytes());
+    row.extend([0xF, 0x7, 0, 0]); // xyzw declared, xyz read.
+    elements.push((semantic.as_bytes().to_vec(), row));
+    let mut table = Vec::new();
+    let mut names = Vec::new();
+    let strings = 8 + elements.len() * STRIDE;
+    for (name, row) in &elements {
+        table.extend(u32::try_from(strings + names.len())?.to_le_bytes());
+        table.extend(row);
+        names.extend(name);
+        names.push(0);
+    }
+    while !names.len().is_multiple_of(4) {
+        names.push(0);
+    }
+    let mut signature = Vec::new();
+    signature.extend(u32::try_from(elements.len())?.to_le_bytes());
+    signature.extend(8u32.to_le_bytes());
+    signature.extend(table);
+    signature.extend(names);
+    Ok((replace_chunk(container, b"ISGN", &signature)?, register))
+}
+
+/// Rebuild a container with one chunk's data replaced, every other chunk kept in order.
+fn replace_chunk(container: &[u8], name: &[u8; 4], data: &[u8]) -> Result<Vec<u8>> {
+    chunk(container, name)?.context("replaced shader chunk is absent")?;
+    let count = u32_at(container, 28)? as usize;
+    let mut result = container[..32].to_vec();
+    result.resize(32 + count * 4, 0);
+    for index in 0..count {
+        let at = u32_at(container, 32 + index * 4)? as usize;
+        let size = u32_at(container, at + 4)? as usize;
+        let offset = u32::try_from(result.len())?;
+        result[32 + index * 4..36 + index * 4].copy_from_slice(&offset.to_le_bytes());
+        let own = &container[at..at + 4];
+        result.extend(own);
+        if own == name {
+            result.extend(u32::try_from(data.len())?.to_le_bytes());
+            result.extend(data);
+        } else {
+            result.extend_from_slice(&container[at + 4..at + 8 + size]);
+        }
+        while !result.len().is_multiple_of(4) {
+            result.push(0);
+        }
+    }
+    let length = u32::try_from(result.len())?;
+    result[24..28].copy_from_slice(&length.to_le_bytes());
+    let digest = checksum(&result)?;
+    result[4..20].copy_from_slice(&digest);
+    Ok(result)
+}
+
 /// Input or output signature elements: (semantic, index, register, mask). `OSG5` elements
 /// carry a leading stream index.
 pub(crate) fn signature(container: &[u8], name: &[u8; 4]) -> Result<Vec<(String, u32, u32, u8)>> {

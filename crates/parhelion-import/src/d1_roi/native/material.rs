@@ -98,6 +98,13 @@ const BORROWED_TECHNIQUES: [(usize, u16, u32); 28] = [
     (14, 139, 0x80EF5148),
 ];
 
+/// PS4 draw stages whose materials lift their own GCN programs: decals additive (6),
+/// transparents (7), distortion (8), light shaft occlusion (9) and lens flares (11). Their
+/// effect programs (scrolling emission, arcs, glows) have no stock equivalent. Gbuffer,
+/// decal, shadow and depth stages keep borrowing stock gear techniques, which bind the
+/// Shadowkeep gear plates and dyes.
+const LIFTED_STAGES: [usize; 5] = [6, 7, 8, 9, 11];
+
 /// The gear extern, a single vector that every stock gear pixel program on layouts 30 and
 /// 138 reads. Only the gear feature renderer binds it, to zero, for each batch it draws
 /// (`0x11B94E3` in the Shadowkeep executable). An imported item draws through the rigid
@@ -157,17 +164,6 @@ fn zero_gear_extern(stock: &Payload) -> Result<Vec<u8>> {
 /// channel BC5, whose third channel reads zero, which this bias would turn into 0.4 occlusion.
 /// The stored bias is `0x3ECCCCCC`, one unit below the nearest float to 0.4.
 const GEAR_NORMAL_UNPACK: [u32; 4] = [0x3FFF_0000, 0xBF80_0000, 0x3ECC_CCCC, 0];
-
-/// Object channels a source vertex offset reads that no Shadowkeep producer feeds to a
-/// converted armor part, and the value each loads instead. Twilight Garrison's offset scale is
-/// `(0.11 * 270E8F60 + 0.12 * (1 - 270E8F60)) * saturate(69EA00AA)`. `69EA00AA` is a state
-/// selector (see `activation`), and in game it read zero, so the pistons stayed at their stored,
-/// retracted pose while their unmoved ring glows (`80A7CD30`) sat 0.05 to 0.06 past the stored
-/// tops. Selector one extends each piston 0.064 to 0.080 along its axis, just past its ring, as
-/// D1 shows it. `270E8F60` keeps the zero an absent channel reads. With both fixed the scale
-/// is constant and is baked into the vertices: the first build carried it as a vertex-stage
-/// expression instead, and in game the pistons still drew at their initial zero scale.
-const FIXED_VERTEX_CHANNELS: [(u32, f32); 2] = [(0x69EA_00AA, 1.0), (0x270E_8F60, 0.0)];
 
 fn put_lanes(rows: &mut [u8], row: usize, lanes: &[(usize, f32)]) -> Result<()> {
     for (lane, value) in lanes {
@@ -600,13 +596,18 @@ impl Assembly<'_> {
 
     /// Carry a source vertex offset. Twilight Garrison's D1 vertex program `80A0770A` adds
     /// `(COLOR + cb[0]) * cb[1]` to the object-space position, with cb[0] a fixed bias and
-    /// cb[1] written by its expression from object channels (`FIXED_VERTEX_CHANNELS`). A
-    /// constant scale is recorded in `vertex_bakes` for the geometry to apply, and the borrowed
-    /// program draws the stored positions. Otherwise a borrowed vertex program with a colour
-    /// input, such as shadow `815B91F9` or depth `80FDBC7C`, gets the offset added
-    /// (`dxbc::add_vertex_offset`), its buffer written by the translated expression. Stock
-    /// `80C0CEC3` has the same offset built in but reads four bone rows (see
-    /// `BORROWED_TECHNIQUES`), so it is not borrowed. Returns the stage's evidence.
+    /// cb[1] written by its expression from the model's object inputs: piston material
+    /// `80A7CD31` writes `saturate(CD6FA091) * (0.11 * gender + 0.12 * (1 - gender))`, where
+    /// CD6FA091 is a curve over the player's 5C6FEDF6 (FNV-1 "linear_speed") that both
+    /// versions' player banks compute (D1 `80A74674`, Shadowkeep `80C45411`). So the pistons
+    /// extend as the player moves, and the ring glows light past 2. A constant scale is
+    /// recorded in `vertex_bakes` for the geometry to apply, and the borrowed program draws the
+    /// stored positions. Otherwise the borrowed vertex program gets the offset added
+    /// (`dxbc::add_vertex_offset`), its buffer written by the translated expression. A program
+    /// without a colour input, such as gear program `81532FC5`, first gets one
+    /// (`dxbc::add_input`): the draw's layout feeds it. Stock `80C0CEC3` has the same offset
+    /// built in but reads four bone rows (see `BORROWED_TECHNIQUES`), so it is not borrowed.
+    /// Returns the stage's evidence.
     fn vertex_offset(
         &mut self,
         tag: u32,
@@ -657,7 +658,6 @@ impl Assembly<'_> {
                 detail: &[String::new(), String::new()],
                 objects,
                 object_channels: &self.object_channels,
-                fixed_objects: &FIXED_VERTEX_CHANNELS,
                 outputs: 2,
                 samplers: 0,
                 stage: 2,
@@ -670,9 +670,9 @@ impl Assembly<'_> {
             program.textures.is_empty(),
             "Source vertex expression binds textures"
         );
-        // With every object input fixed the scale is a constant. The geometry then stores the
-        // offset vertices (`geometry::bake_vertex_offsets`) and every pass draws them with a
-        // zero runtime scale, so the result needs no expression to run in game.
+        // An expression without object or extern inputs has a constant scale. The geometry then
+        // stores the offset vertices (`geometry::bake_vertex_offsets`) and every pass draws them
+        // with a zero runtime scale, so the result needs no expression to run in game.
         if let Some(scale) = program
             .constant_outputs(&values)
             .and_then(|outputs| outputs.get(1).copied())
@@ -698,15 +698,12 @@ impl Assembly<'_> {
             !buffers.contains(&0),
             "Borrowed vertex program {shader:08X} has its own constant buffer"
         );
-        let Some(colour) = crate::tiger::shader::dxbc::signature(&bytecode, b"ISGN")?
+        let (bytecode, colour) = match crate::tiger::shader::dxbc::signature(&bytecode, b"ISGN")?
             .into_iter()
             .find(|(semantic, index, ..)| semantic == "COLOR" && *index == 0)
-            .map(|input| input.2)
-        else {
-            self.approximations.insert(format!(
-                "PS4 source vertex offsets driven at runtime are not drawn by borrowed vertex programs without a colour input (material {tag:08X})"
-            ));
-            return Ok(None);
+        {
+            Some(input) => (bytecode, input.2),
+            None => crate::tiger::shader::dxbc::add_input(&bytecode, "COLOR", 0)?,
         };
         let code = crate::tiger::shader::dxbc::add_vertex_offset(&bytecode, colour, 0)?;
         let template = Template::read(&mut self.native, shader)?;
@@ -813,12 +810,6 @@ impl Assembly<'_> {
         if self.symbols.contains(symbol) {
             return Ok(symbol.to_owned());
         }
-        let Draw {
-            stage: pass,
-            dye,
-            simulated,
-            layout,
-        } = draw;
         let ps4_source = self.source.platform() == 7;
         let expected_class = if ps4_source { 0x80801AD7 } else { 0x80801C32 };
         ensure!(
@@ -826,8 +817,111 @@ impl Assembly<'_> {
             "Source material class differs"
         );
         if ps4_source {
+            if LIFTED_STAGES.contains(&draw.stage)
+                && let Some(symbol) = self.lifted_material(tag, symbol, &draw, equipment)?
+            {
+                return Ok(symbol);
+            }
             return self.borrowed_technique(tag, symbol, &draw, equipment);
         }
+        self.source_material(tag, symbol, draw, equipment, None)
+    }
+
+    /// Convert a PS4 material whose vertex and pixel programs lift from GCN through the
+    /// path Xbox One materials take. Any failure leaves no trace in the graph, records why,
+    /// and returns `None` so the draw borrows a stock technique instead.
+    fn lifted_material(
+        &mut self,
+        tag: u32,
+        symbol: &str,
+        draw: &Draw,
+        equipment: &Equipment,
+    ) -> Result<Option<String>> {
+        let source = self.source.read(tag)?;
+        let (vertex, pixel) = (source.u32(0x28)?, source.u32(0x2A8)?);
+        let nodes = self.nodes.len();
+        let symbols = self.symbols.clone();
+        let evidence = self.evidence.len();
+        let approximations = self.approximations.clone();
+        let bakes = self.vertex_bakes.clone();
+        let outcome = (|| -> Result<String> {
+            ensure!(
+                [0xC8, 0x168, 0x208]
+                    .into_iter()
+                    .map(|at| source.u32(at))
+                    .collect::<Result<Vec<_>>>()?
+                    .iter()
+                    .all(|shader| matches!(*shader, 0 | u32::MAX))
+                    && !matches!(vertex, 0 | u32::MAX)
+                    && !matches!(pixel, 0 | u32::MAX),
+                "Only vertex and pixel programs lift"
+            );
+            let elements = self.layouts.ordered(draw.layout)?;
+            // Pixel texture slots bound to cube maps, which the lift samples as cubes.
+            let mut cubes = std::collections::BTreeSet::new();
+            for row in source.array(0x2A8 + 0x10, 8, Some(0x80801B28))? {
+                let texture = source.u32(row + 4)?;
+                if !matches!(texture, 0 | u32::MAX) && self.source.is_cube_texture(texture)? {
+                    cubes.insert(u8::try_from(source.u32(row)?)?);
+                }
+            }
+            let lifted = super::super::gcn::lift(self.source, vertex, pixel, &elements, &cubes)?;
+            for (name, text) in [
+                format!("gcn-{vertex:08X}-layout-{}.hlsl", draw.layout),
+                format!("gcn-{pixel:08X}-vs-{vertex:08X}.hlsl"),
+            ]
+            .into_iter()
+            .zip(&lifted.hlsl)
+            {
+                fs::write(self.folder.join(name), text)?;
+            }
+            self.source_material(
+                tag,
+                symbol,
+                Draw { ..*draw },
+                equipment,
+                Some((&lifted, vertex)),
+            )
+        })();
+        match outcome {
+            Ok(symbol) => {
+                self.evidence.push(json!({"material":tag,"symbol":symbol,"pass":draw.stage,
+                    "layout":draw.layout,"gcn_lifted":{"vertex":vertex,"pixel":pixel}}));
+                Ok(Some(symbol))
+            }
+            Err(error) => {
+                crate::cancellation::check()?;
+                self.nodes.truncate(nodes);
+                self.symbols = symbols;
+                self.evidence.truncate(evidence);
+                self.approximations = approximations;
+                self.vertex_bakes = bakes;
+                self.evidence.push(json!({"material":tag,"pass":draw.stage,"layout":draw.layout,
+                    "gcn_lift_error":format!("{error:#}")}));
+                self.approximations.insert(
+                    "PS4 effect materials whose GCN programs do not lift (cube maps, loops, cross-lane reads) borrow a stock technique".to_owned(),
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// Convert a source material with its own programs: Xbox One SM5 bytecode, or the SM5
+    /// a PS4 material's GCN programs lifted to (`lifted`, with the vertex program's tag).
+    fn source_material(
+        &mut self,
+        tag: u32,
+        symbol: &str,
+        draw: Draw,
+        equipment: &Equipment,
+        lifted: Option<(&super::super::gcn::Lifted, u32)>,
+    ) -> Result<String> {
+        let Draw {
+            stage: pass,
+            dye,
+            simulated,
+            layout,
+        } = draw;
         let source = self.source.read(tag)?;
         let dye_tag = equipment.dyes.get(&(dye / 2)).copied();
         let dye_data = dye_tag.map(|tag| self.source.read(tag)).transpose()?;
@@ -920,7 +1014,6 @@ impl Assembly<'_> {
                     detail: &detail,
                     objects,
                     object_channels: &self.object_channels,
-                    fixed_objects: &[],
                     outputs: values.len() / 16,
                     samplers: samplers.len(),
                     stage: packed,
@@ -929,6 +1022,16 @@ impl Assembly<'_> {
                 },
             )?;
             program.initialize(&values)?;
+            let lifted = match (lifted, index) {
+                (None, _) => None,
+                (Some((programs, _)), 0) => {
+                    Some((programs.vertex.clone(), format!("-layout-{layout}")))
+                }
+                (Some((programs, vertex)), 4) => {
+                    Some((programs.pixel.clone(), format!("-vs-{vertex:08X}")))
+                }
+                (Some(_), _) => anyhow::bail!("Lifted material has a {stage:?} program"),
+            };
             let shader = self.shader(
                 shader,
                 super::resource::Shader {
@@ -937,6 +1040,7 @@ impl Assembly<'_> {
                     layout,
                     depth: depth.filter(|_| index == 4),
                     reticle_mask: program.reticle_mask.filter(|_| index == 4),
+                    lifted,
                 },
             )?;
             patches.push((to, shader));

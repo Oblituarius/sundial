@@ -7,6 +7,7 @@ mod codec;
 pub mod connections;
 mod dye;
 mod expression;
+mod gcn;
 mod icon;
 mod layout;
 pub mod lifecycle;
