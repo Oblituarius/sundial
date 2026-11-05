@@ -11,12 +11,13 @@ impl Assembly<'_> {
         self.container_icon(container)
     }
 
+    /// An ornament's talent-step label and icon container, from the owning item's grid.
     pub(super) fn ornament_display(
         &mut self,
-        armor: &Armor,
+        owner_definition: u32,
         ornament: &Value,
     ) -> Result<(String, u32)> {
-        let definition = self.source.read(armor.definition)?;
+        let definition = self.source.read(owner_definition)?;
         let holder = definition.pointer(0x58)?;
         ensure!(
             definition.u32(holder - 4)? == 0x808017BD,

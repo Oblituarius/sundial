@@ -305,7 +305,12 @@ impl Source {
             usize::from(layers),
             linear_hint,
         )
-            .with_context(|| format!("PS4 texture {tag:08X} ({width}x{height}, {mips} mips, format {format}, {} bytes)", raw.len()))?;
+        .with_context(|| {
+            format!(
+                "PS4 texture {tag:08X} ({width}x{height}, {mips} mips, format {format}, {} bytes)",
+                raw.len()
+            )
+        })?;
         Ok(Texture {
             format,
             width,

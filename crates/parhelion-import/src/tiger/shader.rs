@@ -229,11 +229,18 @@ mod tests {
         assert!(dxbc::add_input(&with_input, "COLOR", 0).is_err());
         let signature = dxbc::signature(&with_input, b"ISGN").unwrap();
         assert_eq!(signature.last().unwrap().0, "COLOR");
-        assert_eq!(&signature[..2], &dxbc::signature(&code, b"ISGN").unwrap()[..]);
+        assert_eq!(
+            &signature[..2],
+            &dxbc::signature(&code, b"ISGN").unwrap()[..]
+        );
         let offset = dxbc::add_vertex_offset(&with_input, register, 0).unwrap();
         assert_eq!(
-            dxbc::chunk(&offset, b"ISGN").unwrap().map(|r| offset[r].to_vec()),
-            dxbc::chunk(&with_input, b"ISGN").unwrap().map(|r| with_input[r].to_vec())
+            dxbc::chunk(&offset, b"ISGN")
+                .unwrap()
+                .map(|r| offset[r].to_vec()),
+            dxbc::chunk(&with_input, b"ISGN")
+                .unwrap()
+                .map(|r| with_input[r].to_vec())
         );
         let text = disassemble(&offset).unwrap();
         assert!(text.contains("dcl_input v2.xyz"), "{text}");

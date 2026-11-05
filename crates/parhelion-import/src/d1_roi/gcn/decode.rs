@@ -22,17 +22,47 @@ pub enum Src {
 
 #[derive(Clone, Debug)]
 pub enum Op {
-    Sop2 { op: u8, dst: u8, src: [Src; 2] },
-    Sopk { op: u8, dst: u8, imm: u16 },
-    Sop1 { op: u8, dst: u8, src: Src },
-    Sopc { op: u8, src: [Src; 2] },
-    Sopp { op: u8, imm: u16 },
-    Smrd { op: u8, dst: u8, base: u8, offset: SmrdOffset },
+    Sop2 {
+        op: u8,
+        dst: u8,
+        src: [Src; 2],
+    },
+    Sopk {
+        op: u8,
+        dst: u8,
+        imm: u16,
+    },
+    Sop1 {
+        op: u8,
+        dst: u8,
+        src: Src,
+    },
+    Sopc {
+        op: u8,
+        src: [Src; 2],
+    },
+    Sopp {
+        op: u8,
+        imm: u16,
+    },
+    Smrd {
+        op: u8,
+        dst: u8,
+        base: u8,
+        offset: SmrdOffset,
+    },
     /// VOP1, VOP2, VOPC and VOP3 in the VOP3 opcode space: VOPC 0-255, VOP2 256 + op,
     /// VOP1 384 + op, VOP3-only ops between. `literal` is a VOP2 madak/madmk constant.
     Valu(Valu),
-    Vintrp { op: u8, dst: u8, attr: u8, channel: u8 },
-    Ds { op: u8 },
+    Vintrp {
+        op: u8,
+        dst: u8,
+        attr: u8,
+        channel: u8,
+    },
+    Ds {
+        op: u8,
+    },
     Mtbuf(Buffer),
     Mubuf(Buffer),
     Mimg(Image),
@@ -456,7 +486,15 @@ mod tests {
         // s_load_dwordx4 s[16:19], s[2:3], 0x60 from program 80A7600D.
         let (op, size) = instruction(&0xC0880318u32.to_le_bytes(), 0).unwrap();
         assert_eq!(size, 4);
-        let Op::Smrd { op, dst, base, offset } = op else { panic!() };
+        let Op::Smrd {
+            op,
+            dst,
+            base,
+            offset,
+        } = op
+        else {
+            panic!()
+        };
         assert_eq!((op, dst, base), (2, 16, 2));
         assert!(matches!(offset, SmrdOffset::Dwords(24)));
     }
@@ -464,8 +502,14 @@ mod tests {
     #[test]
     fn inline_constants_keep_their_bits() {
         let mut literal = None;
-        assert_eq!(source(242, &mut literal, Ok(0)).unwrap(), Src::Const(0x3F80_0000));
-        assert_eq!(source(193, &mut literal, Ok(0)).unwrap(), Src::Const(u32::MAX));
+        assert_eq!(
+            source(242, &mut literal, Ok(0)).unwrap(),
+            Src::Const(0x3F80_0000)
+        );
+        assert_eq!(
+            source(193, &mut literal, Ok(0)).unwrap(),
+            Src::Const(u32::MAX)
+        );
         assert_eq!(source(131, &mut literal, Ok(0)).unwrap(), Src::Const(3));
         assert!(literal.is_none());
     }

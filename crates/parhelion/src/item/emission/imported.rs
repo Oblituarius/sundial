@@ -343,10 +343,11 @@ pub(super) fn apply(
         .flat_map(|(weapon, graph)| {
             std::iter::once((graph.directory.as_path(), Some(weapon))).chain(
                 graph.attachments.iter().map(move |attachment| {
-                    (
-                        attachment.directory.as_path(),
-                        (weapon.kind == ItemKind::Armor).then_some(weapon),
-                    )
+                    // Gear-art appearances bind to their owner's private socket choices. Other
+                    // weapon ornament graphs name their owner themselves.
+                    let owned = weapon.kind == ItemKind::Armor
+                        || (weapon.kind == ItemKind::Weapon && gear_art(&attachment.directory));
+                    (attachment.directory.as_path(), owned.then_some(weapon))
                 }),
             )
         })
@@ -396,6 +397,15 @@ pub(super) fn apply(
         .collect();
     Ok((replacements, shared.timings))
 }
+/// Whether the graph in `folder` lays out gear art. An unreadable graph reports `false` and
+/// fails later where it is read in full.
+fn gear_art(folder: &Path) -> bool {
+    fs::read(folder.join("asset-graph.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .is_some_and(|graph| graph.get("gear_art").is_some())
+}
+
 /// One node of an imported asset graph, with its payload read from `folder` and prepared:
 /// model draw indices declared and moved markers applied.
 fn graph_node(

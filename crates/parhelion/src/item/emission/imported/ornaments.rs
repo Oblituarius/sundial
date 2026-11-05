@@ -84,7 +84,9 @@ pub(super) fn apply(emission: &mut PackageEmission, graph: &Value) -> AuthoringR
         }
         read_u32(&emission.item_table, item_rows + index as usize * 24)
     };
-    let reset = if graph["kind"] == "armor" {
+    // Armor names its socket's reset. Weapon links name it when the socket's reset is not the
+    // shared Default Ornament.
+    let reset = if graph["kind"] == "armor" || link.get("default_reset").is_some() {
         hash("default_reset")?
     } else {
         0xAEBAE371

@@ -789,7 +789,7 @@ impl Assembly<'_> {
         stages.extend(self.vertex_offset(tag, &stock, &mut out, &mut patches, symbol)?);
         size(&mut out)?;
         self.approximations.insert(
-            "PS4 source shaders are GCN and are not translated: each draw borrows a stock Shadowkeep gear technique for its stage and vertex layout, bound to the converted plates, the draw's dye and a gearstack rewritten in the stock convention without occlusion or emission".to_owned(),
+            "PS4 surface, shadow and depth draws, and effect draws whose GCN program does not lift, borrow a stock Shadowkeep gear technique for their stage and vertex layout, bound to the converted plates, the draw's dye and a gearstack rewritten in the stock convention without occlusion or emission".to_owned(),
         );
         if dye.is_none() && !stages.is_empty() {
             self.approximations
@@ -885,7 +885,8 @@ impl Assembly<'_> {
         })();
         match outcome {
             Ok(symbol) => {
-                self.evidence.push(json!({"material":tag,"symbol":symbol,"pass":draw.stage,
+                self.evidence
+                    .push(json!({"material":tag,"symbol":symbol,"pass":draw.stage,
                     "layout":draw.layout,"gcn_lifted":{"vertex":vertex,"pixel":pixel}}));
                 Ok(Some(symbol))
             }
@@ -896,8 +897,10 @@ impl Assembly<'_> {
                 self.evidence.truncate(evidence);
                 self.approximations = approximations;
                 self.vertex_bakes = bakes;
-                self.evidence.push(json!({"material":tag,"pass":draw.stage,"layout":draw.layout,
-                    "gcn_lift_error":format!("{error:#}")}));
+                self.evidence.push(
+                    json!({"material":tag,"pass":draw.stage,"layout":draw.layout,
+                    "gcn_lift_error":format!("{error:#}")}),
+                );
                 self.approximations.insert(
                     "PS4 effect materials whose GCN programs do not lift (cube maps, loops, cross-lane reads) borrow a stock technique".to_owned(),
                 );

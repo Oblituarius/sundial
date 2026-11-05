@@ -209,7 +209,11 @@ pub(in crate::item::build) fn author(
     let mut grafted_graphs = resolved
         .iter()
         .flat_map(|weapon| {
-            crate::weapon::behavior::requested_graphs(&weapon.weapon.overrides.additional_behaviors)
+            let behaviors = &weapon.weapon.overrides.additional_behaviors;
+            let mut tags = crate::weapon::behavior::requested_graphs(behaviors);
+            // Effect entities a graph brings are named the same way, by a tag no walk reaches.
+            tags.extend(crate::weapon::behavior::requested_graph_effects(behaviors));
+            tags
         })
         .collect::<Vec<_>>();
     for donor in resolved {

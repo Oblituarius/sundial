@@ -1089,3 +1089,39 @@ pub fn requested_graphs(ids: &[String]) -> Vec<u32> {
         .filter_map(Behavior::graph_tag)
         .collect()
 }
+
+/// Effect entities that travel with a grafted graph, as `(variant block offset, entity tag)`.
+///
+/// A graph carries the firing side only. The visuals its source weapon plays around it live in
+/// the source's own variant block, in slots the graph never reaches, so a graft alone leaves the
+/// host showing its own effects. Riskrunner's block (content group 9E266A32 in owner 8152C7C5)
+/// names its firing particles at `+0x60` (80BC1115: particle component 80EF567D, 43 systems, no
+/// audio) and its Arc Conductor particles at `+0x90` (80BC0F9A: particle component 80EF5554, five
+/// systems and one crackle sound). Both read `perk_active` through the weapon's bank, so they
+/// show the Superconductor look whenever the perk is active. Its audio slots `+0x80` and `+0xB0`
+/// stay behind, so the host keeps its own firing sound.
+///
+/// Only sources checked against their block are listed. A tag reference is absolute, so any
+/// weapon can point at these, as it does at the graph.
+const GRAPH_EFFECTS: [(&str, &[(usize, u32)]); 1] = [(
+    "riskrunner-graph",
+    &[(0x60, 0x80BC_1115), (0x90, 0x80BC_0F9A)],
+)];
+
+/// The effect entities a behavior's graph brings with it. See [`GRAPH_EFFECTS`].
+#[must_use]
+pub fn graph_effects(id: &str) -> &'static [(usize, u32)] {
+    GRAPH_EFFECTS
+        .iter()
+        .find(|(source, _)| *source == id)
+        .map_or(&[], |(_, effects)| effects)
+}
+
+/// Effect entities a recipe's grafted graphs bring, so the build can enrol them like graphs.
+#[must_use]
+pub fn requested_graph_effects(ids: &[String]) -> Vec<u32> {
+    ids.iter()
+        .flat_map(|id| graph_effects(id))
+        .map(|&(_, tag)| tag)
+        .collect()
+}

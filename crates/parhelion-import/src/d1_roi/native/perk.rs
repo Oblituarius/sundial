@@ -971,9 +971,9 @@ pub(super) fn translate(
     // Rise of Iron items offer only the Default Shader, not the donor's own shader list.
     for (index, socket) in sockets.iter().enumerate() {
         let shader = socket["choices"].as_array().is_some_and(|choices| {
-            choices.iter().any(|c| {
-                c["default"] == true && c["item_kind"].as_u64() == Some(SHADER_ITEM_KIND)
-            })
+            choices
+                .iter()
+                .any(|c| c["default"] == true && c["item_kind"].as_u64() == Some(SHADER_ITEM_KIND))
         });
         if shader {
             columns[index] = json!({

@@ -1449,10 +1449,13 @@ fn save_imported_recipe(
             updated.overrides.icon_edit.imported_image =
                 recipe.overrides.icon_edit.imported_image.clone();
         }
+        // Converted appearance attachments belong to the converted socket layout above, whose
+        // choices name them. A conversion without any keeps the saved entry's.
         if let (Some(next), Some(previous)) = (
             &mut updated.overrides.imported_graph,
             &baseline.overrides.imported_graph,
-        ) {
+        ) && next.attachments.is_empty()
+        {
             next.attachments = previous.attachments.clone();
         }
         if !recipe.kind.is_weapon() {

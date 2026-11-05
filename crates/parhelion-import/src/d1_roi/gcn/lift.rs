@@ -139,7 +139,11 @@ impl<'a> Lift<'a> {
             Some(guard) => {
                 let temp = format!("r{}", self.temps);
                 self.temps += 1;
-                let ty = if target.starts_with("km") || target == "vcc" || target == "exec" || target == "scc" {
+                let ty = if target.starts_with("km")
+                    || target == "vcc"
+                    || target == "exec"
+                    || target == "scc"
+                {
                     "bool"
                 } else {
                     "uint"
@@ -204,7 +208,10 @@ impl<'a> Lift<'a> {
 
     /// Write a scalar register, which drops any descriptor it held.
     fn write_sgpr(&mut self, register: u8, value: String) -> Result<()> {
-        ensure!(register < 104, "Unsupported GCN scalar destination {register}");
+        ensure!(
+            register < 104,
+            "Unsupported GCN scalar destination {register}"
+        );
         self.sgpr.remove(&register);
         let target = self.s(register);
         self.assign(target, value, false);
@@ -265,7 +272,11 @@ impl<'a> Lift<'a> {
                 self.float_result(valu, v)
             }
             262 => {
-                let v = format!("(mul_legacy({}, {}) + asfloat({dst}))", f(self, 0)?, f(self, 1)?);
+                let v = format!(
+                    "(mul_legacy({}, {}) + asfloat({dst}))",
+                    f(self, 0)?,
+                    f(self, 1)?
+                );
                 self.float_result(valu, v)
             }
             263 => {
@@ -294,8 +305,16 @@ impl<'a> Lift<'a> {
                 };
                 self.float_result(valu, v)
             }
-            273 => format!("asuint(min(asint({}), asint({})))", u(self, 0)?, u(self, 1)?),
-            274 => format!("asuint(max(asint({}), asint({})))", u(self, 0)?, u(self, 1)?),
+            273 => format!(
+                "asuint(min(asint({}), asint({})))",
+                u(self, 0)?,
+                u(self, 1)?
+            ),
+            274 => format!(
+                "asuint(max(asint({}), asint({})))",
+                u(self, 0)?,
+                u(self, 1)?
+            ),
             275 => format!("min({}, {})", u(self, 0)?, u(self, 1)?),
             276 => format!("max({}, {})", u(self, 0)?, u(self, 1)?),
             277 => format!("({} >> ({} & 31u))", u(self, 0)?, u(self, 1)?),
@@ -322,9 +341,18 @@ impl<'a> Lift<'a> {
             293 => format!("({} + {})", u(self, 0)?, u(self, 1)?),
             294 => format!("({} - {})", u(self, 0)?, u(self, 1)?),
             295 => format!("({} - {})", u(self, 1)?, u(self, 0)?),
-            303 => format!("(f32tof16({}) | (f32tof16({}) << 16))", f(self, 0)?, f(self, 1)?),
+            303 => format!(
+                "(f32tof16({}) | (f32tof16({}) << 16))",
+                f(self, 0)?,
+                f(self, 1)?
+            ),
             320 => {
-                let v = format!("(mul_legacy({}, {}) + {})", f(self, 0)?, f(self, 1)?, f(self, 2)?);
+                let v = format!(
+                    "(mul_legacy({}, {}) + {})",
+                    f(self, 0)?,
+                    f(self, 1)?,
+                    f(self, 2)?
+                );
                 self.float_result(valu, v)
             }
             321 | 331 => {
@@ -462,10 +490,11 @@ impl<'a> Lift<'a> {
         if op < 8 {
             for k in 0..count {
                 let desc = match pointer {
-                    Some(Desc::Extended) => *self
-                        .extended
-                        .get(&(16 + offset + k))
-                        .with_context(|| format!("Extended user data {} is undeclared", 16 + offset + k))?,
+                    Some(Desc::Extended) => {
+                        *self.extended.get(&(16 + offset + k)).with_context(|| {
+                            format!("Extended user data {} is undeclared", 16 + offset + k)
+                        })?
+                    }
                     Some(Desc::Resources(api)) => Desc::Resource(
                         api + u8::try_from((offset + k) / 8)?,
                         ((offset + k) % 8) as u8,
@@ -497,7 +526,9 @@ impl<'a> Lift<'a> {
     fn resource(&self, base: u8, count: u8, kind: fn(u8, u8) -> Desc) -> Result<u8> {
         let first = self.sgpr.get(&base).copied();
         let slot = match first {
-            Some(Desc::Resource(slot, 0)) | Some(Desc::Sampler(slot, 0)) | Some(Desc::Buffer(slot, 0)) => slot,
+            Some(Desc::Resource(slot, 0))
+            | Some(Desc::Sampler(slot, 0))
+            | Some(Desc::Buffer(slot, 0)) => slot,
             other => bail!("GCN descriptor s{base} is {other:?}"),
         };
         for k in 0..count {
@@ -511,14 +542,21 @@ impl<'a> Lift<'a> {
     }
 
     fn image(&mut self, image: &Image) -> Result<()> {
-        ensure!(!image.da, "Unsupported GCN array image addressing (op {})", image.op);
+        ensure!(
+            !image.da,
+            "Unsupported GCN array image addressing (op {})",
+            image.op
+        );
         // Texel loads address in integers whatever the unnormalized bit says.
         ensure!(
             !image.unorm || image.op <= 1,
             "Unsupported GCN unnormalized image addressing (op {})",
             image.op
         );
-        ensure!(!image.tfe && !image.lwe, "Unsupported GCN image fault reporting");
+        ensure!(
+            !image.tfe && !image.lwe,
+            "Unsupported GCN image fault reporting"
+        );
         let texture = self.resource(image.resource, 8, Desc::Resource)?;
         self.textures.insert(texture);
         let v = |lift: &mut Self, k: u8| -> String {
@@ -545,7 +583,11 @@ impl<'a> Lift<'a> {
                             "float4(tex{texture}.CalculateLevelOfDetail(smp{sampler}, {uv}), tex{texture}.CalculateLevelOfDetailUnclamped(smp{sampler}, {uv}), 0, 0)"
                         )
                     }
-                    32 => format!("tex{texture}.Sample(smp{sampler}, float2({}, {}))", v(self, 0), v(self, 1)),
+                    32 => format!(
+                        "tex{texture}.Sample(smp{sampler}, float2({}, {}))",
+                        v(self, 0),
+                        v(self, 1)
+                    ),
                     36 => format!(
                         "tex{texture}.SampleLevel(smp{sampler}, float2({}, {}), {})",
                         v(self, 0),
@@ -558,7 +600,11 @@ impl<'a> Lift<'a> {
                         v(self, 2),
                         v(self, 0)
                     ),
-                    39 => format!("tex{texture}.SampleLevel(smp{sampler}, float2({}, {}), 0)", v(self, 0), v(self, 1)),
+                    39 => format!(
+                        "tex{texture}.SampleLevel(smp{sampler}, float2({}, {}), 0)",
+                        v(self, 0),
+                        v(self, 1)
+                    ),
                     _ => format!(
                         "tex{texture}.SampleGrad(smp{sampler}, float2({}, {}), float2({}, {}), float2({}, {}))",
                         v(self, 4),
@@ -587,7 +633,12 @@ impl<'a> Lift<'a> {
             format!("asfloat({register})")
         };
         let call = match image.op {
-            32 => format!("tex{texture}.Sample(smp{sampler}, cube_dir({}, {}, {}))", v(0), v(1), v(2)),
+            32 => format!(
+                "tex{texture}.Sample(smp{sampler}, cube_dir({}, {}, {}))",
+                v(0),
+                v(1),
+                v(2)
+            ),
             36 => format!(
                 "tex{texture}.SampleLevel(smp{sampler}, cube_dir({}, {}, {}), {})",
                 v(0),
@@ -602,7 +653,12 @@ impl<'a> Lift<'a> {
                 v(3),
                 v(0)
             ),
-            39 => format!("tex{texture}.SampleLevel(smp{sampler}, cube_dir({}, {}, {}), 0)", v(0), v(1), v(2)),
+            39 => format!(
+                "tex{texture}.SampleLevel(smp{sampler}, cube_dir({}, {}, {}), 0)",
+                v(0),
+                v(1),
+                v(2)
+            ),
             96 => {
                 let direction = format!("cube_dir({}, {}, {})", v(0), v(1), v(2));
                 format!(
@@ -687,8 +743,7 @@ impl<'a> Lift<'a> {
                 let register = self.v(export.src[half]);
                 for k in 0..2 {
                     if export.enable >> (half * 2 + k) & 1 != 0 {
-                        lanes[half * 2 + k] =
-                            Some(format!("f16tof32({register} >> {})", 16 * k));
+                        lanes[half * 2 + k] = Some(format!("f16tof32({register} >> {})", 16 * k));
                     }
                 }
             }
@@ -730,13 +785,17 @@ impl Lift<'_> {
         match &self.header.interface {
             Interface::Vertex { inputs, .. } => {
                 for &(element, vgpr, size) in inputs {
-                    let (code, _) = *elements
-                        .get(usize::from(element))
-                        .with_context(|| format!("Vertex input {element} is not a layout element"))?;
+                    let (code, _) = *elements.get(usize::from(element)).with_context(|| {
+                        format!("Vertex input {element} is not a layout element")
+                    })?;
                     let (_, integer) = semantic_name(code)?;
                     for (lane, name) in LANES.iter().enumerate().take(usize::from(size)) {
                         let value = format!("i{element}.{name}");
-                        let value = if integer { value } else { format!("asuint({value})") };
+                        let value = if integer {
+                            value
+                        } else {
+                            format!("asuint({value})")
+                        };
                         values.push((vgpr + lane as u8, value));
                     }
                 }
@@ -752,7 +811,9 @@ impl Lift<'_> {
                     }
                     match bit {
                         0..=7 => {}
-                        8..=11 => values.push((vgpr, format!("asuint(position.{})", LANES[bit - 8]))),
+                        8..=11 => {
+                            values.push((vgpr, format!("asuint(position.{})", LANES[bit - 8])))
+                        }
                         12 => values.push((vgpr, "asuint(front ? 1.0f : -1.0f)".to_owned())),
                         _ => bail!("Unsupported pixel system input {bit}"),
                     }
@@ -973,7 +1034,10 @@ impl Lift<'_> {
                 parameters.extend(interpolants(inputs, linkage)?);
                 parameters.push("in float4 position : SV_Position".to_owned());
                 parameters.push("in bool front : SV_IsFrontFace".to_owned());
-                ensure!(!self.targets.is_empty(), "GCN pixel program exports no colour");
+                ensure!(
+                    !self.targets.is_empty(),
+                    "GCN pixel program exports no colour"
+                );
                 for target in &self.targets {
                     parameters.push(format!("out float4 o{target} : SV_Target{target}"));
                     outputs.push(format!("o{target}"));
@@ -992,10 +1056,17 @@ impl Lift<'_> {
                 None if *slot == 10 => 216,
                 None => 4096,
             };
-            writeln!(text, "cbuffer CB{slot} : register(b{slot}) {{ float4 cb{slot}[{rows}]; }}")?;
+            writeln!(
+                text,
+                "cbuffer CB{slot} : register(b{slot}) {{ float4 cb{slot}[{rows}]; }}"
+            )?;
         }
         for slot in &self.textures {
-            let kind = if self.cubes.contains(slot) { "TextureCube" } else { "Texture2D" };
+            let kind = if self.cubes.contains(slot) {
+                "TextureCube"
+            } else {
+                "Texture2D"
+            };
             writeln!(text, "{kind}<float4> tex{slot} : register(t{slot});")?;
         }
         for slot in &self.samplers {

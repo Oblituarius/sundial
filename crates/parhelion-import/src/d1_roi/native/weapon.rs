@@ -1,6 +1,7 @@
 //! Source weapon art on a native runtime that preserves every source bone binding.
 use super::*;
 use crate::GraphReference;
+mod ornament;
 mod stats;
 
 pub(super) fn key(text: &str) -> u32 {
@@ -172,7 +173,7 @@ impl Source {
             row["template_index"] = json!(template);
         }
         let icon = assembly.item_icon(weapon.strings)?;
-        let (columns, variants, perks, damage) =
+        let (mut columns, mut variants, perks, damage) =
             perk::translate(&mut assembly, source, donor, perk::Host::Weapon)?;
         let stats = stats::translate(&mut assembly, source)?;
         progress(format!("Converting {} runtime animation", weapon.name));
@@ -270,6 +271,37 @@ impl Source {
             format!("Third-person poses retain native behavior: {}", first_person_animation["character_reason"].as_str().unwrap_or("source holding profile was not converted"))
         });
         limitations.extend(assembly.approximations.iter().cloned());
+        let mut attachments = Vec::new();
+        let mut ornament_report = Value::Null;
+        let ornaments = self.weapon_ornament_socket(
+            &ornament::Host {
+                weapon: &weapon,
+                source,
+                native,
+                donor,
+                template,
+                private_item,
+                namespace: &namespace,
+            },
+            columns.as_array().context("Weapon talent columns")?,
+            output,
+            options,
+            &mut limitations,
+            progress,
+        )?;
+        if let Some(converted) = ornaments {
+            let columns = columns.as_array_mut().context("Weapon talent columns")?;
+            if columns.len() <= converted.socket {
+                columns.resize(converted.socket + 1, Value::Null);
+            }
+            columns[converted.socket] = converted.column;
+            variants
+                .as_array_mut()
+                .context("Weapon talent variants")?
+                .extend(converted.variants);
+            attachments = converted.attachments;
+            ornament_report = converted.report;
+        }
         let mut graph = json!({"kind":"weapon","source":"d1_roi","source_item":hash,"source_name":weapon.name,
             "source_icon_png":icon,"source_builds":self.report.builds,"source_stamp":self.report.stamp,
             "item_hash":private_item,"native_item":donor,"converter_revision":crate::graph::CONVERTER_REVISION,
@@ -278,13 +310,17 @@ impl Source {
             "source_talents":source["talents"],"perk_translation":perks,"stat_translation":stats.report,
             "rendering":assembly.evidence,"equipment_animation":runtime_animation,"animation":first_person_animation,"audio":named_audio,
             "collections_unconditional":true,"installable":true,"gameplay_verified":false,"limitations":limitations});
+        if !ornament_report.is_null() {
+            graph["ornaments"] = ornament_report;
+        }
         if let Some(audio) = audio_assets {
             graph["audio_assets"] = audio;
         }
         crate::io::write_json(&directory.join("asset-graph.json"), &graph)?;
         assembly.native.finish()?;
         self.unchanged()?;
-        let reference = GraphReference::new(&directory, private_item)?;
+        let mut reference = GraphReference::new(&directory, private_item)?;
+        reference.attachments = attachments;
         let rarity = match weapon.rarity {
             1 => "common",
             2 => "uncommon",

@@ -501,3 +501,57 @@ fn every_block_with_labels_parses_at_the_row_size_grafts_copy() {
     assert!(checked > 0, "no blocks carried labels");
     assert!(failures.is_empty(), "label layout: {failures:#?}");
 }
+
+/// Every effect entity a graph brings is the one its source weapon's own block names at that
+/// slot, and Hard Light's block, the Zhalo Supercell host, leaves those slots empty for it.
+#[test]
+#[ignore = "requires SUNDIAL_STOCK_PACKAGES"]
+fn graph_effects_match_their_source_block_and_fill_only_empty_host_slots() {
+    use sundial::package_authoring::open_shadowkeep_package_manager;
+    const AUTO_RIFLE_OWNER: u32 = 0x8152_9461;
+    const HARD_LIGHT_GROUP: u32 = 0x8F15_AF33;
+    let path = crate::test_support::stock_packages();
+    let manager = open_shadowkeep_package_manager(&path).unwrap();
+    for entry in CATALOG
+        .iter()
+        .filter(|entry| !graph_effects(entry.id).is_empty())
+    {
+        let (owner, block) = source_block(&manager, entry).unwrap();
+        for &(offset, effect) in graph_effects(entry.id) {
+            assert_eq!(
+                u32_at(&owner, block + offset).unwrap(),
+                effect,
+                "{} +{offset:#X}",
+                entry.id
+            );
+        }
+    }
+
+    let owner = manager.read_tag(TagHash(AUTO_RIFLE_OWNER)).unwrap();
+    let resource = 0x80_usize;
+    let definition = usize::try_from(u64_at(&owner, resource + 8).unwrap()).unwrap();
+    let blocks = crate::weapon::ammo::property_offsets(&owner, definition).unwrap();
+    let content = Content {
+        owner_tag: AUTO_RIFLE_OWNER,
+        owner,
+        resource,
+        blocks,
+    };
+    let host = exact_block(&content, HARD_LIGHT_GROUP).unwrap();
+    let riskrunner = behavior("riskrunner-graph").unwrap();
+    let patches = effect_patches(&content, host, riskrunner).unwrap();
+    let written = patches
+        .iter()
+        .map(|patch| {
+            (
+                patch.offset,
+                u32::from_le_bytes(patch.bytes[..4].try_into().unwrap()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let expected = graph_effects(riskrunner.id)
+        .iter()
+        .map(|&(offset, effect)| (slot_offset(host + offset, resource).unwrap(), effect))
+        .collect::<Vec<_>>();
+    assert_eq!(written, expected);
+}

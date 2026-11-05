@@ -325,9 +325,7 @@ impl Program {
     /// application crate): operands in push order, `right` the most recent.
     pub(super) fn constant_outputs(&self, values: &[u8]) -> Option<Vec<[f32; 4]>> {
         let vector = |bytes: &[u8]| -> [f32; 4] {
-            std::array::from_fn(|i| {
-                f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
-            })
+            std::array::from_fn(|i| f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()))
         };
         let mut outputs = values.chunks_exact(16).map(vector).collect::<Vec<_>>();
         let mut stack: Vec<[f32; 4]> = Vec::new();

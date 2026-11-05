@@ -41,8 +41,19 @@ impl Assembly<'_> {
             "Source light has no unique skeleton provider"
         );
         let link = connections[0];
+        // PS4 light schemas sit 0x38 bytes shorter before the skeleton field and the draw,
+        // and 0x40 before the pose selection: measured over all 993 PS4 Rise of Iron lights,
+        // whose pose arrays sit at +0x138 (Xbox One +0x178). The PS4 pose selection holds its
+        // 8080052A marker in the second word, after a zero word.
+        let ps4 = self.source.platform() == 7;
+        let field = move |xbox: usize, orbis: usize| s + if ps4 { orbis } else { xbox };
+        let marker = if ps4 {
+            source.u32(field(0x150, 0x110))? == 0 && source.u32(field(0x154, 0x114))? == 0x8080052A
+        } else {
+            source.u32(s + 0x150)? == 0x8080052A && source.u32(s + 0x154)? == 0
+        };
         ensure!(
-            source_entity.u64(link + 16)? == (s + 0x130) as u64
+            source_entity.u64(link + 16)? == field(0x130, 0xF8) as u64
                 && source_entity.u32(link + 40)? == 0xAE7D0AED
                 && source_entity.u32(link + 48)? == u32::MAX
                 && source_entity.u64(link + 72)? == 0x3FFFF
@@ -50,17 +61,16 @@ impl Assembly<'_> {
             "Source light requires a different skeleton binding"
         );
         ensure!(
-            source.u32(s + 0x150)? == 0x8080052A
-                && source.u32(s + 0x154)? == 0
-                && source.u32(s + 0x158)? <= 2
-                && source.u32(s + 0x15C)? == u32::MAX
-                && source.u64(s + 0x160)? == 0
-                && source.u32(s + 0x168)? == 0x80801AAA
-                && source.u32(s + 0x16C)? == 0x811C9DC5
-                && source.u64(s + 0x170)? == 1,
+            marker
+                && source.u32(field(0x158, 0x118))? <= 2
+                && source.u32(field(0x15C, 0x11C))? == u32::MAX
+                && source.u64(field(0x160, 0x120))? == 0
+                && source.u32(field(0x168, 0x128))? == 0x80801AAA
+                && source.u32(field(0x16C, 0x12C))? == 0x811C9DC5
+                && source.u64(field(0x170, 0x130))? == 1,
             "Source light pose selection differs"
         );
-        let poses = source.array(s + 0x178, 64, Some(0x80801AAA))?;
+        let poses = source.array(field(0x178, 0x138), 64, Some(0x80801AAA))?;
         ensure!(poses.len() == 1, "Source light requires one local pose");
         let at = poses[0];
         ensure!(
@@ -78,7 +88,7 @@ impl Assembly<'_> {
         put(
             &mut component.payload.0,
             n + 0x130,
-            &source.bytes::<16>(s + 0x158)?,
+            &source.bytes::<16>(field(0x158, 0x118))?,
         )?;
         array(
             &mut component.payload.0,
@@ -88,7 +98,9 @@ impl Assembly<'_> {
             64,
         )?;
         self.light_inputs(&mut component, &channels)?;
-        let source_draw = source.u32(s + 0x110)?;
+        // The draw keeps Charm's Rise of Iron `SExpensiveLight` layout (0xB0, shading at 0x90,
+        // parameters at 0x98) on both platforms.
+        let source_draw = source.u32(field(0x110, 0xD8))?;
         ensure!(
             self.source.reference(source_draw)? == 0x80801BD9,
             "Source light draw class differs"

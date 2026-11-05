@@ -142,7 +142,12 @@ impl Layouts {
     }
 
     /// The stream, byte offset and native format of a native layout's element.
-    pub fn element(&self, layout: u16, semantic: u8, index: u8) -> Result<Option<(usize, usize, u8)>> {
+    pub fn element(
+        &self,
+        layout: u16,
+        semantic: u8,
+        index: u8,
+    ) -> Result<Option<(usize, usize, u8)>> {
         let streams = self
             .native
             .get(&layout)

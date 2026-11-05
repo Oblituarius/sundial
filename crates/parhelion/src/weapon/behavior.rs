@@ -41,8 +41,8 @@ mod tests;
 use catalog::*;
 pub use catalog::{
     CATALOG, ELEMENT_SWITCH, behavior, catalog_for_owner, catalog_for_type,
-    element_switch_for_owner, paired_record_source, requested_graphs, source_switches_element,
-    switches_element_for_type,
+    element_switch_for_owner, graph_effects, paired_record_source, requested_graph_effects,
+    requested_graphs, source_switches_element, switches_element_for_type,
 };
 pub use firing::BehaviorFiring;
 pub(crate) use firing::*;
@@ -266,6 +266,31 @@ fn selected_block(content: &Content, group: Option<u32>) -> AuthoringResult<usiz
     }
 }
 
+/// Points the host block's empty effect slots at the visuals a grafted graph brings (see
+/// [`graph_effects`]). A filled slot is the host's own effect and stays.
+fn effect_patches(
+    content: &Content,
+    block: usize,
+    entry: &Behavior,
+) -> AuthoringResult<Vec<WeaponRuntimeResourcePatch>> {
+    let mut patches = Vec::new();
+    for &(offset, effect) in graph_effects(entry.id) {
+        if u32_at(&content.owner, block + offset)? != u32::MAX {
+            continue;
+        }
+        patches.push(WeaponRuntimeResourcePatch {
+            binding_hash: BINDING,
+            resource_index: 0,
+            offset: slot_offset(block + offset, content.resource)?,
+            bytes: effect.to_le_bytes().to_vec(),
+            graph_values: Vec::new(),
+            graph_removals: Vec::new(),
+            graph_trajectories: None,
+        });
+    }
+    Ok(patches)
+}
+
 /// Builds the runtime patches that graft each behavior onto the weapon's own variant block.
 ///
 /// When the pattern row selects another weapon's block, the base weapon's own type markers,
@@ -417,7 +442,9 @@ pub(crate) fn patches(
             return Err(invalid("No element-switch record is available to graft."));
         }
 
-        if let Some(tag) = entry.and_then(Behavior::graph_tag) {
+        if let Some(entry) = entry
+            && let Some(tag) = entry.graph_tag()
+        {
             graph_requested = true;
             patches.push(WeaponRuntimeResourcePatch {
                 binding_hash: BINDING,
@@ -428,6 +455,7 @@ pub(crate) fn patches(
                 graph_removals: Vec::new(),
                 graph_trajectories: None,
             });
+            patches.extend(effect_patches(&content, block, entry)?);
         }
     }
     // Putting the base's own behavior back is a best effort, so a block it cannot read keeps

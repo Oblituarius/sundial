@@ -76,7 +76,10 @@ pub(super) fn linear_chain(
     slices: usize,
     linear_hint: bool,
 ) -> Result<Vec<u8>> {
-    ensure!(matches!(slices, 1 | 6), "Unsupported PS4 slice count {slices}");
+    ensure!(
+        matches!(slices, 1 | 6),
+        "Unsupported PS4 slice count {slices}"
+    );
     ensure!(mips > 0 && mips <= 16, "Invalid PS4 mip count {mips}");
     let dxgi = DxgiFormat::try_from(format)
         .map_err(|_| anyhow::anyhow!("Unsupported PS4 DXGI format {format}"))?;

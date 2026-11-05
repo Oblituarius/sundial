@@ -2,7 +2,7 @@
 use super::*;
 use crate::GraphReference;
 
-fn hash(text: &str) -> u32 {
+pub(super) fn hash(text: &str) -> u32 {
     text.bytes().fold(0x811C9DC5u32, |h, b| {
         h.wrapping_mul(16777619) ^ u32::from(b)
     })
@@ -367,7 +367,7 @@ impl Source {
                     None,
                 )?;
                 let (name, icon_container) =
-                    ornament_assembly.ornament_display(&armor, ornament)?;
+                    ornament_assembly.ornament_display(armor.definition, ornament)?;
                 if !name.is_empty()
                     && super::super::localization::Labels::new(self)?
                         .text(self, &self.read(source_item.strings)?, 0x78)?

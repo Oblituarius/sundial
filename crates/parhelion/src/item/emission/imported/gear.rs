@@ -44,7 +44,7 @@ pub(super) fn bind(
         let socket = word(&link["target_socket"])? as usize;
         let choice = word(&link["choice_index"])? as usize;
         let source = word(&link["native_plug"])?;
-        if spec.kind != ItemKind::Armor
+        if !matches!(spec.kind, ItemKind::Armor | ItemKind::Weapon)
             || !spec.overrides.socket_plug_variants.iter().any(|v| {
                 usize::from(v.socket_index) == socket
                     && usize::from(v.choice_index) == choice
@@ -52,23 +52,23 @@ pub(super) fn bind(
             })
         {
             return Err(invalid(
-                "Armor ornament has no matching private socket choice",
+                "Gear ornament has no matching private socket choice",
             ));
         }
         let owner = definition_ordinal(emission, spec.identity.item_hash)?;
         let data = &emission.host_new_tags[owner].payload;
         let (count, _, rows, _) = array_at(data, relative_target(data, 0x68)?)?;
         if socket >= count {
-            return Err(invalid("Armor ornament socket is absent"));
+            return Err(invalid("Gear ornament socket is absent"));
         }
         let (count, _, rows, _) = array_at(data, rows + socket * 0x50 + 0x40)?;
         if choice >= count {
-            return Err(invalid("Armor ornament choice is absent"));
+            return Err(invalid("Gear ornament choice is absent"));
         }
         let ordinal = usize::from(read_u16(data, rows + choice * 0x20)?);
         let (count, _, rows, _) = array_at(&emission.item_table, 8)?;
         if ordinal >= count {
-            return Err(invalid("Armor ornament item is absent"));
+            return Err(invalid("Gear ornament item is absent"));
         }
         let item = read_u32(&emission.item_table, rows + ordinal * 24)?;
         definition_ordinal(emission, item)?;

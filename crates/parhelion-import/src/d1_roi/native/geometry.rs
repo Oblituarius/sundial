@@ -52,7 +52,10 @@ impl Assembly<'_> {
         vertices: usize,
         transform: &[u8; 48],
     ) -> Result<()> {
-        if !draws.iter().any(|(m, ..)| self.vertex_bakes.contains_key(m)) {
+        if !draws
+            .iter()
+            .any(|(m, ..)| self.vertex_bakes.contains_key(m))
+        {
             return Ok(());
         }
         let mut scales: BTreeMap<usize, [f32; 3]> = BTreeMap::new();
@@ -136,8 +139,10 @@ impl Assembly<'_> {
                     .to_owned(),
             );
         }
-        self.evidence.push(json!({"baked_vertex_offset":{"buffer":symbol,"layout":layout,
-            "vertices":scales.len(),"max_displacement":moved,"max_clamped":clamped}}));
+        self.evidence.push(
+            json!({"baked_vertex_offset":{"buffer":symbol,"layout":layout,
+            "vertices":scales.len(),"max_displacement":moved,"max_clamped":clamped}}),
+        );
         Ok(())
     }
 

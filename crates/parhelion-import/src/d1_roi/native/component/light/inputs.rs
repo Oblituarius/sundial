@@ -8,7 +8,16 @@ pub(super) fn names(
     owner: u32,
     ordinal: usize,
 ) -> Result<Vec<u32>> {
-    names_at(source, p, entity, owner, ordinal, 0xC8, 0x1D0)
+    // PS4 light definitions sit at +0x180 (measured on the 658 PS4 lights with inputs).
+    names_at(
+        source,
+        p,
+        entity,
+        owner,
+        ordinal,
+        0xC8,
+        source.field(0x1D0, 0x180),
+    )
 }
 
 pub(in crate::d1_roi::native::component) fn names_at(
@@ -22,7 +31,10 @@ pub(in crate::d1_roi::native::component) fn names_at(
 ) -> Result<Vec<u32>> {
     let r = p.pointer(24)?;
     let inputs = p.array(p.pointer(16)? + instance_field, 88, Some(0x8080077D))?;
-    let definitions = p.array(r + definition_field, 48, Some(0x80800927))?;
+    // PS4 definitions are 40 bytes, with the 808003E8 marker as a word at +28 and the name
+    // at +32, as model material inputs are.
+    let ps4 = source.platform() == 7;
+    let definitions = p.array(r + definition_field, source.field(48, 40), Some(0x80800927))?;
     ensure!(
         inputs.len() == definitions.len(),
         "Source light input count differs"
@@ -31,13 +43,18 @@ pub(in crate::d1_roi::native::component) fn names_at(
     let owners = entity.array(0x20, 12, Some(0x80800715))?;
     let mut names = Vec::new();
     for (input, def) in inputs.into_iter().zip(definitions) {
+        let marker = if ps4 {
+            u64::from(p.u32(def + 28)?)
+        } else {
+            p.u64(def + 32)?
+        };
         ensure!(
             p.u64(input + 8)? == def as u64
                 && p.u64(def + 8)? == input as u64
-                && p.u64(def + 32)? == 0x808003E8,
+                && marker == 0x808003E8,
             "Source light input definition differs"
         );
-        let name = p.u32(def + 40)?;
+        let name = p.u32(def + source.field(40, 32))?;
         let matching = links
             .iter()
             .copied()
@@ -67,7 +84,9 @@ pub(in crate::d1_roi::native::component) fn names_at(
             bank.u32(schema - 4)? == 0x808008F6 && entity.u64(a + 56)? == (schema + 0x60) as u64,
             "Source light input is not a body channel"
         );
-        let rows = bank.array(schema + 0xD8, 112, Some(0x80800883))?;
+        // The connection names the bank pointer plus 0x60 on both platforms; PS4 bank rows
+        // sit 0x20 earlier, with the rest of its schema block.
+        let rows = bank.array(schema + source.field(0xD8, 0xB8), 112, Some(0x80800883))?;
         let channel = usize::try_from(entity.u64(a + 80)?)?;
         ensure!(
             bank.u32(*rows.get(channel).context("Source light channel index")?)? == name,

@@ -48,6 +48,27 @@ impl Component {
     }
 }
 
+/// Diagnostic only: `PARHELION_D1_DEBUG_INPUT_REMAP=FROM=TO[,FROM=TO…]` (hex channel names)
+/// rebinds model material inputs to another channel of the same bank, so an in-game test can
+/// tell which link of a channel-driven effect fails. Unset in normal imports.
+pub(super) fn debug_input_remap() -> Result<Option<BTreeMap<u32, u32>>> {
+    let Ok(text) = std::env::var("PARHELION_D1_DEBUG_INPUT_REMAP") else {
+        return Ok(None);
+    };
+    let mut remap = BTreeMap::new();
+    for pair in text.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let (from, to) = pair
+            .split_once('=')
+            .context("Debug input remap pairs are FROM=TO")?;
+        let parse = |s: &str| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16);
+        remap.insert(
+            parse(from).context("Debug input remap source name")?,
+            parse(to).context("Debug input remap target name")?,
+        );
+    }
+    Ok(Some(remap))
+}
+
 fn replace_owner(p: &mut Payload, before: u32, after: u32) -> Result<()> {
     for at in (0..p.0.len().saturating_sub(15)).step_by(4) {
         if p.u32(at)? == before {
@@ -160,7 +181,14 @@ impl Assembly<'_> {
             );
             names.push(source.u32(def + self.source.field(40, 32))?);
         }
-        Ok(names)
+        Ok(debug_input_remap()?
+            .map(|remap| {
+                names
+                    .iter()
+                    .map(|name| remap.get(name).copied().unwrap_or(*name))
+                    .collect()
+            })
+            .unwrap_or(names))
     }
 
     fn inputs(&mut self, source: &Payload, component: &mut Component) -> Result<()> {
@@ -237,6 +265,18 @@ impl Assembly<'_> {
         let source_entity_tag =
             u32::try_from(body["entity"].as_u64().context("Source body entity")?)?;
         let source_entity = self.source.read(source_entity_tag)?;
+        if let Some(remap) = debug_input_remap()? {
+            let pairs = remap
+                .iter()
+                .map(|(f, t)| format!("{f:08X}={t:08X}"))
+                .collect::<Vec<_>>();
+            self.approximations.insert(format!(
+                "DIAGNOSTIC BUILD: model material inputs remapped ({}). Not for normal use.",
+                pairs.join(",")
+            ));
+            self.evidence
+                .push(json!({"source_entity":source_entity_tag,"debug_input_remap":pairs}));
+        }
         let mut components = Vec::new();
         let mut source_owners = BTreeMap::new();
         let mut bank = None;
@@ -400,10 +440,29 @@ impl Assembly<'_> {
                     self.evidence.push(json!({"source_component":tag,"resource_class":class,
                         "omitted":"Source auxiliary sight effects require separate runtime translation"}));
                 }
-                // PS4 light layouts are unmeasured, so PS4 keeps omitting them.
-                0x80801B6F if self.weapon => {
+                // PS4 lights stay omitted by default: converting them changed how a grafted
+                // native firing graph's effects look in game. `PARHELION_D1_PS4_LIGHTS=1` opts in
+                // for testing; it uses the measured PS4 layout, and a light that still differs is
+                // omitted with its reason rather than failing the import.
+                0x80801B6F if self.weapon && std::env::var_os("PARHELION_D1_PS4_LIGHTS").is_none() => {
                     self.evidence.push(json!({"source_component":tag,"resource_class":class,
                         "omitted":"Source auxiliary sight effects require separate runtime translation"}));
+                }
+                0x80801B6F if self.weapon => {
+                    let (nodes, evidence) = (self.nodes.len(), self.evidence.len());
+                    let (symbols, approximations) = (self.symbols.clone(), self.approximations.clone());
+                    match self.light(tag, ordinal, &source, &source_entity, &name, components.len()) {
+                        Ok(component) => components.push(component),
+                        Err(error) => {
+                            crate::cancellation::check()?;
+                            self.nodes.truncate(nodes);
+                            self.symbols = symbols;
+                            self.evidence.truncate(evidence);
+                            self.approximations = approximations;
+                            self.evidence.push(json!({"source_component":tag,"resource_class":class,
+                                "omitted":format!("Source light differs: {error:#}")}));
+                        }
+                    }
                 }
                 0x80800610 if self.weapon && !ps4 && source.u64(sr + 0x190)? != 0 => {
                     source_owners.insert(ordinal, components.len());

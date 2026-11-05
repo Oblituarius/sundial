@@ -129,9 +129,18 @@ pub(super) fn lift(
     };
     let mut linkage = exports.clone();
     linkage.sort_unstable_by_key(|(_, param)| *param);
-    let linkage = linkage.into_iter().map(|(semantic, _)| semantic).collect::<Vec<_>>();
-    let vertex_hlsl = lift::hlsl(&vertex_header, &vertex_code, elements, &[], &Default::default())
-        .with_context(|| format!("Source vertex program {vertex:08X}"))?;
+    let linkage = linkage
+        .into_iter()
+        .map(|(semantic, _)| semantic)
+        .collect::<Vec<_>>();
+    let vertex_hlsl = lift::hlsl(
+        &vertex_header,
+        &vertex_code,
+        elements,
+        &[],
+        &Default::default(),
+    )
+    .with_context(|| format!("Source vertex program {vertex:08X}"))?;
     let pixel_hlsl = lift::hlsl(&pixel_header, &pixel_code, &[], &linkage, cubes)
         .with_context(|| format!("Source pixel program {pixel:08X}"))?;
     let (vertex_code, _) = crate::tiger::shader::compile(&vertex_hlsl, true)
@@ -155,7 +164,9 @@ mod tests {
     #[test]
     #[ignore]
     fn lift_surveyed_effect_programs() {
-        let Ok(dir) = std::env::var("GCN_FX_DIR") else { return };
+        let Ok(dir) = std::env::var("GCN_FX_DIR") else {
+            return;
+        };
         let dir = std::path::Path::new(&dir);
         let read = |kind: &str, tag: &str| -> (Payload, Vec<u8>) {
             let base = dir.join(kind).join(tag);
@@ -165,7 +176,10 @@ mod tests {
             )
         };
         let mut pairs = BTreeSet::new();
-        for line in std::fs::read_to_string(dir.join("materials.txt")).unwrap().lines() {
+        for line in std::fs::read_to_string(dir.join("materials.txt"))
+            .unwrap()
+            .lines()
+        {
             let words = line.split_whitespace().collect::<Vec<_>>();
             if words.len() == 5 && words[4] != "FFFFFFFF" && words[2] != "FFFFFFFF" {
                 pairs.insert((words[2].to_owned(), words[4].to_owned()));
@@ -184,7 +198,9 @@ mod tests {
                 let (ph, pc) = read("ps", ps);
                 let (vh, vc) = parse(&vh, &vc, true)?;
                 let (ph, pc) = parse(&ph, &pc, false)?;
-                let Interface::Vertex { exports, inputs } = &vh.interface else { unreachable!() };
+                let Interface::Vertex { exports, inputs } = &vh.interface else {
+                    unreachable!()
+                };
                 let mut params = exports.clone();
                 params.sort_unstable_by_key(|(_, p)| *p);
                 let linkage = params.iter().map(|(s, _)| *s).collect::<Vec<_>>();
@@ -210,7 +226,10 @@ mod tests {
                 *reasons.entry(key).or_default() += 1;
             }
         }
-        println!("pixel programs {} lifted {lifted} compiled {compiled}", pixels.len());
+        println!(
+            "pixel programs {} lifted {lifted} compiled {compiled}",
+            pixels.len()
+        );
         let mut reasons = reasons.into_iter().collect::<Vec<_>>();
         reasons.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
         for (reason, n) in reasons.iter().take(40) {
