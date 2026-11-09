@@ -147,3 +147,78 @@ fn fingerprint(outputs: &[i16]) -> u32 {
     }
     hash.max(1)
 }
+
+/// The stock weapons that lend a weapon the first-person animations of a content group no stock
+/// weapon carries any more, such as a Rise of Iron weapon whose group's attachment row Shadowkeep
+/// kept: `donor` plays that row's clips for every action, otherwise `actions` lends each action
+/// that one candidate plays. Actions the base already plays that way are not lent.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct GroupAnimations {
+    pub(crate) donor: Option<u32>,
+    pub(crate) actions: BTreeMap<AnimationAction, u32>,
+}
+
+/// What `group`'s attachment row plays on `base`'s rig, lent by the first of `candidates` that
+/// plays the same, in their order. `None` when the base's attachment owner has no row for the
+/// group, or the base already plays it.
+pub(crate) fn group_animations(
+    manager: &PackageManager,
+    base: u32,
+    group: u32,
+    candidates: &[u32],
+) -> AuthoringResult<Option<GroupAnimations>> {
+    use crate::weapon::animations::{arms_rig, group_profile, profile};
+    use sundial::package_authoring::runtime::load_weapon_runtime_entity_for_item_with_manager as entity;
+    let base_source = entity(manager, base).map_err(invalid)?;
+    let own_group = Some(base_source.weapon_content_group_hash);
+    let Some(target) = group_profile(manager, &base_source.payload, group)? else {
+        return Ok(None);
+    };
+    let own = profile(manager, &base_source.payload, own_group)?;
+    if own.owner != target.owner {
+        return Ok(None);
+    }
+    // Every row of one attachment owner plays on the same arms rig, so one machine answers
+    // for the base, the group and every candidate of that owner.
+    let rig = arms_rig(manager, &base_source.payload, own_group)?;
+    let machine = Machine::read(rig.states, &rig.parameters)?;
+    let plays =
+        |key: u32| AnimationAction::ALL.map(|action| machine.outputs(action, key).ok().flatten());
+    let wanted = plays(target.keys[1]);
+    let base_plays = plays(own.keys[1]);
+    if wanted == base_plays {
+        return Ok(None);
+    }
+    let mut actions = BTreeMap::new();
+    for &item in candidates {
+        let Ok(source) = entity(manager, item) else {
+            continue;
+        };
+        let Ok(lent) = profile(
+            manager,
+            &source.payload,
+            Some(source.weapon_content_group_hash),
+        ) else {
+            continue;
+        };
+        if lent.owner != target.owner {
+            continue;
+        }
+        let lends = plays(lent.keys[1]);
+        if lends == wanted {
+            return Ok(Some(GroupAnimations {
+                donor: Some(item),
+                actions: BTreeMap::new(),
+            }));
+        }
+        for (index, action) in AnimationAction::ALL.into_iter().enumerate() {
+            if wanted[index] != base_plays[index] && lends[index] == wanted[index] {
+                actions.entry(action).or_insert(item);
+            }
+        }
+    }
+    Ok((!actions.is_empty()).then_some(GroupAnimations {
+        donor: None,
+        actions,
+    }))
+}

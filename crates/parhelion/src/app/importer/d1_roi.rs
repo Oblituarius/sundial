@@ -187,7 +187,13 @@ impl PackageAuthoringApp {
             };
             match bases {
                 Some(bases) => {
-                    source.prepare_weapon_on_base(*hash, native, bases, &output, &options, progress)
+                    let recipe = source.prepare_weapon_on_base(
+                        *hash, native, bases, &output, &options, progress,
+                    )?;
+                    progress("Matching first-person animations".to_owned());
+                    super::animations::lend(native, &recipe, bases)
+                        .map_err(|error| error.context("Match first-person animations"))?;
+                    Ok(recipe)
                 }
                 None => source.prepare_armor(*hash, native, &donors, &output, &options, progress),
             }

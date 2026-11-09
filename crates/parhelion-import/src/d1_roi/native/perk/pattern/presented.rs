@@ -102,10 +102,54 @@ pub(super) fn bank(source: &Source, graph: &Payload) -> Result<Option<Presented>
 /// Whether a component class is the engine's network replication component, which a native
 /// attachment brings with it. Its schema tag names the class, the same in both builds.
 fn replicator(source: &Source, class: u32) -> Result<bool> {
+    schema_named(source, class, b"c_network_component_tag_instance")
+}
+
+/// Whether a component class is defined by a schema tag that names `name`.
+fn schema_named(source: &Source, class: u32, name: &[u8]) -> Result<bool> {
     if source.reference(class).ok() != Some(0x80800000) {
         return Ok(false);
     }
     let schema = source.read(class)?;
-    let name = b"c_network_component_tag_instance";
     Ok(schema.0.windows(name.len()).any(|window| window == name))
+}
+
+/// The component count of a pattern that only presents its effect: a channel bank and the
+/// scalar sequence that animate effects, lights and audio, a player status icon, and the network
+/// replicator. None of them changes gameplay, and source effect presentation has no native
+/// translation, so the attachment is left out and counted. Empyrean Bellicose's Antigrav
+/// Thrusters attaches one (`80A7E2EA`: thruster effects with two lights and two audio events,
+/// and its HUD icon) beside the airborne accuracy bank that is its gameplay. `None` when any
+/// component has another kind or any connection leaves the pattern.
+pub(super) fn presentation_only(source: &Source, graph: &Payload) -> Result<Option<usize>> {
+    let owners = graph
+        .array(32, 12, Some(0x80800715))?
+        .into_iter()
+        .map(|at| graph.u32(at))
+        .collect::<Result<BTreeSet<_>>>()?;
+    for &owner in &owners {
+        if source.reference(owner)? != 0x80800861 {
+            return Ok(None);
+        }
+        let p = source.read(owner)?;
+        let runtime = p.u32(p.pointer(16)? - 4)?;
+        let settings = p.u32(p.pointer(24)? - 4)?;
+        let presentation = matches!(
+            (runtime, settings),
+            (0x8080079A, 0x80800610) | (0x80800594, 0x808008F6)
+        ) || replicator(source, runtime)?
+            || schema_named(source, settings, b"c_player_status_icon_definition")?;
+        if !presentation {
+            return Ok(None);
+        }
+    }
+    if owners.is_empty() || graph.bytes::<16>(0x40)? != [0; 16] {
+        return Ok(None);
+    }
+    for at in graph.array(0x30, 88, Some(0x8080054E))? {
+        if !owners.contains(&graph.u32(at + 8)?) || !owners.contains(&graph.u32(at + 48)?) {
+            return Ok(None);
+        }
+    }
+    Ok(Some(owners.len()))
 }

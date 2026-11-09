@@ -105,6 +105,50 @@ const BORROWED_TECHNIQUES: [(usize, u16, u32); 28] = [
 /// Shadowkeep gear plates and dyes.
 const LIFTED_STAGES: [usize; 5] = [6, 7, 8, 9, 11];
 
+/// The sight reticle stage. Its programs carry the reticle projection, the sight depth row and
+/// the reticle mask load the Xbox One path rewrites, and no stock gear technique draws it, so a
+/// PS4 reticle draw always lifts its GCN programs and has no borrowed fallback.
+pub(super) const RETICLE_STAGE: usize = 16;
+
+/// The sight lens stage. Native reticle pixel programs discard every pixel whose reticle mask
+/// lacks bit 2, which a native sight gets from a stage-14 lens drawn in front of it. A Rise of
+/// Iron sight sets the bit through its own draws' render state and has no stage-14 draw, so
+/// its reticle draws get a lens over their own faces (the D2 importer's `lenses` does the same
+/// for source reticles without one).
+pub(super) const LENS_STAGE: usize = 14;
+
+/// The stock gear lens material borrowed for stage 14 on layout 139 (`BORROWED_TECHNIQUES`):
+/// no pixel outputs beyond the stencil, no textures and no expression.
+const LENS_MATERIAL: u32 = 0x80EF5148;
+/// A stock sight reticle material (also the source of [`NATIVE_SIGHT_DEPTH`]).
+const RETICLE_MATERIAL: u32 = 0x80BA7DA2;
+
+/// Rise of Iron sight reticles that Shadowkeep ported: the source reticle's pixel program and
+/// slot-0 dot texture, the stock technique drawing the port, and the input channel names of the
+/// stock model component that technique was authored for (object input `n` reads name `n`).
+///
+/// The First Curse's reticle (`80A734AE`: pixel program `80A3D246`, dot `80A3D241`, flare
+/// `80A743B4`) is The Last Word's (`815287EC`, component `815287EF`, models `815287EE` and
+/// `81A6AAD1`). The stock pixel expression is the source one with the same constants, the same
+/// two object inputs (`0E36F79F` power glow, `79FD498A` visibility) and Shadowkeep's HDR output
+/// reads (extern `5C`, which only reticle techniques read, always with extern `49`), and it binds
+/// the same dot and flare pair redrawn (`80BC5C5C`, `815287EB`, plain 2D textures).
+/// The lifted D1 programs never drew the dot in game; the stock port draws it as Shadowkeep does.
+const PORTED_RETICLES: [(u32, u32, u32, &[u32]); 1] = [(
+    0x80A3D246,
+    0x80A3D241,
+    0x815287EC,
+    &[0x0E36F79F, 0x32CC5402, 0x79FD498A, 0x9F7F13A9, 0xF061CA4E],
+)];
+
+/// A reticle vertex expression's tail: extern `0x49` field 4 (the reticle viewport) into one
+/// constant row. The client sets extern `0x49` only for the reticle stage, so the lens drops
+/// it and that row keeps the material's own value.
+const RETICLE_VIEWPORT_READ: [u8; 3] = [0x3D, 0x49, 4];
+/// A native material's vertex and pixel stage blocks.
+const VERTEX: usize = 0x48;
+const PIXEL: usize = 0x2C8;
+
 /// The gear extern, a single vector that every stock gear pixel program on layouts 30 and
 /// 138 reads. Only the gear feature renderer binds it, to zero, for each batch it draws
 /// (`0x11B94E3` in the Shadowkeep executable). An imported item draws through the rigid
@@ -289,7 +333,7 @@ fn scope_masks(
         // such as `80BA7DA2`) requests the gear dye scope (26) at +0x18 and provides the
         // plated-texture and dye scopes (25, 26) at +0x1C, which the gear draw callback keys
         // on. D1 has no scope of those names, so the mapped mask never set them.
-        if pass == 16 {
+        if pass == RETICLE_STAGE {
             mask |= if index == 0 {
                 1 << 26
             } else {
@@ -800,6 +844,235 @@ impl Assembly<'_> {
         self.node(symbol, template, &out, None, &patches)
     }
 
+    /// The stage-14 lens over the reticle material `reticle`: the stock lens's render state and
+    /// pixel side with the reticle's own vertex side, so the lens covers exactly the reticle's
+    /// pixels and sets their mask bit.
+    /// Every stock reticle draw (1,410 stage-16 parts, `stagehdr`, 2026-11-06) has header word
+    /// `+0x14` = `0x10000200`, a value no other stage uses, and no opaque bit (31) in its `+0x1C`
+    /// scopes, which only opaque stages set. The word requests per-draw resources: stock reticle
+    /// pixel programs read the sight's lens mask from the slot after their own textures, and
+    /// D1's `0x800` is no Shadowkeep request. A reticle keeps its source state selector
+    /// (`+0x0C`: D1 sights use 6, as stock `815287EC` does) and its mapped scopes.
+    /// The Xbox One path keeps its source state.
+    fn native_reticle_state(&mut self, pass: usize, out: &mut [u8]) -> Result<()> {
+        if pass != RETICLE_STAGE || self.source.platform() != 7 {
+            return Ok(());
+        }
+        let shell = self.native.tag(RETICLE_MATERIAL, Some(0x808071E8))?;
+        ensure!(
+            shell.u32(8)? == 1
+                && shell.u32(24)? == 0x0400_2083
+                && shell.u32(28)? == 0x0600_2083
+                && shell.u32(32)? == 0x88,
+            "Native reticle material contract differs"
+        );
+        if super::super::shader::debug_reticle_unmasked() {
+            self.approximations.insert(
+                "DIAGNOSTIC BUILD: reticle pixels drawn without the lens mask. Not for normal use."
+                    .to_owned(),
+            );
+        }
+        out[0x10..0x18].copy_from_slice(&shell.0[0x10..0x18]);
+        let scopes = u32::from_le_bytes(out[0x1C..0x20].try_into()?) & 0x7FFF_FFFF;
+        put(out, 0x1C, &scopes.to_le_bytes())
+    }
+
+    /// The stock technique of a PS4 reticle that Shadowkeep ported ([`PORTED_RETICLES`]), copied
+    /// whole: its programs, render state, scopes, textures and expressions. Its object inputs
+    /// are re-indexed by channel name into this component's inputs, and its sight depth row
+    /// carries the plane of the source quad. `None` when the reticle has no port.
+    fn ported_reticle(&mut self, tag: u32, symbol: &str) -> Result<Option<String>> {
+        if self.source.platform() != 7 {
+            return Ok(None);
+        }
+        let source = self.source.read(tag)?;
+        let pixel = source.u32(0x2A8)?;
+        let mut dot = None;
+        for row in source.array(0x2A8 + 0x10, 8, Some(0x80801B28))? {
+            if source.u32(row)? == 0 {
+                dot = Some(source.u32(row + 4)?);
+            }
+        }
+        let Some((technique, inputs)) = PORTED_RETICLES
+            .iter()
+            .find(|(program, texture, ..)| *program == pixel && Some(*texture) == dot)
+            .map(|(.., technique, inputs)| (*technique, *inputs))
+        else {
+            return Ok(None);
+        };
+        let stock = self.native.tag(technique, Some(0x808071E8))?;
+        ensure!(
+            stock.u32(0x14)? == 0x1000_0200
+                && stock.u32(0x1C)? >> 31 == 0
+                && [0xE8, 0x188, 0x228].into_iter().all(|to| stock
+                    .u32(to)
+                    .is_ok_and(|shader| matches!(shader, 0 | u32::MAX)))
+                && stock.u32(VERTEX + 0x70)? == 0
+                && stock.u32(PIXEL + 0x70)? as usize == inputs.len(),
+            "Ported reticle technique {technique:08X} differs from its contract"
+        );
+        let mut out = stock.0.clone();
+        // The stock quad's plane (2.25 for The Last Word) belongs to the stock quad; the source
+        // quad's dimensions are those of the stock sights drawn at `NATIVE_SIGHT_DEPTH`.
+        let vertex = stock.u32(VERTEX)?;
+        let bytecode = self.native.tag(self.native.reference(vertex)?, None)?;
+        let row = usize::from(super::super::shader::sight_depth_row(&bytecode.0)?);
+        let values = stock.array_range(VERTEX + 0x50, 16, Some(0x80800090))?;
+        let at = values.start + row * 16;
+        ensure!(
+            at + 16 <= values.end,
+            "Ported reticle sight depth row exceeds its initial vectors"
+        );
+        put(&mut out, at, &NATIVE_SIGHT_DEPTH.to_le_bytes())?;
+        // Object input `n` reads this component's input `n`: re-index each read by name.
+        let code = stock.array_range(PIXEL + 0x20, 1, Some(0x80800009))?;
+        let mut remapped = Vec::new();
+        let mut at = code.start;
+        while at < code.end {
+            let op = stock.0[at];
+            let length = 1 + operand_bytes(op)?;
+            ensure!(
+                at + length <= code.end,
+                "Truncated stock expression instruction"
+            );
+            ensure!(
+                !(0x3C..=0x41).contains(&op) || stock.0[at + 1] != GEAR_EXTERN,
+                "Ported reticle technique reads the gear extern"
+            );
+            if op == 0x4D {
+                let name = *inputs
+                    .get(usize::from(stock.0[at + 1]))
+                    .context("Ported reticle object input exceeds its stock inputs")?;
+                let index = self
+                    .object_channels
+                    .iter()
+                    .position(|channel| *channel == name)
+                    .with_context(|| {
+                        format!("Sight component has no input {name:08X} for its ported reticle")
+                    })?;
+                out[at + 1] = u8::try_from(index)?;
+                remapped.push(
+                    json!({"channel":format!("{name:08X}"),"stock":stock.0[at + 1],"input":index}),
+                );
+            }
+            at += length;
+        }
+        put(
+            &mut out,
+            PIXEL + 0x70,
+            &u32::try_from(self.object_channels.len())?.to_le_bytes(),
+        )?;
+        self.approximations.insert(
+            "PS4 sight reticles that Shadowkeep ported draw with the stock port's technique and textures".to_owned(),
+        );
+        self.evidence
+            .push(json!({"material":tag,"symbol":symbol,"pass":RETICLE_STAGE,
+            "ported_reticle":format!("{technique:08X}"),"sight_depth_row":row,
+            "native_sight_depth":NATIVE_SIGHT_DEPTH,"object_inputs":remapped}));
+        let template = self.class_template(0x808071E8)?;
+        self.node(symbol, template, &out, None, &[]).map(Some)
+    }
+
+    pub(super) fn reticle_lens(&mut self, reticle: &str) -> Result<String> {
+        let symbol = format!("{reticle}-lens");
+        if self.symbols.contains(&symbol) {
+            return Ok(symbol);
+        }
+        let node = self
+            .nodes
+            .iter()
+            .find(|node| node["symbol"] == reticle)
+            .context("Reticle material for its lens")?
+            .clone();
+        let mut out = fs::read(
+            self.folder
+                .join(node["file"].as_str().context("Reticle material file")?),
+        )?;
+        let reticle_material = Payload(out.clone());
+        let shell = self.native.tag(LENS_MATERIAL, Some(0x808071E8))?;
+        ensure!(
+            shell.u32(8)? == 1
+                && shell.u32(24)? == 0x83
+                && shell.u32(28)? == 0x0200_0083
+                && shell.u32(32)? == 0
+                && !matches!(shell.u32(PIXEL)?, 0 | u32::MAX)
+                && [8, 0x20, 0x30, 0x40, 0x50]
+                    .into_iter()
+                    .all(|field| shell.u64(PIXEL + field).ok() == Some(0)),
+            "Native lens material contract differs"
+        );
+        // The stock lens's state and scopes, and its whole pixel side, whose arrays are empty.
+        out[8..0x48].copy_from_slice(&shell.0[8..0x48]);
+        out[PIXEL..PIXEL + 0xA0].copy_from_slice(&shell.0[PIXEL..PIXEL + 0xA0]);
+        // Without the reticle stage's viewport read the vertex constants keep their values.
+        let code = reticle_material.array(VERTEX + 0x20, 1, Some(0x80800009))?;
+        let bytes = code
+            .iter()
+            .map(|&at| reticle_material.0[at])
+            .collect::<Vec<_>>();
+        let tail = bytes.len().checked_sub(5);
+        ensure!(
+            tail.is_some_and(|tail| bytes[tail..tail + 3] == RETICLE_VIEWPORT_READ
+                && bytes[tail + 3] == 0x43
+                && !bytes[..tail].windows(2).any(|pair| pair == [0x3D, 0x49])),
+            "Reticle vertex expression differs from the lens contract"
+        );
+        put(
+            &mut out,
+            VERTEX + 0x20,
+            &(tail.context("Reticle vertex expression")? as u64).to_le_bytes(),
+        )?;
+        // Pixel texture and sampler rows of the reticle stay in the payload unreferenced, so
+        // their relocations go with them.
+        let dropped = [8, 0x40]
+            .into_iter()
+            .map(|field| {
+                let stride = if field == 8 { 8 } else { 16 };
+                Ok(reticle_material
+                    .array(PIXEL + field, stride, None)?
+                    .into_iter()
+                    .map(move |at| at..at + stride))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let patches = node["patches"]
+            .as_array()
+            .context("Reticle material relocations")?
+            .iter()
+            .map(|patch| {
+                Ok((
+                    usize::try_from(patch["offset"].as_u64().context("Relocation offset")?)?,
+                    patch["symbol"]
+                        .as_str()
+                        .context("Relocation symbol")?
+                        .to_owned(),
+                ))
+            })
+            .collect::<Result<Vec<(usize, String)>>>()?
+            .into_iter()
+            .filter(|(offset, _)| {
+                *offset != PIXEL && !dropped.iter().any(|range| range.contains(offset))
+            })
+            .collect::<Vec<_>>();
+        for (offset, _) in &patches {
+            ensure!(
+                out.get(*offset..offset + 4) == Some(&u32::MAX.to_le_bytes()[..]),
+                "Reticle lens relocation lost its placeholder"
+            );
+        }
+        if let Some(bake) = self.vertex_bakes.get(reticle).copied() {
+            self.vertex_bakes.insert(symbol.clone(), bake);
+        }
+        let template = u32::try_from(node["template"].as_u64().context("Reticle template")?)?;
+        self.evidence
+            .push(json!({"material":reticle,"symbol":symbol,"pass":LENS_STAGE,
+            "lens_material":format!("{LENS_MATERIAL:08X}"),
+            "approximation":"reticle_lens_over_reticle_faces"}));
+        self.node(&symbol, template, &out, None, &patches)
+    }
+
     pub(super) fn material(
         &mut self,
         tag: u32,
@@ -817,10 +1090,24 @@ impl Assembly<'_> {
             "Source material class differs"
         );
         if ps4_source {
-            if LIFTED_STAGES.contains(&draw.stage)
+            if draw.stage == RETICLE_STAGE
+                && let Some(symbol) = self.ported_reticle(tag, symbol)?
+            {
+                return Ok(symbol);
+            }
+            if (LIFTED_STAGES.contains(&draw.stage) || draw.stage == RETICLE_STAGE)
                 && let Some(symbol) = self.lifted_material(tag, symbol, &draw, equipment)?
             {
                 return Ok(symbol);
+            }
+            if draw.stage == RETICLE_STAGE {
+                let reason = self
+                    .evidence
+                    .last()
+                    .and_then(|row| row["gcn_lift_error"].as_str())
+                    .unwrap_or("unknown")
+                    .to_owned();
+                anyhow::bail!("PS4 sight reticle program does not lift: {reason}");
             }
             return self.borrowed_technique(tag, symbol, &draw, equipment);
         }
@@ -951,6 +1238,7 @@ impl Assembly<'_> {
         };
         put(&mut out, 0x28, &u32::MAX.to_le_bytes())?;
         let masks = scope_masks(&source, &self.globals, simulated, pass, &mut out)?;
+        self.native_reticle_state(pass, &mut out)?;
         let depth = (source.u32(0x1C)? & (1 << self.globals.depth.index) != 0)
             .then_some(self.globals.depth);
         let mut patches = Vec::new();
@@ -982,15 +1270,21 @@ impl Assembly<'_> {
                 code,
                 constants,
             } = self.material_inputs(&source, from)?;
-            if pass == 16 && index == 0 {
+            if pass == RETICLE_STAGE && index == 0 {
                 // The sight quad's z is offset by this row before reticle matrix six. Stock
                 // sights carry a per-weapon constant (2.5 on the two stock sights whose quad
                 // has this quad's dimensions, 1.2 to 25 across all 18), and the game builds
                 // the matrix for that plane. D1's own 1.0 belongs to D1's projection and
                 // drew the quad 2.5 times too large with a corner on the lens centre.
-                let program = self.source.read(shader)?;
-                let range = program.array_range(8, 1, Some(0x80800009))?;
-                let row = usize::from(super::super::shader::sight_depth_row(&program.0[range])?);
+                // A lifted PS4 sight reads the row from its lifted vertex program.
+                let row = usize::from(match lifted {
+                    Some((programs, _)) => super::super::shader::sight_depth_row(&programs.vertex)?,
+                    None => {
+                        let program = self.source.read(shader)?;
+                        let range = program.array_range(8, 1, Some(0x80800009))?;
+                        super::super::shader::sight_depth_row(&program.0[range])?
+                    }
+                });
                 let at = row * 16;
                 ensure!(
                     values.len() >= at + 16,
@@ -1020,7 +1314,7 @@ impl Assembly<'_> {
                     outputs: values.len() / 16,
                     samplers: samplers.len(),
                     stage: packed,
-                    reticle: pass == 16,
+                    reticle: pass == RETICLE_STAGE,
                     light: false,
                 },
             )?;

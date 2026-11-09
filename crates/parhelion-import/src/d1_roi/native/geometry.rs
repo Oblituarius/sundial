@@ -1,4 +1,4 @@
-use super::material::{Draw, Equipment};
+use super::material::{Draw, Equipment, LENS_STAGE, RETICLE_STAGE};
 use super::*;
 
 pub(super) struct Model {
@@ -37,7 +37,28 @@ fn primitives(indices: &[u32], primitive: u16, restart: u32) -> Result<u32> {
     Ok(u32::try_from(count)?)
 }
 
+/// The native layout of stock sight draws. Stock stage-16 reticle parts use layout 137
+/// (1,454 parts) or 122 (2), and stage-14 lenses 139 (1,104), 137 (107) or 122 (2)
+/// (`stagehdr`, 2026-11-07). Layout 123 declares the same streams as 137, but no stock draw
+/// uses it on stages 2, 3, 12, 14 or 16, so the layout identity itself selects the passes a
+/// draw joins, and a reticle on 123 never drew in game.
+const SIGHT_LAYOUT: u16 = 137;
+
 impl Assembly<'_> {
+    /// A PS4 sight draw (reticle or added lens) whose declaration matched another layout with
+    /// [`SIGHT_LAYOUT`]'s exact streams takes [`SIGHT_LAYOUT`], so the same vertex buffers feed
+    /// it. Xbox One draws keep the first matching layout.
+    fn sight_layout(&self, layout: u16, stage: usize) -> u16 {
+        if self.source.platform() == 7
+            && matches!(stage, LENS_STAGE | RETICLE_STAGE)
+            && self.layouts.same_streams(layout, SIGHT_LAYOUT)
+        {
+            SIGHT_LAYOUT
+        } else {
+            layout
+        }
+    }
+
     /// Store each constant source vertex offset (`vertex_bakes`) in the positions its draws
     /// read. Stock program `80C0CEC3` adds `(COLOR - 0.5) * scale` after the model transform
     /// (`v0 * cb11[5].w + cb11[5].xyz`), so the offset is divided by the uniform model scale
@@ -338,36 +359,54 @@ impl Assembly<'_> {
             let mut materials = Vec::new();
             let mut draws = Vec::new();
             let mut covered = 0;
-            for stage in 0..23 {
-                let (start, end) = if stage < 19 {
+            let stage_range = |stage: usize| -> Result<(usize, usize)> {
+                Ok(if stage < 19 {
                     (
                         source.u16(mesh + 0x58 + stage * 2)? as usize,
                         source.u16(mesh + 0x5A + stage * 2)? as usize,
                     )
                 } else {
                     (parts.len(), parts.len())
-                };
+                })
+            };
+            // A lifted PS4 reticle with no source lens gets one over its own draws
+            // (`LENS_STAGE`). Those rows join the native table, so native stage starts and
+            // draw ordinals count rows, not source records.
+            let (lens, reticle) = (stage_range(LENS_STAGE)?, stage_range(RETICLE_STAGE)?);
+            let lenses = self.source.platform() == 7 && lens.0 == lens.1 && reticle.0 < reticle.1;
+            for stage in 0..23 {
+                let (start, end) = stage_range(stage)?;
                 ensure!(
                     start == covered && start <= end && end <= parts.len(),
                     "Source stages do not partition their draw records"
                 );
+                covered = end;
+                let lens_stage = lenses && stage == LENS_STAGE;
+                let (start, end, from) = if lens_stage {
+                    (reticle.0, reticle.1, RETICLE_STAGE)
+                } else {
+                    (start, end, stage)
+                };
                 put(
                     &mut out,
                     to + 0x28 + stage * 2,
-                    &u16::try_from(start)?.to_le_bytes(),
+                    &u16::try_from(rows.len() / 32)?.to_le_bytes(),
                 )?;
                 let layout = if start == end {
                     u16::MAX
                 } else {
-                    self.layouts
-                        .matching(source.u8(mesh + 0x80 + stage)?, strides)?
+                    self.sight_layout(
+                        self.layouts
+                            .matching(source.u8(mesh + 0x80 + from)?, strides)?,
+                        stage,
+                    )
                 };
                 if self.bone_map.is_some() && start != end {
                     // These declarations store rigid POSITION0 as an Int16-normalized four-vector,
                     // followed by ordinary attributes. The vertex-program guard separately
                     // rejects weighted inputs and resource-backed deformation.
                     ensure!(
-                        matches!(layout, 123 | 139)
+                        matches!(layout, 123 | SIGHT_LAYOUT | 139)
                             && strides[0] == 8
                             && strides[2] == 0
                             && strides[3] == 0,
@@ -397,19 +436,24 @@ impl Assembly<'_> {
                     );
                     let dye = source.u8(part + 0x1E)?;
                     let mat_symbol = format!(
-                        "{symbol}-material-{material:08X}-pass-{stage}-dye-{dye}-layout-{layout}-sim-{}",
+                        "{symbol}-material-{material:08X}-pass-{from}-dye-{dye}-layout-{layout}-sim-{}",
                         u8::from(simulated)
                     );
-                    let mat = self
+                    let mut mat = self
                     .material(
                         material,
                         &mat_symbol,
-                        Draw { stage, dye, simulated, layout },
+                        Draw { stage: from, dye, simulated, layout },
                         equipment,
                     )
                     .with_context(|| {
                         format!("Source model {source_tag:08X}, mesh {ordinal}, draw {index}, material {material:08X}")
                     })?;
+                    if lens_stage {
+                        mat = self.reticle_lens(&mat).with_context(|| {
+                            format!("Source model {source_tag:08X}, mesh {ordinal}, reticle draw {index} lens")
+                        })?;
+                    }
                     let mut row = vec![0; 32];
                     put(&mut row, 0, &u32::MAX.to_le_bytes())?;
                     put(&mut row, 4, &source.bytes::<12>(part + 4)?)?;
@@ -428,7 +472,7 @@ impl Assembly<'_> {
                     put(
                         &mut row,
                         22,
-                        &u16::try_from(total_parts + index)?.to_le_bytes(),
+                        &u16::try_from(total_parts + rows.len() / 32)?.to_le_bytes(),
                     )?;
                     // Source 0087E6F0 and native 0119F900 use exclusion masks
                     // 0x200/0x100 for view 8 and 0x100/0x80 for view 7. A weapon keeps no
@@ -444,6 +488,11 @@ impl Assembly<'_> {
                         (((flags & 7) | ((flags & !15) >> 1)) & !8) | if simulated { 8 } else { 0 };
                     if weapon {
                         native_flags &= !0x180;
+                    }
+                    // Reticle draws carry the translucent-stage bit 0x10, which no native
+                    // stage-14 draw does (the D2 importer's census of the stock packages).
+                    if lens_stage {
+                        native_flags &= !0x10;
                     }
                     put(&mut row, 24, &native_flags.to_le_bytes())?;
                     row[26] = dye;
@@ -476,20 +525,19 @@ impl Assembly<'_> {
                     materials.push(mat);
                     rows.extend(row);
                 }
-                covered = end;
             }
             self.bake_vertex_offsets(&draws, &indices, restart, &streams, vertices, &transform)?;
             put(
                 &mut out,
                 to + 0x56,
-                &u16::try_from(parts.len())?.to_le_bytes(),
+                &u16::try_from(rows.len() / 32)?.to_le_bytes(),
             )?;
             let start = array(&mut out, to + 0x18, 0x8080737E, &rows, 32)?;
             for (index, material) in materials.into_iter().enumerate() {
                 patches.push((start + index * 32, material));
             }
             total_parts = total_parts
-                .checked_add(parts.len())
+                .checked_add(rows.len() / 32)
                 .context("Model draw count overflow")?;
         }
         // A conservative sphere encloses the source packed-coordinate box.

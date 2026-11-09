@@ -718,6 +718,44 @@ fn stock_companion(manager: &PackageManager, owner: u32) -> AuthoringResult<(Tag
     found.ok_or_else(|| invalid("Audio parent has no shared-tag companion"))
 }
 
+/// Every component owner `pattern` binds.
+fn bound_owners(pattern: &[u8]) -> AuthoringResult<BTreeSet<u32>> {
+    let mut bound = BTreeSet::new();
+    for binding_hash in sundial::package_authoring::entity::weapon_component_binding_hashes(pattern)
+        .map_err(invalid)?
+    {
+        for binding in weapon_component_bindings(pattern, binding_hash).map_err(invalid)? {
+            bound.insert(binding.owner_tag);
+        }
+    }
+    Ok(bound)
+}
+
+/// The private copy of `owner_tag` the audio edits merge into: the imported animation's owner,
+/// or one the weapon already binds in the stock owner's place, such as the first-person
+/// attachment an animation donor's row keys rewrote. The entity no longer names the stock owner
+/// then, so a second copy could not take its binding.
+fn private_copy(
+    owner_tag: u32,
+    animation_owner: Option<u32>,
+    bound: &BTreeSet<u32>,
+    allocator: AppendedTagAllocator,
+    tags: &[NewTagSpec],
+) -> Option<u32> {
+    let copy_of_owner = |private: &u32| {
+        allocator
+            .ordinal(TagHash(*private))
+            .ok()
+            .and_then(|ordinal| tags.get(ordinal))
+            .is_some_and(|tag| tag.template_tag.0 == owner_tag)
+    };
+    animation_owner.filter(copy_of_owner).or_else(|| {
+        (!bound.contains(&owner_tag))
+            .then(|| bound.iter().copied().find(copy_of_owner))
+            .flatten()
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::item) fn author(
     manager: &PackageManager,
@@ -882,14 +920,9 @@ pub(in crate::item) fn author(
             return Err(invalid("Audio owner has no parent link"));
         }
     }
+    let bound = bound_owners(pattern)?;
     for (owner_tag, mut owner) in owners {
-        let animated_owner = animation_owner.filter(|private| {
-            allocator
-                .ordinal(TagHash(*private))
-                .ok()
-                .and_then(|ordinal| tags.get(ordinal))
-                .is_some_and(|tag| tag.template_tag.0 == owner_tag)
-        });
+        let animated_owner = private_copy(owner_tag, animation_owner, &bound, allocator, tags);
         if let Some(private) = animated_owner {
             let ordinal = allocator.ordinal(TagHash(private))?;
             let entry = tags

@@ -17,6 +17,7 @@ pub(in crate::d1_roi::native) mod label;
 mod orb;
 mod pattern;
 mod policy;
+mod record;
 mod scalar;
 mod timer;
 mod transfer;
@@ -87,6 +88,9 @@ impl Host {
                     // Ammo modifier callbacks resolve the action owner's player component,
                     // independently of an owning weapon or a triggering-weapon event.
                     4 | 7 | 10 | 11 | 12 | 19 | 27 | 28 => {}
+                    // The aim-suspension record registers on the action owner's player, as
+                    // Tome of Dawn's does from armor.
+                    31 => {}
                     // Reserve transfer resolves the player's inventory. Armor can name
                     // explicit inventory slots, but cannot supply an owning weapon amount.
                     15 => ensure!(
@@ -233,13 +237,32 @@ struct Lowered {
     grants: Vec<Value>,
 }
 
-/// Source talent perks, by identity, that run a stock Shadowkeep weapon perk instead of their
-/// own action. Each source action attaches a talent pattern that sets weapon component fields,
-/// which have no established Shadowkeep field mapping, while Shadowkeep ships the same perk:
-/// Quickdraw `4E9855BC` (`quick_draw.pattern.tft`) runs Quickdraw `2A1CBFD4` and Snapshot
-/// `5D32FF95` (`snapshot.pattern.tft`) runs Snapshot Sights `39169B67`. Rise of Iron and
-/// Shadowkeep share no sandbox perk identities, so the pairs are listed rather than looked up.
-const STOCK_EQUIVALENTS: [(u32, u32); 2] = [(0x4E98_55BC, 0x2A1C_BFD4), (0x5D32_FF95, 0x3916_9B67)];
+/// Source talent perks, by identity, that run a stock Shadowkeep perk instead of their own
+/// action, on the host kind that carries it. Shadowkeep ships the same perk, while the source
+/// action has no established translation:
+/// - Weapon Quickdraw `4E9855BC` (`quick_draw.pattern.tft`) runs Quickdraw `2A1CBFD4` and
+///   Snapshot `5D32FF95` (`snapshot.pattern.tft`) runs Snapshot Sights `39169B67`. Each source
+///   pattern sets weapon component fields with no established Shadowkeep field mapping.
+/// - Weapon Triple Tap `87FB6EF0` runs Triple Tap `CAB3DB58`. Both count precision hits to 3,
+///   one per hit held for 2 s and capped at 3, and return 1 round. The source also attaches a
+///   presentation pattern (`80A7F1F2`) the pattern translator does not admit, where the stock
+///   perk attaches its own (`80BC5833`).
+/// - Armor Better Already `7F10B78F` ("Shields start recovery immediately after Orb pickup")
+///   runs the Better Already armor perk `12807BFF` ("Your health begins to regenerate
+///   immediately after picking up an Orb of Light"), and Infusion `1ABD3D84` ("Replenishes
+///   health each time you pick up an Orb of Light") runs Recuperation `CBAA6F4A`, whose text is
+///   the same. Each source action attaches orb-pickup patterns of six components, two of them
+///   scripted banks, with no armor host contract.
+///
+/// Rise of Iron and Shadowkeep share no sandbox perk identities, so the pairs are listed rather
+/// than looked up.
+const STOCK_EQUIVALENTS: [(Host, u32, u32); 5] = [
+    (Host::Weapon, 0x4E98_55BC, 0x2A1C_BFD4),
+    (Host::Weapon, 0x5D32_FF95, 0x3916_9B67),
+    (Host::Weapon, 0x87FB_6EF0, 0xCAB3_DB58),
+    (Host::Armor, 0x7F10_B78F, 0x1280_7BFF),
+    (Host::Armor, 0x1ABD_3D84, 0xCBAA_6F4A),
+];
 
 fn conditions(
     source: &Source,
@@ -291,6 +314,7 @@ fn effect(
     let kind = data.u8(at)?;
     match (class, kind) {
         (0x80802A46, 4) => orb::read(source, data, at),
+        (0x808023AA, 31) => record::read(data, at),
         (0x808026E4, 28) => incoming::read(source, data, at, native),
         (0x808027D8, 10) | (0x80802188, 11) => scalar::ammo_modifiers(data, at, kind),
         (0x8080230E, 27) => timer::read(source, data, at, native),
@@ -564,6 +588,11 @@ const DEFAULT_SHADER: u64 = 0xFD36_8D30;
 /// Year-one armor trait mods: Plasteel Reinforcement and Restorative Mod. They are Shadowkeep's
 /// own choice, not a Rise of Iron talent, so an armor import disables the socket.
 const ARMOR_TRAIT_CATEGORY: u64 = 0xC57B_725E;
+/// Year-one weapon damage mod sockets, which Shadowkeep labels Weapon Mod: 68 offers an energy
+/// weapon's Arc, Solar or Void Damage Mod and 69 a kinetic weapon's Kinetic Damage Mod. Rise of
+/// Iron weapons have no mods and the imported weapon carries its damage type itself, so the
+/// socket holds a talent column the base's perk sockets cannot, or else is disabled.
+const DAMAGE_MOD_SOCKET_TYPES: [u64; 2] = [68, 69];
 
 /// Weapon properties whose only gameplay consumer is another weapon's firing graph, and the
 /// behavior that grafts it. Zhalo Supercell's chain lightning writes `chain_enabled`, which
@@ -885,8 +914,9 @@ fn distinct<'a>(members: Vec<&'a Choice>, merged: &mut Vec<Value>) -> Vec<&'a Ch
     kept
 }
 
-/// Translate the source talent grid onto the base's perk sockets. On an exotic, a first source
-/// column that holds one single-step node, its signature perk, takes the intrinsic socket.
+/// Translate the source talent grid onto the base's perk sockets. On an exotic, the signature
+/// perk takes the intrinsic socket: a single-step node alone in its column and named after the
+/// item, or else a first source column that holds one single-step node.
 /// Otherwise the intrinsic holds Legacy Frame, since a native frame would describe a perk the
 /// source never had.
 /// Each other source column becomes one socket, taking the base's perk sockets after its
@@ -896,10 +926,10 @@ fn distinct<'a>(members: Vec<&'a Choice>, merged: &mut Vec<Value>) -> Vec<&'a Ch
 /// randomized pool. Each choice clones a plug from
 /// its native socket's pool as its layout template, distinct while the pool lasts. A choice whose
 /// only effect sets a fixed damage type sets the recipe's damage type. Alternative damage steps
-/// share a separate socket so their private effects follow the equipped choice, and all of them
-/// stay selectable rather than rolled.
+/// would be damage mods, so only the first is kept, as the weapon's damage type.
 /// Unused perk sockets are disabled so the base's own perks do not stand in for the source's.
-/// Damage alternatives keep their source talent art, the element marks Rise of Iron drew.
+/// The base's damage mod sockets hold columns past its perk sockets before any socket is added,
+/// and are otherwise disabled, since an imported weapon offers no damage mods.
 #[allow(clippy::cognitive_complexity)]
 pub(super) fn translate(
     assembly: &mut Assembly<'_>,
@@ -952,9 +982,9 @@ pub(super) fn translate(
     let (_, extra_layouts) = self::perk_sockets(template_sockets, host)?;
     let (template_hash, templates) = templates(assembly, template_sockets, needed)?;
     let mut equivalents = BTreeMap::new();
-    for (source, plug) in STOCK_EQUIVALENTS
+    for (_, source, plug) in STOCK_EQUIVALENTS
         .into_iter()
-        .filter(|_| host == Host::Weapon)
+        .filter(|(kind, ..)| *kind == host)
     {
         let tag = crate::tiger::shadowkeep::item_tag(&mut assembly.native, plug)
             .with_context(|| format!("Stock perk plug {plug:08X}"))?;
@@ -1001,6 +1031,21 @@ pub(super) fn translate(
                 columns[index] = json!({"choices":[],"socket_type":u16::MAX});
             }
         }
+    }
+    // Damage mod sockets, in socket order, for talent columns past the base's perk sockets.
+    let mut mod_sockets = sockets
+        .iter()
+        .enumerate()
+        .filter(|(_, socket)| {
+            host == Host::Weapon
+                && socket["socket_type"]
+                    .as_u64()
+                    .is_some_and(|kind| DAMAGE_MOD_SOCKET_TYPES.contains(&kind))
+        })
+        .map(|(index, _)| index)
+        .collect::<std::collections::VecDeque<_>>();
+    for &index in &mod_sockets {
+        columns[index] = json!({"choices":[],"socket_type":u16::MAX});
     }
     let mut choices = Vec::new();
     let mut unsupported = Vec::new();
@@ -1067,14 +1112,15 @@ pub(super) fn translate(
                     };
                     let tag = u32::try_from(tag)?;
                     tags.push(tag);
-                    host.validate_action(assembly.source, tag)?;
                     let identity =
                         u32::try_from(perk["hash"].as_u64().context("Source perk identity")?)?;
+                    // A stock equivalent replaces the source action, which is not lowered.
                     if let Some((plug, indices)) = equivalents.get(&identity) {
                         stock.extend(indices.iter().copied());
                         stock_plugs.push(format!("{plug:08X}"));
                         continue;
                     }
+                    host.validate_action(assembly.source, tag)?;
                     let (mut program, omitted) =
                         program(assembly.source, tag, name, Some(&mut assembly.native))?;
                     if host == Host::Weapon {
@@ -1181,10 +1227,19 @@ pub(super) fn translate(
             damage_nodes.len() == 1,
             "Damage alternatives belong to different source nodes"
         );
-        for choice in choices.iter_mut().filter(|c| c.column == i64::MIN) {
-            choice.column = i64::MAX;
-            choice.report["damage_choice"] = json!(damage_type(&choice.lowered.raw));
-        }
+        // Alternative damage steps would be damage mods, which an imported weapon does not
+        // offer. It keeps the first source step's damage type, which the recipe can change.
+        choices.retain(|choice| {
+            let kind = (choice.column == i64::MIN)
+                .then(|| damage_type(&choice.lowered.raw))
+                .flatten();
+            if kind.is_none() || kind == damage {
+                return true;
+            }
+            unsupported.push(json!({"node":choice.node,"step":choice.report["step"],
+                "name":choice.name,"reason":"Alternative damage types are damage mods, which an imported weapon does not offer. The weapon keeps the first source damage type."}));
+            false
+        });
     }
     let mut source_columns = choices
         .iter()
@@ -1206,20 +1261,46 @@ pub(super) fn translate(
         let index = node["index"].as_u64().context("Source talent node")?;
         steps.insert(index, node["steps"].as_array().map_or(0, Vec::len));
     }
-    let signature = source_columns.first().copied().filter(|&column| {
+    // A column whose only choice is one fixed step: the shape of an exotic's signature perk.
+    let fixed = |column: i64| -> Option<&Choice> {
         let members = choices
             .iter()
             .filter(|choice| choice.column == column)
             .collect::<Vec<_>>();
-        column == 0
-            && intrinsic.is_some()
-            && source["item"]["rarity"].as_u64() == Some(EXOTIC_RARITY)
-            && members.len() == 1
+        (members.len() == 1
             && members[0].report["node"]
                 .as_u64()
                 .and_then(|node| steps.get(&node))
-                == Some(&1)
-    });
+                == Some(&1))
+        .then(|| members[0])
+    };
+    let exotic = intrinsic.is_some() && source["item"]["rarity"].as_u64() == Some(EXOTIC_RARITY);
+    let item_name = source["item"]["name"]
+        .as_str()
+        .map(|name| name.trim().to_lowercase());
+    let signature = exotic
+        .then(|| {
+            // A fixed perk named after the item is its signature wherever its column sits, as
+            // The First Curse's is in column 4 behind fixed Dead Eye and Triple Tap. Rise of
+            // Iron marks neither by node flags: Dead Eye and Empyrean Bellicose's Antigrav
+            // Thrusters both start unlocked outside an exclusive set, while The First Curse's
+            // perk unlocks later inside its own set.
+            source_columns
+                .iter()
+                .copied()
+                .find(|&column| {
+                    fixed(column).is_some_and(|choice| {
+                        item_name.as_deref() == Some(choice.name.trim().to_lowercase().as_str())
+                    })
+                })
+                .or_else(|| {
+                    source_columns
+                        .first()
+                        .copied()
+                        .filter(|&column| column == 0 && fixed(column).is_some())
+                })
+        })
+        .flatten();
     let mut ordinal = 0;
     for &column in &source_columns {
         let mut members = choices
@@ -1227,15 +1308,10 @@ pub(super) fn translate(
             .filter(|choice| choice.column == column)
             .collect::<Vec<_>>();
         members.sort_by_key(|choice| (choice.row, choice.node));
-        // Damage alternatives are steps of one node, which a roll would cut to its first step.
-        // Every damage type stays selectable instead. Armor offers every step of each talent
-        // the same way, as an owned piece can take any plug of its column's pool.
-        let (members, reusable) = if column == i64::MAX || host == Host::Armor {
-            let mut members = if host == Host::Armor {
-                distinct(members, &mut merged)
-            } else {
-                members
-            };
+        // Armor offers every step of each talent, as an owned piece can take any plug of its
+        // column's pool.
+        let (members, reusable) = if host == Host::Armor {
+            let mut members = distinct(members, &mut merged);
             for choice in members.drain(ROLL_POOL.min(members.len())..) {
                 unsupported.push(json!({"node":choice.node,"step":choice.report["step"],
                     "name":choice.name,"reason":"The column's roll pool is full"}));
@@ -1246,7 +1322,8 @@ pub(super) fn translate(
             roll(members, &mut unsupported)
         };
         // The runtime base supplies socket layouts, not a limit on source talent columns.
-        // Additional columns use a normal perk layout and still receive private plug identities.
+        // Additional columns use a normal perk layout and still receive private plug identities,
+        // in the base's damage mod socket first so they keep the base's socket order.
         let extra;
         let socket = if signature == Some(column)
             && let Some(socket) = &intrinsic
@@ -1260,12 +1337,15 @@ pub(super) fn translate(
                 .last()
                 .or_else(|| extra_layouts.last())
                 .context("Native base has no perk socket layout")?;
+            let index = mod_sockets.pop_front().unwrap_or_else(|| {
+                columns.push(Value::Null);
+                columns.len() - 1
+            });
             extra = PerkSocket {
-                index: columns.len(),
+                index,
                 socket_type: layout.socket_type,
                 plugs: layout.plugs.clone(),
             };
-            columns.push(Value::Null);
             &extra
         };
         let mut plugs = Vec::new();
@@ -1340,7 +1420,7 @@ pub(super) fn translate(
     let adaptation = if host == Host::Armor {
         "Supported source armor talents become private equipped socket choices. Source activation, removal, rearm and explicit player or triggering-weapon targets are retained through the bounded translators. Supported charge and script-parameter grants use private properties restricted to matching ability banks. Every action and grant must translate for a choice to be admitted. Donor perk columns and direct perks are cleared. Native base stats remain the baseline. Source stat tiers, progression and unqualified effects remain unsupported. Ornaments keep their separate appearance sockets."
     } else {
-        "Source talent columns become private socket choices, with additional perk sockets when needed. A column offers the first supported step of each of its first four nodes, in row order, and every supported step joins a private randomized plug set the socket rolls from, since Rise of Iron rolled one step of each node. Offered talents are available immediately, with plain stat adjustments as equipped stat contributions. A fixed damage talent sets the weapon's damage type. Alternative damage steps share a separate socket that offers every one of them, with the first source step as the initial damage type. Supported attached status companions remain part of their talent. Source progression, separate auxiliary status rows and unsupported talents are not migrated."
+        "Source talent columns become private socket choices, with additional perk sockets when needed. A column offers the first supported step of each of its first four nodes, in row order, and every supported step joins a private randomized plug set the socket rolls from, since Rise of Iron rolled one step of each node. Offered talents are available immediately, with plain stat adjustments as equipped stat contributions. A fixed damage talent sets the weapon's damage type. Alternative damage steps would be damage mods, so the weapon keeps the first source step's damage type, and the base's damage mod socket is disabled unless a talent column needs it. Supported attached status companions remain part of their talent. Source progression, separate auxiliary status rows and unsupported talents are not migrated."
     };
     // Authored columns make the build curate the sockets the base keeps, such as a year-two
     // armor base's random stat intrinsic, so each needs a default.

@@ -11,7 +11,7 @@ fn child(
     let kind = p.u8(at + 5)?;
     // Bound recursion and keep compound timer allocation outside leaf children.
     ensure!(
-        matches!(kind, 2 | 3 | 4 | 7..=10 | 12 | 14..=20 | 22 | 23 | 27 | 33),
+        matches!(kind, 2 | 3 | 4 | 7..=10 | 12 | 14..=20 | 22 | 23 | 27 | 33 | 35),
         "Source compound condition has an unqualified child"
     );
     ensure!(

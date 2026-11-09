@@ -157,14 +157,21 @@ impl Assembly<'_> {
             source.u32(s - 4)? == 0x808027FC && component.payload.u32(n - 4)? == 0x8080393B,
             "Optic resource layout differs"
         );
+        // The camera flag is native `+0x60`, set in the stock optic template `81529E1F`, whose
+        // camera vector (0.4, 0, -0.1) matches the source optics that set it. Xbox One stores it
+        // at `+0x78` after a zero word, PS4 at `+0x70` before one: 191 of the 352 CUSA00219
+        // optics set it, all with the -0.1 camera depth.
+        let (flag, zero) = (self.source.field(0x78, 0x70), self.source.field(0x70, 0x78));
         ensure!(
-            source.u64(s + 0x70)? == 0 && source.u64(s + 0x78)? <= 1,
-            "Source optic camera flags differ"
+            source.u64(s + zero)? == 0 && source.u64(s + flag)? <= 1,
+            "Source optic camera flags differ: {:016X} {:016X}",
+            source.u64(s + 0x70)?,
+            source.u64(s + 0x78)?
         );
         put(
             &mut component.payload.0,
             n + 0x60,
-            &source.bytes::<8>(s + 0x78)?,
+            &source.bytes::<8>(s + flag)?,
         )?;
         for (from, to) in [(0x80, 0x70), (0x90, 0x80)] {
             for at in (0..16).step_by(4) {

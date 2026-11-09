@@ -27,9 +27,10 @@ pub(super) struct Shader {
 
 impl Shader {
     /// Stored layouts without a per-vertex detail scale that a source vertex
-    /// program may still name: weighted 9 and unweighted 123.
+    /// program may still name: weighted 9 and unweighted 123 (and 137, its same-stream
+    /// sight layout).
     fn no_detail_scale(&self) -> bool {
-        self.stage == Stage::Vertex && matches!(self.layout, 9 | 123)
+        self.stage == Stage::Vertex && matches!(self.layout, 9 | 123 | 137)
     }
 
     fn symbol(&self, tag: u32) -> String {
@@ -50,6 +51,9 @@ impl Shader {
         }
         if let Some(slot) = self.reticle_mask {
             symbol.push_str(&format!("-reticle-{slot}"));
+            if super::super::shader::debug_reticle_unmasked() {
+                symbol.push_str("-nomask");
+            }
         }
         if let Some((_, suffix)) = &self.lifted {
             symbol.push_str(&format!("-gcn{suffix}"));

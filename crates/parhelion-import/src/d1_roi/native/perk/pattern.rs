@@ -426,6 +426,12 @@ pub(super) fn read(
             },
         )]);
     }
+    if let Some(omitted) = presented::presentation_only(source, &source_graph)? {
+        *omitted_presentation = omitted_presentation
+            .checked_add(omitted)
+            .context("Presentation record count overflow")?;
+        return Ok(Vec::new());
+    }
     let source_owners = source_graph.array(32, 12, Some(0x80800715))?;
     ensure!(
         matches!(source_owners.len(), 1 | 2),

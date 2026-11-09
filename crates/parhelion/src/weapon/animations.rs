@@ -131,6 +131,25 @@ pub(crate) fn profile(
     })
 }
 
+/// The animations the row of content group `group` names in `entity`'s attachment owner, or
+/// `None` when the owner has no row of its own for that group. Unlike [`profile`], this never
+/// answers with the embedded default row.
+pub(crate) fn group_profile(
+    manager: &PackageManager,
+    entity: &[u8],
+    group: u32,
+) -> AuthoringResult<Option<Profile>> {
+    let attachment = attachment(manager, entity)?;
+    let row = row(&attachment, Some(group))?;
+    if read_u32(&attachment.owner, row)? != group {
+        return Ok(None);
+    }
+    Ok(Some(Profile {
+        owner: attachment.owner_tag,
+        keys: keys(&attachment, row)?,
+    }))
+}
+
 /// How `entity`'s first-person attachment row for content group `group` holds the weapon.
 pub(crate) fn stance(
     manager: &PackageManager,

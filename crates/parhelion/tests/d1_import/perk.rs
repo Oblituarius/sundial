@@ -49,7 +49,7 @@ pub(super) fn check(
         .ok_or("Perk translation report")?;
     let source_reader = source;
     // Discover mutually exclusive damage steps from the source payloads, independently of
-    // the translator's report. Every alternative must resolve through one selectable socket.
+    // the translator's report. One alternative must remain as the damage type.
     let source_grid: Value = serde_json::from_slice(&fs::read(source_directory.join(
         if receipt["graph"]["kind"] == "armor" {
             "armor.json"
@@ -96,28 +96,31 @@ pub(super) fn check(
         .len()
         > 1
     {
-        let mut selected_socket = None;
-        let mut choice_ids = BTreeSet::new();
+        // Alternatives would be damage mods. One step stays as the weapon's damage type and
+        // every other one is reported as not imported.
+        let unsupported = receipt["graph"]["perk_translation"]["unsupported"]
+            .as_array()
+            .ok_or("Perk translation unsupported report")?;
+        let mut kept = 0;
         for (node, step, _) in &damage_steps {
             let matches = translated
                 .iter()
                 .filter(|r| r["node"] == *node && r["step"] == *step)
-                .collect::<Vec<_>>();
-            assert_eq!(matches.len(), 1, "A source damage alternative was lost");
-            let slot = matches[0]["socket"]
-                .as_u64()
-                .ok_or("Damage choice socket")?;
-            assert!(selected_socket.is_none_or(|previous| previous == slot));
-            selected_socket = Some(slot);
-            assert!(
-                choice_ids.insert(
-                    matches[0]["choice"]
-                        .as_u64()
-                        .ok_or("Damage choice ordinal")?
-                )
-            );
+                .count();
+            let dropped = unsupported
+                .iter()
+                .filter(|r| {
+                    r["node"] == *node
+                        && r["step"] == *step
+                        && r["reason"]
+                            .as_str()
+                            .is_some_and(|r| r.contains("damage mods"))
+                })
+                .count();
+            assert_eq!(matches + dropped, 1, "A source damage alternative was lost");
+            kept += matches;
         }
-        assert_eq!(choice_ids.len(), damage_steps.len());
+        assert_eq!(kept, 1, "Exactly one source damage type is kept");
     }
     let mut behaviors = Vec::new();
     for translated in translated {

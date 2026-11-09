@@ -197,6 +197,14 @@ impl Layouts {
         })
     }
 
+    /// Whether two native layouts declare the same elements in the same streams, so one
+    /// vertex buffer set is byte-compatible with both.
+    pub fn same_streams(&self, a: u16, b: u16) -> bool {
+        self.native
+            .get(&a)
+            .is_some_and(|a| Some(a) == self.native.get(&b))
+    }
+
     /// Whether two native layouts declare the same elements, whatever their stream split.
     /// A vertex program binds its inputs by semantic, so either layout feeds it.
     pub fn same_elements(&self, a: u16, b: u16) -> bool {

@@ -307,7 +307,7 @@ pub(super) struct Specialized {
 
 /// Use the source convention for programs without a per-vertex detail scale when
 /// the stored layout has none. Weighted layout 9 follows the six-input armor
-/// program and unweighted layout 123 the four-input weapon program. Both copy the
+/// program and unweighted layout 123 (and same-stream 137) the four-input weapon program. Both copy the
 /// transformed base UV to both output pairs. Specialize only this exact data flow,
 /// never arbitrary reads of the absent register.
 pub(super) fn without_detail_scale(code: &[u8], layout: u16) -> Result<Specialized> {
@@ -323,7 +323,7 @@ pub(super) fn without_detail_scale(code: &[u8], layout: u16) -> Result<Specializ
     }
     let (expected, uv): (&[(&str, u32, u8)], u32) = match layout {
         9 => (&WEIGHTED[..], 3),
-        123 => (&UNWEIGHTED[..], 1),
+        123 | 137 => (&UNWEIGHTED[..], 1),
         _ => anyhow::bail!("Layout {layout} has no convention without a detail scale"),
     };
     let last = expected.len() - 1;
@@ -439,11 +439,29 @@ pub(super) fn without_detail_scale(code: &[u8], layout: u16) -> Result<Specializ
 /// to keep. Source sight programs read its first channel, while every Shadowkeep sight
 /// program reads the second (stock `81532F5D`, `81529F7A` and `8161EE21` load `t6.yxzw`
 /// before the same frac-and-discard test). The native mask keeps its selection bits in
-/// that channel, so each load from the mask resource swaps its first two components.
+/// that channel, so each load from the mask resource swaps its first two components: every
+/// swizzle selector that names x names y instead, and the reverse, whichever destination
+/// lane the compiler gave the load. Stock programs also declare the mask unsigned. A
+/// program lifted from GCN, whose loads return the raw texel bits, declares every texture
+/// as float, so the mask declaration and its loads take the unsigned return type too.
 pub(super) fn reticle_mask(code: &[u8], slot: u32) -> Result<Vec<u8>> {
+    /// Four unsigned component return types (D3D10_SB_RETURN_TYPE_UINT = 4).
+    const UNSIGNED: u32 = 0x4444;
     let mut words = tokens(code)?;
     let mut rewritten = 0;
+    let mut first_load = None;
     for instruction in dxbc::walk(&words)? {
+        if instruction.opcode == 0x58 {
+            // dcl_resource: the operand, then the trailing return type token.
+            if let Some(resource) = instruction.operands.first()
+                && resource.kind == 7
+                && let Some(Some(index)) = resource.indices.first()
+                && words[*index] == slot
+            {
+                words[instruction.end - 1] = UNSIGNED;
+            }
+            continue;
+        }
         if instruction.opcode != 45 {
             continue;
         }
@@ -464,15 +482,75 @@ pub(super) fn reticle_mask(code: &[u8], slot: u32) -> Result<Vec<u8>> {
             "Source mask load selects its resource without a swizzle"
         );
         let swizzle = (token >> 4) & 0xFF;
-        let swapped = (swizzle & 0xF0) | ((swizzle & 3) << 2) | ((swizzle >> 2) & 3);
+        let swapped = (0..4).fold(0, |swapped, lane| {
+            let selector = (swizzle >> (lane * 2)) & 3;
+            let selector = match selector {
+                0 => 1,
+                1 => 0,
+                other => other,
+            };
+            swapped | (selector << (lane * 2))
+        });
         words[resource.token_at] = (token & !(0xFF << 4)) | (swapped << 4);
+        // Extended opcode tokens follow the opcode token while bit 31 is set. Type 3 holds
+        // the load's resource return type, four bits per component from bit 6.
+        let mut at = instruction.start;
+        while words[at] >> 31 != 0 {
+            at += 1;
+            if words[at] & 0x3F == 3 {
+                words[at] = (words[at] & !(0xFFFF << 6)) | (UNSIGNED << 6);
+            }
+        }
+        first_load.get_or_insert(instruction.start);
         rewritten += 1;
     }
     ensure!(
         rewritten > 0,
         "Source sight program never loads its reticle mask"
     );
+    if debug_reticle_unmasked() {
+        unmask(&mut words, first_load.context("Reticle mask load")?)?;
+    }
     dxbc::rebuild(code, &words, None)
+}
+
+/// Diagnostic only: `PARHELION_D1_DEBUG_RETICLE=nomask` keeps every reticle pixel the lens
+/// mask would discard, so an in-game test tells a missing mask from a reticle draw that never
+/// shows. Unset in normal imports.
+pub(super) fn debug_reticle_unmasked() -> bool {
+    std::env::var("PARHELION_D1_DEBUG_RETICLE").is_ok_and(|mode| mode.trim() == "nomask")
+}
+
+/// Make the mask test that follows the first mask load always pass: its `ge`/`lt` against the
+/// immediate 0.5 compares with -1 instead (`ge` always true keeps the pixel, `lt` always false
+/// never discards it), so the program also takes its masked shading path everywhere.
+fn unmask(words: &mut [u32], load: usize) -> Result<()> {
+    const HALF: u32 = 0x3F00_0000;
+    const MINUS_ONE: u32 = 0xBF80_0000;
+    for instruction in dxbc::walk(words)? {
+        if instruction.start <= load || !matches!(instruction.opcode, 0x1D | 0x31) {
+            continue;
+        }
+        let Some(immediate) = instruction.operands.iter().find(|o| o.kind == 4) else {
+            continue;
+        };
+        let components = if words[immediate.token_at] & 3 == 2 {
+            4
+        } else {
+            1
+        };
+        let values = immediate.token_at + 1..immediate.token_at + 1 + components;
+        if !words[values.clone()].contains(&HALF) {
+            continue;
+        }
+        for at in values {
+            if words[at] == HALF {
+                words[at] = MINUS_ONE;
+            }
+        }
+        return Ok(());
+    }
+    anyhow::bail!("Reticle program has no mask test after its load")
 }
 
 /// The initial-vector row a sight vertex program subtracts from the quad's z before the
@@ -650,4 +728,76 @@ pub(super) fn deferred(code: &[u8], glow: &[glow::Profile]) -> Result<Vec<u8>> {
         signature.push(0);
     }
     dxbc::rebuild(code, &output, Some(&signature))
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    /// Destination lane mask and source swizzle of each load from `slot`, plus the
+    /// declaration's return type and every load's extended return type.
+    fn loads(code: &[u8], slot: u32) -> (Vec<(u32, u32)>, Vec<u32>, Vec<u32>) {
+        let words = tokens(code).unwrap();
+        let (mut loads, mut declared, mut returned) = (Vec::new(), Vec::new(), Vec::new());
+        for instruction in dxbc::walk(&words).unwrap() {
+            let Some(resource) =
+                instruction
+                    .operands
+                    .get(if instruction.opcode == 45 { 2 } else { 0 })
+            else {
+                continue;
+            };
+            if resource.kind != 7
+                || resource
+                    .indices
+                    .first()
+                    .copied()
+                    .flatten()
+                    .map(|i| words[i])
+                    != Some(slot)
+            {
+                continue;
+            }
+            if instruction.opcode == 0x58 {
+                declared.push(words[instruction.end - 1]);
+            } else if instruction.opcode == 45 {
+                let target = words[instruction.operands[0].token_at];
+                loads.push(((target >> 4) & 15, (words[resource.token_at] >> 4) & 0xFF));
+                let mut at = instruction.start;
+                while words[at] >> 31 != 0 {
+                    at += 1;
+                    if words[at] & 0x3F == 3 {
+                        returned.push((words[at] >> 6) & 0xFFFF);
+                    }
+                }
+            }
+        }
+        (loads, declared, returned)
+    }
+
+    #[test]
+    fn reticle_mask_reads_the_native_selection_channel_as_unsigned() {
+        // The lifted GCN form: a float-declared mask whose raw bits the program reinterprets,
+        // with the loaded component landing in a lane other than x.
+        let text = "Texture2D<float4> tex6 : register(t6);\n\
+            float4 main(float4 p : SV_Position) : SV_Target {\n\
+            float a = p.x * 3.0f; float b = p.y * 5.0f;\n\
+            float4 t = tex6.Load(int3(p.xy, 0));\n\
+            float v = frac((float)asuint(t.x) * 0.125f + 0.0625f);\n\
+            if (v < 0.5f) discard;\n\
+            return float4(a, b, v, 1.0f); }";
+        let (code, _) = crate::tiger::shader::compile(text, false).unwrap();
+        let (before, _, _) = loads(&code, 6);
+        assert!(!before.is_empty());
+        let rewritten = reticle_mask(&code, 6).unwrap();
+        let (after, declared, returned) = loads(&rewritten, 6);
+        assert_eq!(declared, [0x4444]);
+        assert!(!returned.is_empty() && returned.iter().all(|&r| r == 0x4444));
+        for ((mask, old), (_, new)) in before.into_iter().zip(after) {
+            for lane in (0..4).filter(|lane| mask >> lane & 1 != 0) {
+                let (old, new) = ((old >> (lane * 2)) & 3, (new >> (lane * 2)) & 3);
+                assert_eq!(new, [1, 0, 2, 3][old as usize], "lane {lane}");
+            }
+        }
+    }
 }

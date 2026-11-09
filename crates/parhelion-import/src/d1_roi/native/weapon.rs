@@ -307,6 +307,9 @@ impl Source {
             "item_hash":private_item,"native_item":donor,"converter_revision":crate::graph::CONVERTER_REVISION,
             "nodes":assembly.nodes,"parent":parts[0]["parent"],"dyes":[],"dye_rows":[[],[],[]],
             "gear_art":{"selector_format":"shadowkeep","rows":rows,"parts":parts},
+            // The source pattern row's content group. Shadowkeep keeps some Rise of Iron groups'
+            // first-person rows, which the app matches to a stock animation donor.
+            "source_content_group":source["runtime"]["content_key"],
             "source_talents":source["talents"],"perk_translation":perks,"stat_translation":stats.report,
             "rendering":assembly.evidence,"equipment_animation":runtime_animation,"animation":first_person_animation,"audio":named_audio,
             "collections_unconditional":true,"installable":true,"gameplay_verified":false,"limitations":limitations});

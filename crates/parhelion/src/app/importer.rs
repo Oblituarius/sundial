@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 mod ability;
+mod animations;
 mod batch;
 mod browser;
 mod d1_roi;
@@ -1485,6 +1486,7 @@ fn save_imported_recipe(
             }
             melee::merge(&recipe, &mut updated)
                 .map_err(|error| format!("Import melee activation: {error:#}"))?;
+            animations::merge(&recipe, &mut updated);
         }
         keep_bundled_selection(&baseline, &mut updated);
         validate_projectile_selection(&updated)?;
