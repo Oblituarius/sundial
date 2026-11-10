@@ -3,7 +3,7 @@ use super::*;
 use sundial::package_authoring::{
     entity::weapon_component_bindings,
     sandbox_perk::program::{
-        Asset, AttachmentTarget, NativeAssetPatch, NativeAssetResourceAppend,
+        Asset, AttachmentTarget, NativeAssetComponent, NativeAssetPatch, NativeAssetResourceAppend,
         NativeAssetResourcePatch,
     },
 };
@@ -11,6 +11,8 @@ mod connected;
 mod dynamic;
 mod nested;
 mod presented;
+mod network;
+mod sequence;
 mod status;
 
 struct Modifier {
@@ -53,24 +55,28 @@ fn envelope(count: usize) -> Result<u32> {
         .context("Source modifier count has no checked native envelope")
 }
 
-fn input(component: u8, source: u16) -> Result<u16> {
+fn input(component: u8, ability: u16, source: u16) -> Result<u16> {
     // Source talent operands and native stock modifier roles qualify these lanes.
     // Original compiled stat programs also qualify accuracy, both projectile-speed
     // inputs and the full recoil range. Barrel ordinals diverge after Damage.
-    // Ability consumers preserve recharge input 0 and active drain input 2. Their
-    // slot is carried separately. Player stats need the additive tier-to-point
-    // conversion below. Both builds order them Armor, Agility, Recovery: MIDA's
-    // Mobility is input 1, and Twilight Garrison's "Increased Armor" and "Increased
-    // Recovery" talents modify inputs 0 and 2.
+    // Charge input 1 adds hold time to input 0. The target retains its own clock,
+    // state transitions and progress outputs, including for negative hold values.
+    // Ability consumers preserve recharge input 0 and active drain input 2. Melee
+    // input 5 scales the first queried profile coefficient after parameter rows.
+    // Its consumer is not qualified for other slots. Player Armor, Mobility and
+    // Recovery need the additive tier-to-point conversion below.
+    // Selected-weapon consumers read controller inputs 7/8 as one minus current.
+    // Their view-input attenuation retains these ordinals in both native builds.
     Ok(match (component, source) {
-        (0, 0..=6 | 9..=15 | 17 | 19..=21)
+        (9, 5) if ability == 2 => source,
+        (0, 0..=15 | 17 | 19..=21)
         | (1, 0..=4)
         | (2, 0..=9 | 11 | 13..=16 | 22..=25 | 30 | 32)
         | (3, 0..=2)
-        | (4, 0)
+        | (4, 0..=1)
         | (5, 0..=7 | 9)
         | (9, 0 | 2)
-        | (10, 5 | 6)
+        | (10, 1 | 5 | 6)
         | (13, 0..=2)
         | (14, 0 | 1 | 3..=11 | 13..=15 | 17 | 18) => source,
         (2, 33) => 36,
@@ -192,7 +198,7 @@ fn modifier_owner(source: &Source, graph: &Payload, owner: u32) -> Result<Vec<Mo
             );
             u16::MAX
         };
-        let input = input(component, p.u16(at + source.field(0x52, 0x42))?)?;
+        let input = input(component, ability, p.u16(at + source.field(0x52, 0x42))?)?;
         let operation = p.u8(at + source.field(0x34, 0x2C))?;
         let mut value = p.f32(at + source.field(0x30, 0x28))?;
         ensure!(
@@ -200,11 +206,12 @@ fn modifier_owner(source: &Source, graph: &Payload, owner: u32) -> Result<Vec<Mo
             "Unsupported source modifier operation"
         );
         if component == 10 {
-            // Both final timing consumers multiply by min(reviver, target). Only
-            // relative factors are qualified. Base-value producers differ between builds.
+            // Radius input 1 is added to the object's base radius before squaring.
+            // Native objects can override that input. Timing inputs 5/6 multiply by
+            // min(reviver, target). Preserve relative factors on native baselines.
             ensure!(
                 operation == 1,
-                "Source revival input requires a relative timing multiplier"
+                "Source player interaction input requires a relative multiplier"
             );
         }
         if component == 13 {
@@ -212,8 +219,9 @@ fn modifier_owner(source: &Source, graph: &Payload, owner: u32) -> Result<Vec<Mo
                 operation == 0,
                 "Source player stat multiplication has no native unit contract"
             );
-            // The source MIDA property contributes two Mobility tiers. Its native
-            // counterpart contributes twenty points before the ten-point tier table.
+            // Original player definitions give Armor, Mobility and Recovery one
+            // source unit per tier and ten native points per tier. The MIDA banks
+            // independently corroborate the Mobility scale with two and twenty.
             // Scale the delta only, never the host's baseline or a multiplier.
             value *= 10.0;
         }
@@ -337,10 +345,12 @@ pub(super) fn armor_attachment_inner(
                 );
                 return Ok(());
             }
-            let rows = if owners.len() == 2 {
+            let rows = if matches!(owners.len(), 2 | 3) {
                 let owner = source.read(graph.u32(owners[0])?)?;
+                let class = owner.u32(owner.pointer(24)? - 4)?;
                 ensure!(
-                    matches!(owner.u32(owner.pointer(24)? - 4)?, 0x80802698 | 0x808029C3),
+                    matches!(class, 0x80802698 | 0x808029C3)
+                        && (owners.len() == 2 || class == 0x80802698),
                     "Source armor attachment needs another host contract"
                 );
                 status::modifier_bank(source, &graph)?
@@ -350,9 +360,11 @@ pub(super) fn armor_attachment_inner(
                 modifiers(source, tag)?
             };
             ensure!(
-                // The native resolver queries these interfaces from the same player
-                // unit. Revival selectors still require their relative-factor contract.
-                rows.iter().all(|row| matches!(row.component, 5 | 9 | 10)),
+                // Both modifier constructors query these interfaces from the enclosing
+                // unit. Player Stats retains its Add-only tier conversion, and revival
+                // selectors retain their relative-factor contract.
+                rows.iter()
+                    .all(|row| matches!(row.component, 5 | 9 | 10 | 13)),
                 "Source armor owner attachment requires player component modifiers"
             );
             Ok(())
@@ -361,13 +373,62 @@ pub(super) fn armor_attachment_inner(
     }
 }
 
+fn status_key(owner: &Payload, tag: u32) -> Result<u32> {
+    let settings = owner.pointer(24)?;
+    let live = owner.pointer(16)?;
+    let duration = settings + 0x250;
+    ensure!(
+        owner.u32(settings - 4)? == 0x80802698
+            && owner.u32(live - 4)? == 0x80802A75
+            && owner.u32(duration + 0xA0)? == 9,
+        "Source attachment cleanup key needs a qualified timed status"
+    );
+    status::pair(owner, tag, live + 0x50, duration, 0x8080255D, 0x8080223C)?;
+    owner.u32(duration + 0xA4)
+}
+
+/// Admit a removal key only when this action also creates its status publisher.
+/// The ordinary effect path still validates all companions, timer and private patches.
+pub(super) fn duration_end(source: &Source, action: &Payload, key: u32) -> Result<()> {
+    ensure!(key != 0x811C9DC5, "Source duration removal key is empty");
+    for row in action.array(0x38, 8, None)? {
+        let at = action.pointer(row)?;
+        if action.u32(at - 4)? != 0x80802953
+            || action.u8(at)? != 0
+            || action.u8(at + 1)? != 1
+            || action.u8(at + 2)? > 1
+            || action.u32(at + 24)? != key
+        {
+            continue;
+        }
+        let tag = action.u32(at + 16)?;
+        ensure!(
+            source.reference(tag)? == 0x80800734,
+            "Source status pattern"
+        );
+        let graph = source.read(tag)?;
+        let owners = graph.array(32, 12, Some(0x80800715))?;
+        let tag = graph.u32(*owners.first().context("Source status owner")?)?;
+        ensure!(
+            source.reference(tag)? == 0x80800861,
+            "Source status owner class"
+        );
+        ensure!(
+            status_key(&source.read(tag)?, tag)? == key,
+            "Source duration removal key disagrees with its status publisher"
+        );
+        return Ok(());
+    }
+    anyhow::bail!("Source duration removal has no matching status publisher in this action")
+}
+
 pub(super) fn read(
     source: &Source,
     native: &mut Reader,
     p: &Payload,
     at: usize,
     ancestors: &mut Vec<u32>,
-    omitted_presentation: &mut usize,
+    omitted_feedback: &mut usize,
 ) -> Result<Vec<(Action, NativeAssetPatch)>> {
     if (p.u32(at - 4)?, p.u8(at)?) == (0x80802B8D, 1) {
         return dynamic::read(source, native, p, at);
@@ -377,7 +438,7 @@ pub(super) fn read(
             && p.u8(at + 2)? <= 2
             && p.bytes::<5>(at + 3)? == [0; 5]
             && p.u32(at + 20)? == 0
-            && p.bytes::<8>(at + 24)? == [0xC5, 0x9D, 0x1C, 0x81, 0xC5, 0x9D, 0x1C, 0x81]
+            && p.u32(at + 28)? == 0x811C9DC5
             && p.bytes::<16>(at + 32)? == [0; 16],
         "Source pattern needs target, retained-state or cleanup translation"
     );
@@ -388,11 +449,11 @@ pub(super) fn read(
     );
     let source_graph = source.read(source_tag)?;
     if let Some(presented) = presented::bank(source, &source_graph)? {
-        *omitted_presentation = omitted_presentation
+        *omitted_feedback = omitted_feedback
             .checked_add(presented.omitted)
             .context("Presentation record count overflow")?;
         let player_stats = presented.rows.iter().all(|row| row.component == 13);
-        let (tag, patches, appends, hud_status) = match presented.status {
+        let (edit, hud_status) = match presented.status {
             Some((owner, status)) => status::presented(
                 source,
                 native,
@@ -402,10 +463,21 @@ pub(super) fn read(
             )?,
             None => {
                 let (tag, patches) = modifier_patch(native, &presented.rows)?;
-                (tag, patches, Vec::new(), None)
+                (
+                    NativeAssetPatch {
+                        action_index: 0,
+                        source_graph: tag,
+                        patches,
+                        appends: Vec::new(),
+                        remove_owners: Vec::new(),
+                        components: Vec::new(),
+                        programs: Vec::new(),
+                    },
+                    None,
+                )
             }
         };
-        let mut action = attachment(p, at, tag, hud_status)?;
+        let mut action = attachment(p, at, edit.source_graph, hud_status)?;
         // Player stats belong to the player whichever item owns the bank, and an armor item
         // has no native contract for them on itself, so the bank attaches to the player.
         if p.u8(at + 2)? == 0
@@ -414,27 +486,17 @@ pub(super) fn read(
         {
             *mode = AttachmentTarget::Player;
         }
-        return Ok(vec![(
-            action,
-            NativeAssetPatch {
-                action_index: 0,
-                source_graph: tag,
-                patches,
-                appends,
-                remove_owners: Vec::new(),
-                programs: Vec::new(),
-            },
-        )]);
+        return Ok(vec![(action, edit)]);
     }
     if let Some(omitted) = presented::presentation_only(source, &source_graph)? {
-        *omitted_presentation = omitted_presentation
+        *omitted_feedback = omitted_feedback
             .checked_add(omitted)
             .context("Presentation record count overflow")?;
         return Ok(Vec::new());
     }
     let source_owners = source_graph.array(32, 12, Some(0x80800715))?;
     ensure!(
-        matches!(source_owners.len(), 1 | 2),
+        matches!(source_owners.len(), 1..=3),
         "Source attachment has additional components"
     );
     let owner_tag = source_graph.u32(source_owners[0])?;
@@ -443,6 +505,20 @@ pub(super) fn read(
         "Source attachment owner class differs"
     );
     let owner = source.read(owner_tag)?;
+    ensure!(
+        source_owners.len() != 3 || owner.u32(owner.pointer(24)? - 4)? == 0x80802698,
+        "Source three-owner attachment requires a qualified status host"
+    );
+    if p.u32(at + 24)? != 0x811C9DC5 {
+        // A nonempty first key suppresses the action's automatic retirement in
+        // both runtimes. Retain it only on a separately qualified timed status
+        // whose matching Duration identity agrees. The second key names a removal
+        // write and remains closed. Status validation qualifies every companion.
+        ensure!(
+            status_key(&owner, owner_tag)? == p.u32(at + 24)?,
+            "Source attachment cleanup key needs a qualified timed status"
+        );
+    }
     if owner.u32(owner.pointer(24)? - 4)? == 0x80802A94 {
         if p.u8(at + 2)? == 1 {
             // A player attachment cannot supply an owning weapon to the child.
@@ -450,9 +526,9 @@ pub(super) fn read(
             Host::Armor.validate_action(source, nested::source_action(source, &source_graph)?)?;
         }
         let (tag, program, omitted) = nested::read(source, native, &source_graph, ancestors)?;
-        *omitted_presentation = omitted_presentation
+        *omitted_feedback = omitted_feedback
             .checked_add(omitted)
-            .context("Nested presentation record count overflow")?;
+            .context("Nested feedback record count overflow")?;
         return Ok(vec![(
             attachment(p, at, tag, None)?,
             NativeAssetPatch {
@@ -461,12 +537,21 @@ pub(super) fn read(
                 patches: Vec::new(),
                 appends: Vec::new(),
                 remove_owners: Vec::new(),
+                components: Vec::new(),
                 programs: vec![program],
             },
         )]);
     }
     if owner.u32(owner.pointer(24)? - 4)? == 0x808029C3 {
-        let (tag, patches) = connected::read(source, native, &source_graph)?;
+        let edit = connected::read(source, native, &source_graph)?;
+        return Ok(vec![(attachment(p, at, edit.source_graph, None)?, edit)]);
+    }
+    if owner.u32(owner.pointer(24)? - 4)? == 0x80800610 {
+        ensure!(
+            p.u8(at + 2)? == 1,
+            "HUD sequence requires a player attachment"
+        );
+        let (tag, patches) = sequence::read(source, native, &source_graph)?;
         return Ok(vec![(
             attachment(p, at, tag, None)?,
             NativeAssetPatch {
@@ -475,11 +560,12 @@ pub(super) fn read(
                 patches,
                 appends: Vec::new(),
                 remove_owners: Vec::new(),
+                components: Vec::new(),
                 programs: Vec::new(),
             },
         )]);
     }
-    let (tag, patches, appends, hud_status) = if owner.u32(owner.pointer(24)? - 4)? == 0x80802698 {
+    if owner.u32(owner.pointer(24)? - 4)? == 0x80802698 {
         if p.u8(at + 2)? == 0 {
             armor_attachment(source, p, at)?;
         }
@@ -487,20 +573,30 @@ pub(super) fn read(
             p.u8(at + 2)? <= 1,
             "Source status must attach to a qualified player host"
         );
-        status::read(source, native, &source_graph, &owner, owner_tag)?
+        let (edit, hud_status) = status::read(source, native, &source_graph, &owner, owner_tag)?;
+        return Ok(vec![(
+            attachment(p, at, edit.source_graph, hud_status)?,
+            edit,
+        )]);
+    }
+    let (tag, patches) = if source_owners.len() == 2
+        && source.reference(owner.u32(owner.pointer(24)? - 4)?).ok() == Some(0x80800000)
+        && source.read(owner.u32(owner.pointer(24)? - 4)?)?.u32(16)? == 0x80800362
+    {
+        network::modifier(source, native, &source_graph)?
     } else {
-        let (tag, patches) = modifier_patch(native, &modifiers(source, source_tag)?)?;
-        (tag, patches, Vec::new(), None)
+        modifier_patch(native, &modifiers(source, source_tag)?)?
     };
-    let action = attachment(p, at, tag, hud_status)?;
+    let action = attachment(p, at, tag, None)?;
     Ok(vec![(
         action,
         NativeAssetPatch {
             action_index: 0,
             source_graph: tag,
             patches,
-            appends,
+            appends: Vec::new(),
             remove_owners: Vec::new(),
+            components: Vec::new(),
             programs: Vec::new(),
         },
     )])
@@ -523,7 +619,7 @@ fn attachment(
             1 => AttachmentTarget::Player,
             _ => AttachmentTarget::TriggeringWeapon,
         },
-        keys: [0x811C9DC5; 2],
+        keys: [p.u32(at + 24)?, p.u32(at + 28)?],
         float_bits: [0; 4],
     })
 }

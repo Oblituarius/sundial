@@ -1,4 +1,4 @@
-use super::material::{Draw, Equipment, LENS_STAGE, RETICLE_STAGE};
+use super::material::{Draw, Equipment, LENS_STAGE, RETICLE_STAGE, Retained};
 use super::*;
 
 pub(super) struct Model {
@@ -241,6 +241,8 @@ impl Assembly<'_> {
     ) -> Result<Model> {
         let source = self.source.read(source_tag)?;
         let meshes = source.array(0x10, 0xA0, Some(0x80801BBF))?;
+        // Every mesh of the source model shares one gear-dye extern per stage.
+        let retained = equipment.retained(&source, &meshes)?;
         let first = *ordinals
             .first()
             .context("Source model has no selected meshes")?;
@@ -439,11 +441,17 @@ impl Assembly<'_> {
                         "{symbol}-material-{material:08X}-pass-{from}-dye-{dye}-layout-{layout}-sim-{}",
                         u8::from(simulated)
                     );
+                    // A lens draw borrows the source reticle stage's records, so the extern it
+                    // sees is that stage's.
+                    let retained = retained
+                        .get(&(from, dye, material))
+                        .copied()
+                        .unwrap_or(Retained::Unresolved);
                     let mut mat = self
                     .material(
                         material,
                         &mat_symbol,
-                        Draw { stage: from, dye, simulated, layout },
+                        Draw { stage: from, dye, simulated, layout, retained },
                         equipment,
                     )
                     .with_context(|| {

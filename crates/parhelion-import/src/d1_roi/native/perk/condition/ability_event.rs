@@ -124,7 +124,16 @@ fn identity(source: &Source, p: &Payload, at: usize) -> Result<u32> {
             "Source ability-reference path is unterminated"
         );
     }
-    let pattern = p.u32(at + 16)?;
+    pattern_identity(source, p.u32(at + 16)?)
+}
+
+/// The Shadowkeep ability pattern that runs the Rise of Iron ability pattern `pattern`.
+pub(super) fn resolve(source: &Source, native: &mut Reader, pattern: u32) -> Result<u32> {
+    target(native, pattern_identity(source, pattern)?)
+}
+
+/// The Rise of Iron ability identity whose runtime assignment is `pattern`.
+fn pattern_identity(source: &Source, pattern: u32) -> Result<u32> {
     ensure!(
         source.reference(pattern)? == 0x80800734,
         "Source ability-reference condition does not select a pattern"
@@ -152,7 +161,7 @@ fn identity(source: &Source, p: &Payload, at: usize) -> Result<u32> {
             );
         }
     }
-    matched.context("Source event pattern has no ability identity")
+    matched.context("Source pattern has no ability identity")
 }
 
 /// The Shadowkeep ability pattern an ability identity runs.

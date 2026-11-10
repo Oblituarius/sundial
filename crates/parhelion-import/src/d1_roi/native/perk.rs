@@ -5,12 +5,16 @@ use sundial::package_authoring::sandbox_perk::program::{
     Action, AmmunitionStore, AmmunitionTarget, DamageMode, NativeNode, Program, Trigger,
 };
 mod armor;
+mod audio;
 mod condition;
 mod damage;
+mod direct;
 mod energy;
+mod feedback;
 mod filter;
 mod grant;
 mod hit;
+mod hud;
 mod incoming;
 /// Object-label filters, shared with query components.
 pub(in crate::d1_roi::native) mod label;
@@ -79,6 +83,12 @@ impl Host {
                 let at = data.pointer(row)?;
                 match data.u8(at)? {
                     0 => pattern::armor_attachment_inner(source, &data, at, ancestors)?,
+                    // The qualified direct health response resolves the owning player.
+                    // Profile admission still checks the complete zero-damage envelope.
+                    3 => ensure!(
+                        data.u8(at + 2)? == 1,
+                        "Armor direct effects require the player target"
+                    ),
                     // Explicit player properties use the same target resolver on armor.
                     // An item-local property or selected ability needs a separate contract.
                     9 => ensure!(
@@ -91,11 +101,17 @@ impl Host {
                     // The aim-suspension record registers on the action owner's player, as
                     // Tome of Dawn's does from armor.
                     31 => {}
-                    // Reserve transfer resolves the player's inventory. Armor can name
-                    // explicit inventory slots, but cannot supply an owning weapon amount.
-                    15 => ensure!(
+                    // Proportional refills and reserve transfers resolve the player's
+                    // inventory. Armor cannot supply an owning weapon amount.
+                    14 | 15 => ensure!(
                         data.u32(at + 8)? == 0,
                         "Source armor refill requires an explicit inventory slot"
+                    ),
+                    // Literal damage rows consume the event buffers directly. Without
+                    // the owner gate they need no weapon supplied by the armor host.
+                    34 => ensure!(
+                        data.u8(at + 0x94)? == 0,
+                        "Source armor damage modifier requires the owner gate disabled"
                     ),
                     kind => anyhow::bail!("Source effect {kind} needs an armor host contract"),
                 }
@@ -235,6 +251,7 @@ struct Lowered {
     stock: Vec<u16>,
     stock_plugs: Vec<String>,
     grants: Vec<Value>,
+    audio_cues: BTreeSet<u32>,
 }
 
 /// Source talent perks, by identity, that run a stock Shadowkeep perk instead of their own
@@ -347,30 +364,7 @@ fn effect(
                 keep_after_removal: false,
             })
         }
-        (0x8080221F, 14) => {
-            ensure!(
-                data.u8(at + 1)? == 0 && data.bytes::<2>(at + 6)? == [0; 2],
-                "Unknown ammunition flags"
-            );
-            ensure!(
-                (2..=5).all(|i| data.u8(at + i).is_ok_and(|v| v <= 1)),
-                "Unknown ammunition selector"
-            );
-            ensure!(
-                data.bytes::<12>(at + 12)? == [0; 12],
-                "Source slot ammunition amounts require separate slot translation"
-            );
-            let _ = data.f32(at + 8)?;
-            Ok(Action::AddFraction {
-                fraction_bits: data.u32(at + 8)?,
-                target: AmmunitionTarget::OwningWeapon,
-                store: AmmunitionStore::from_byte(data.u8(at + 2)?).context("Ammunition store")?,
-                capacity: AmmunitionStore::from_byte(data.u8(at + 4)?)
-                    .context("Ammunition capacity")?,
-                overflow: data.u8(at + 3)? != 0,
-                action_scaled: data.u8(at + 5)? != 0,
-            })
-        }
+        (0x8080221F, 14) => scalar::fraction(data, at),
         (0x80802840, 24) | (0x80802C04, 25) => {
             let size = if kind == 24 { 24 } else { 16 };
             ensure!(
@@ -491,8 +485,9 @@ fn action_program(
         "Additional source action groups require translation"
     );
     let policy = policy::read(&data, native.as_deref_mut())?;
-    let mut omitted_presentation = usize::try_from(data.u64(0x10)?)?;
+    let mut omitted_feedback = 0;
     let mut patches = Vec::new();
+    let mut damage_profiles = Vec::new();
     let mut actions = Vec::new();
     for at in data
         .array(0x38, 8, None)?
@@ -514,13 +509,25 @@ fn action_program(
                 &data,
                 at,
                 ancestors,
-                &mut omitted_presentation,
+                &mut omitted_feedback,
             )?;
             for (action, mut patch) in translated {
                 patch.action_index = actions.len();
                 patches.push(patch);
                 actions.push(action);
             }
+        } else if data.u32(at - 4)? == 0x808025A9 && data.u8(at)? == 3 {
+            let (action, mut profile) = direct::read(
+                source,
+                native
+                    .as_deref_mut()
+                    .context("Direct effect translation needs native profiles")?,
+                &data,
+                at,
+            )?;
+            profile.action_index = actions.len();
+            damage_profiles.push(profile);
+            actions.push(action);
         } else {
             actions.push(effect(source, &data, at, native.as_deref_mut())?);
         }
@@ -531,7 +538,7 @@ fn action_program(
     );
     let mut activation = conditions(source, &data, 0x20, native.as_deref_mut())?.into_iter();
     let mut removal = conditions(source, &data, 0x48, native.as_deref_mut())?.into_iter();
-    let mut rearm = conditions(source, &data, 0x58, native)?.into_iter();
+    let mut rearm = conditions(source, &data, 0x58, native.as_deref_mut())?.into_iter();
     let native_trigger = activation.next();
     let trigger = if native_trigger.is_some() {
         Trigger::Native
@@ -545,7 +552,7 @@ fn action_program(
         );
         Trigger::Always
     };
-    let program = Program {
+    let mut program = Program {
         name: name.to_owned(),
         trigger,
         duration_ms: 0,
@@ -558,11 +565,15 @@ fn action_program(
         alternative_rearms: rearm.collect(),
         actions,
         native_asset_patches: patches,
+        damage_profiles,
         policy,
         ..Program::default()
     };
+    let (auxiliary, omitted) = feedback::read(source, native, &data, &program)?;
+    program.auxiliary = auxiliary;
+    omitted_feedback += omitted;
     program.validate_structure().map_err(anyhow::Error::msg)?;
-    Ok((program, omitted_presentation))
+    Ok((program, omitted_feedback))
 }
 
 /// Intrinsic plugs (`67FBA961`) set a native weapon's frame, a fixed perk Rise of Iron never had.
@@ -571,6 +582,12 @@ pub(super) const INTRINSIC_CATEGORY: u64 = 0x67FB_A961;
 /// The source item rarity of an exotic. A legendary's first column can also hold one fixed perk,
 /// such as Burning Eye's Snapshot or Abyss Defiant's Hive Disruptor, which stays a perk column.
 const EXOTIC_RARITY: u64 = 5;
+/// The client node kind (`+0x44`) of a grid's infusion node. Grids with one keep an exotic's
+/// always-on trait beside it in the first column. Year-one grids have none, hold only damage and
+/// Ascend there, and unlock the trait as their last talent.
+const INFUSION_NODE: u64 = 1;
+/// The source effect class and kind that set a weapon's damage type.
+const DAMAGE_EFFECT: (u32, u8) = (0x8080_2AC6, 5);
 /// The display-only intrinsic a weapon without a signature perk shows, so the inspect screen
 /// still has a frame row. It carries no stats or effects.
 const LEGACY_FRAME: &str = "Legacy Frame";
@@ -647,14 +664,7 @@ fn property_behaviors(programs: &[Program]) -> Vec<&'static str> {
     behaviors
 }
 
-/// The damage type a source choice gives the weapon, when setting it is all the choice does.
-fn damage_type(programs: &[Program]) -> Option<&'static str> {
-    let [program] = programs else {
-        return None;
-    };
-    let [Action::SetDamageType { mode, .. }] = program.actions.as_slice() else {
-        return None;
-    };
+fn damage_name(mode: DamageMode) -> Option<&'static str> {
     match mode {
         DamageMode::Kinetic => Some("kinetic"),
         DamageMode::Solar => Some("solar"),
@@ -664,49 +674,95 @@ fn damage_type(programs: &[Program]) -> Option<&'static str> {
     }
 }
 
-/// Only an unambiguous, standalone source damage choice constrains automatic donor selection.
-/// Unsupported actions retain their normal per-choice translation report.
-pub(super) fn requires_kinetic(source: &Source, weapon: &Value) -> Result<bool> {
-    let mut kinds = BTreeSet::new();
-    for node in weapon["talents"]["nodes"]
-        .as_array()
-        .context("Source talent nodes")?
-    {
+/// The damage type a translated source choice sets, from the first of its programs that sets one.
+fn damage_type(programs: &[Program]) -> Option<&'static str> {
+    programs
+        .iter()
+        .flat_map(|program| &program.actions)
+        .find_map(|action| match action {
+            Action::SetDamageType { mode, .. } => damage_name(*mode),
+            _ => None,
+        })
+}
+
+/// Whether setting the damage type is all a translated choice does, so the recipe's damage type
+/// can stand in for it.
+fn only_sets_damage(lowered: &Lowered) -> bool {
+    matches!(lowered.raw.as_slice(), [program] if program.actions.len() == 1)
+        && lowered.stats.is_empty()
+        && lowered.stock.is_empty()
+        && lowered.grants.is_empty()
+}
+
+/// Every source step whose talent actions carry a damage effect, as its node, step and damage
+/// type. The effects are read from the source actions, so a step counts even when its other
+/// contributions keep it from translating. A selector outside the four types reads as `None`.
+/// Only each action's own effect list is read, not nested controllers or additional groups.
+fn source_damage(
+    source: &Source,
+    nodes: &[Value],
+) -> Result<Vec<(u64, u64, Option<&'static str>)>> {
+    let mut found = Vec::new();
+    for node in nodes {
+        let index = node["index"].as_u64().context("Source talent node index")?;
         for step in node["steps"].as_array().context("Source talent steps")? {
-            let variants = step["variants"]
+            let ordinal = step["index"].as_u64().context("Source talent step index")?;
+            let perks = step["variants"]
                 .as_array()
-                .context("Source talent variants")?;
-            let [variant] = variants.as_slice() else {
-                continue;
-            };
-            let record = Payload(hex::decode(
-                variant["record"].as_str().context("Source variant bytes")?,
-            )?);
-            let rows = variant["stat_adjustments"]
-                .as_array()
-                .map(Vec::as_slice)
-                .unwrap_or_default();
-            if record.u64(16)? != 0 || !rows.is_empty() {
-                continue;
-            }
-            let perks = variant["perks"].as_array().context("Source talent perks")?;
-            let [perk] = perks.as_slice() else {
-                continue;
-            };
-            let Some(tag) = perk["action"]
-                .as_u64()
-                .and_then(|tag| u32::try_from(tag).ok())
-            else {
-                continue;
-            };
-            if let Ok((program, _)) = program(source, tag, "Damage", None)
-                && let Some(kind) = damage_type(&[program])
-            {
-                kinds.insert(kind);
+                .context("Source talent variants")?
+                .iter()
+                .flat_map(|variant| variant["perks"].as_array().into_iter().flatten());
+            for perk in perks {
+                let Some(tag) = perk["action"]
+                    .as_u64()
+                    .and_then(|tag| u32::try_from(tag).ok())
+                else {
+                    continue;
+                };
+                if source.reference(tag)? != 0x8080_2711 {
+                    continue;
+                }
+                let data = source.read(tag)?;
+                for at in data.array(0x38, 8, None)? {
+                    let at = data.pointer(at)?;
+                    if (data.u32(at - 4)?, data.u8(at)?) == DAMAGE_EFFECT {
+                        let kind = if data.u8(at + 1)? == 1 {
+                            damage_name(DamageMode::from_byte(data.u8(at + 2)?))
+                        } else {
+                            None
+                        };
+                        found.push((index, ordinal, kind));
+                    }
+                }
             }
         }
     }
-    Ok(kinds.len() == 1 && kinds.contains("kinetic"))
+    Ok(found)
+}
+
+/// The damage type the source effects give a weapon: the one type all of them select, or Kinetic
+/// when no talent carries one, since Rise of Iron applies an element only through such an effect.
+/// A mix of types or an unreadable selector gives none.
+fn effect_damage(found: &[(u64, u64, Option<&'static str>)]) -> Option<&'static str> {
+    let kinds = found
+        .iter()
+        .map(|&(_, _, kind)| kind)
+        .collect::<BTreeSet<_>>();
+    match kinds.into_iter().collect::<Vec<_>>().as_slice() {
+        [] => Some("kinetic"),
+        [kind] => *kind,
+        _ => None,
+    }
+}
+
+/// A source weapon whose effects make it Kinetic needs a donor that can carry Kinetic damage.
+/// Damage alternatives mix types, so a weapon with selectable damage keeps any donor. Unsupported
+/// choices count, since the weapon's damage does not depend on their translation.
+pub(super) fn requires_kinetic(source: &Source, weapon: &Value) -> Result<bool> {
+    let nodes = weapon["talents"]["nodes"]
+        .as_array()
+        .context("Source talent nodes")?;
+    Ok(effect_damage(&source_damage(source, nodes)?) == Some("kinetic"))
 }
 
 /// A native perk socket: its index, socket type and perk plugs, a default first when present.
@@ -868,20 +924,36 @@ const REUSABLE_CHOICES: usize = 4;
 /// largest stock randomized set.
 const ROLL_POOL: usize = 64;
 
+/// Source choices in row and node order, retaining step order within each node.
+fn members(choices: &[Choice], column: i64) -> Vec<usize> {
+    let mut members = choices
+        .iter()
+        .enumerate()
+        .filter_map(|(index, choice)| (choice.column == column).then_some(index))
+        .collect::<Vec<_>>();
+    members.sort_by_key(|&index| (choices[index].row, choices[index].node));
+    members
+}
+
 /// A column's choices in socket order, and how many lead it as freely swappable. A source
 /// column's nodes are exclusive rows, and Rise of Iron rolled one step of each. The first
 /// supported step of each of the first four nodes stays swappable. Every supported step joins the
 /// roll pool, the swappable ones first and then the rest in row and step order.
-fn roll<'a>(members: Vec<&'a Choice>, unsupported: &mut Vec<Value>) -> (Vec<&'a Choice>, usize) {
+fn roll(
+    choices: &[Choice],
+    members: Vec<usize>,
+    unsupported: &mut Vec<Value>,
+) -> (Vec<usize>, usize) {
     let mut nodes = BTreeSet::new();
     let (mut ordered, rolled): (Vec<_>, Vec<_>) = members
         .into_iter()
-        .partition(|choice| nodes.insert(choice.node) && nodes.len() <= REUSABLE_CHOICES);
+        .partition(|&index| nodes.insert(choices[index].node) && nodes.len() <= REUSABLE_CHOICES);
     let reusable = ordered.len();
-    for choice in rolled {
+    for index in rolled {
         if ordered.len() < ROLL_POOL {
-            ordered.push(choice);
+            ordered.push(index);
         } else {
+            let choice = &choices[index];
             unsupported.push(json!({"node":choice.node,"step":choice.report["step"],
                 "name":choice.name,"reason":"The column's roll pool is full"}));
         }
@@ -892,9 +964,10 @@ fn roll<'a>(members: Vec<&'a Choice>, unsupported: &mut Vec<Value>) -> (Vec<&'a 
 /// A column's choices without repeats. Rise of Iron's nodes can each roll the same talent, as
 /// Twilight Garrison's two Increase nodes both hold Increase Discipline, and a column that offers
 /// every step keeps one choice for each distinct talent.
-fn distinct<'a>(members: Vec<&'a Choice>, merged: &mut Vec<Value>) -> Vec<&'a Choice> {
-    let mut kept: Vec<&Choice> = Vec::new();
-    for choice in members {
+fn distinct(choices: &[Choice], members: Vec<usize>, merged: &mut Vec<Value>) -> Vec<usize> {
+    let mut kept: Vec<usize> = Vec::new();
+    for index in members {
+        let choice = &choices[index];
         let same = |other: &Choice| {
             other.name == choice.name
                 && other.description == choice.description
@@ -902,23 +975,75 @@ fn distinct<'a>(members: Vec<&'a Choice>, merged: &mut Vec<Value>) -> Vec<&'a Ch
                 && other.lowered.stats == choice.lowered.stats
                 && other.lowered.stock == choice.lowered.stock
         };
-        if let Some(first) = kept.iter().find(|other| same(other)) {
+        if let Some(&first) = kept.iter().find(|&&other| same(&choices[other])) {
+            let first = &choices[first];
             merged.push(
                 json!({"node":choice.node,"step":choice.report["step"],"name":choice.name,
                 "same_as":{"node":first.node,"step":first.report["step"]}}),
             );
         } else {
-            kept.push(choice);
+            kept.push(index);
         }
     }
     kept
 }
 
+/// Whether a source node carries a talent: perks, stat rows or ability grants. Infusion, Ascend,
+/// damage upgrade and ornament nodes carry none.
+fn carries_talent(node: &Value) -> bool {
+    node["steps"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|step| step["variants"].as_array().into_iter().flatten())
+        .any(|variant| {
+            ["perks", "stat_adjustments", "ability_grants"]
+                .into_iter()
+                .any(|field| {
+                    variant[field]
+                        .as_array()
+                        .is_some_and(|rows| !rows.is_empty())
+                })
+        })
+}
+
+/// The source column of an exotic's trait, decided by the grid's structure rather than by which
+/// talents translate. A grid with an infusion node keeps the trait as its first column's one talent
+/// node. Otherwise, or when the first column holds no single talent, the trait is the talent of the
+/// last column that holds any, the grid's final unlock. Nodes that set the damage type are never
+/// the trait, and the trait's column holds one talent node with one step.
+fn trait_column(nodes: &[Value], damage_nodes: &BTreeSet<u64>) -> Result<Option<i64>> {
+    let mut talents = Vec::new();
+    for node in nodes {
+        let index = node["index"].as_u64().context("Source talent node index")?;
+        if carries_talent(node) && !damage_nodes.contains(&index) {
+            let column = node["column"].as_i64().context("Source talent column")?;
+            talents.push((column, node["steps"].as_array().map_or(0, Vec::len)));
+        }
+    }
+    let single = |column: i64| {
+        let mut members = talents.iter().filter(|&&(at, _)| at == column);
+        matches!((members.next(), members.next()), (Some((_, 1)), None))
+    };
+    let infused = nodes
+        .iter()
+        .any(|node| node["column"] == 0 && node["client_kind"] == INFUSION_NODE);
+    if infused && single(0) {
+        return Ok(Some(0));
+    }
+    Ok(talents
+        .iter()
+        .map(|&(column, _)| column)
+        .filter(|&column| column >= 0)
+        .max()
+        .filter(|&column| single(column)))
+}
+
 /// Translate the source talent grid onto the base's perk sockets. On an exotic, the signature
 /// perk takes the intrinsic socket: a single-step node alone in its column and named after the
-/// item, or else a first source column that holds one single-step node.
-/// Otherwise the intrinsic holds Legacy Frame, since a native frame would describe a perk the
-/// source never had.
+/// item, or else a first source column that holds one single-step node, or else the trait that
+/// [`trait_column`] finds. Otherwise the intrinsic holds Legacy Frame, since a native frame would
+/// describe a perk the source never had.
 /// Each other source column becomes one socket, taking the base's perk sockets after its
 /// intrinsic in order, so the sights column lands where a native weapon's barrel or sight does.
 /// A column offers one step of each of its first four nodes, in row order, and rolls from every
@@ -926,7 +1051,10 @@ fn distinct<'a>(members: Vec<&'a Choice>, merged: &mut Vec<Value>) -> Vec<&'a Ch
 /// randomized pool. Each choice clones a plug from
 /// its native socket's pool as its layout template, distinct while the pool lasts. A choice whose
 /// only effect sets a fixed damage type sets the recipe's damage type. Alternative damage steps
-/// would be damage mods, so only the first is kept, as the weapon's damage type.
+/// would be damage mods, so only the first is kept, as the weapon's damage type. A fixed damage
+/// choice that does more keeps the rest on a separate socket, as its one choice. Without a
+/// translated damage choice, the source effects set the recipe's damage type, Kinetic when no
+/// talent sets an element.
 /// Unused perk sockets are disabled so the base's own perks do not stand in for the source's.
 /// The base's damage mod sockets hold columns past its perk sockets before any socket is added,
 /// and are otherwise disabled, since an imported weapon offers no damage mods.
@@ -965,6 +1093,12 @@ pub(super) fn translate(
         .unwrap_or_default()
         .max(1);
     let (intrinsic, perk_sockets) = perk_sockets(sockets, host)?;
+    // Armor has no damage type, so only a weapon's damage effects are read.
+    let found = if host == Host::Weapon {
+        source_damage(assembly.source, nodes)?
+    } else {
+        Vec::new()
+    };
     let armor_lender = if host == Host::Armor && perk_sockets.is_empty() {
         Some(armor::layout(&mut assembly.native, donor)?)
     } else {
@@ -1050,7 +1184,6 @@ pub(super) fn translate(
     let mut choices = Vec::new();
     let mut unsupported = Vec::new();
     let mut merged = Vec::new();
-    let mut damage = None;
     let mut grant_catalog = None;
     for node in nodes {
         let column = node["column"].as_i64().context("Source talent column")?;
@@ -1156,6 +1289,7 @@ pub(super) fn translate(
                     !programs.is_empty() || !stats.is_empty() || !stock.is_empty(),
                     "Talent step has no executable action, property or stat contribution"
                 );
+                let audio_cues = audio::program_cues(&raw)?;
                 Ok(Lowered {
                     programs,
                     raw,
@@ -1166,6 +1300,7 @@ pub(super) fn translate(
                     stock,
                     stock_plugs,
                     grants: granted,
+                    audio_cues,
                 })
             })();
             let lowered = match lowered {
@@ -1179,27 +1314,20 @@ pub(super) fn translate(
                 "column":column,"row":row,"source_actions":lowered.tags,
                 "stat_adjustments":lowered.adjustments,"stock_perk_plugs":lowered.stock_plugs,
                 "ability_grants":lowered.grants,
-                "omitted_presentation_records":lowered.auxiliary});
+                "source_audio_cues":lowered.audio_cues,
+                "omitted_feedback_records":lowered.auxiliary});
             let container = u32::try_from(step["icon"].as_u64().unwrap_or(0))?;
             let icon = assembly
                 .talent_icon(container)
                 .with_context(|| format!("Source talent {name} icon"))?;
-            if let Some(kind) = damage_type(&lowered.raw)
-                .filter(|_| lowered.stats.is_empty() && lowered.stock.is_empty())
-            {
-                damage.get_or_insert(kind);
-                choices.push(Choice {
-                    column: i64::MIN,
-                    row,
-                    node: node_index,
-                    name: name.to_owned(),
-                    description: step["description"].clone(),
-                    icon,
-                    lowered,
-                    report,
-                });
-                continue;
-            }
+            // A choice that sets the weapon's damage type leaves its perk column. When that is
+            // all it does, the recipe's damage type stands in for it. A choice that does more
+            // keeps the rest on the damage socket, after the perk columns.
+            let column = match damage_type(&lowered.raw) {
+                Some(_) if only_sets_damage(&lowered) => i64::MIN,
+                Some(_) => i64::MAX,
+                None => column,
+            };
             choices.push(Choice {
                 column,
                 row,
@@ -1212,6 +1340,7 @@ pub(super) fn translate(
             });
         }
     }
+    audio::admit(assembly, &mut choices, &mut unsupported)?;
     let damage_kinds = choices
         .iter()
         .filter(|c| c.column == i64::MIN)
@@ -1229,11 +1358,15 @@ pub(super) fn translate(
         );
         // Alternative damage steps would be damage mods, which an imported weapon does not
         // offer. It keeps the first source step's damage type, which the recipe can change.
+        let first = choices
+            .iter()
+            .filter(|c| c.column == i64::MIN)
+            .find_map(|c| damage_type(&c.lowered.raw));
         choices.retain(|choice| {
             let kind = (choice.column == i64::MIN)
                 .then(|| damage_type(&choice.lowered.raw))
                 .flatten();
-            if kind.is_none() || kind == damage {
+            if kind.is_none() || kind == first {
                 return true;
             }
             unsupported.push(json!({"node":choice.node,"step":choice.report["step"],
@@ -1241,6 +1374,26 @@ pub(super) fn translate(
             false
         });
     }
+    for choice in choices.iter_mut().filter(|c| c.column == i64::MAX) {
+        choice.report["damage_choice"] = json!(damage_type(&choice.lowered.raw));
+    }
+    // The first damage choice in source order gives the weapon its damage type, the initial one
+    // among alternatives. Without one, the source effects decide it.
+    let chosen = choices
+        .iter()
+        .filter(|c| matches!(c.column, i64::MIN | i64::MAX))
+        .find_map(|c| damage_type(&c.lowered.raw));
+    let damage = chosen.or_else(|| {
+        (host == Host::Weapon)
+            .then(|| effect_damage(&found))
+            .flatten()
+    });
+    let damage_origin = match (chosen, damage) {
+        (Some(_), _) => Some("talent"),
+        (None, Some(_)) if found.is_empty() => Some("no_source_element"),
+        (None, Some(_)) => Some("source_effect"),
+        (None, None) => None,
+    };
     let mut source_columns = choices
         .iter()
         .map(|choice| choice.column)
@@ -1278,13 +1431,23 @@ pub(super) fn translate(
     let item_name = source["item"]["name"]
         .as_str()
         .map(|name| name.trim().to_lowercase());
+    let damage_nodes = found
+        .iter()
+        .map(|&(node, _, _)| node)
+        .collect::<BTreeSet<_>>();
+    let trait_at = if exotic {
+        trait_column(nodes, &damage_nodes)?
+    } else {
+        None
+    };
     let signature = exotic
         .then(|| {
             // A fixed perk named after the item is its signature wherever its column sits, as
             // The First Curse's is in column 4 behind fixed Dead Eye and Triple Tap. Rise of
             // Iron marks neither by node flags: Dead Eye and Empyrean Bellicose's Antigrav
             // Thrusters both start unlocked outside an exclusive set, while The First Curse's
-            // perk unlocks later inside its own set.
+            // perk unlocks later inside its own set. The grid's structural trait comes last,
+            // and one that does not translate leaves Legacy Frame in the intrinsic socket.
             source_columns
                 .iter()
                 .copied()
@@ -1299,27 +1462,30 @@ pub(super) fn translate(
                         .copied()
                         .filter(|&column| column == 0 && fixed(column).is_some())
                 })
+                .or_else(|| trait_at.filter(|&column| fixed(column).is_some()))
         })
         .flatten();
     let mut ordinal = 0;
     for &column in &source_columns {
-        let mut members = choices
-            .iter()
-            .filter(|choice| choice.column == column)
-            .collect::<Vec<_>>();
-        members.sort_by_key(|choice| (choice.row, choice.node));
-        // Armor offers every step of each talent, as an owned piece can take any plug of its
-        // column's pool.
-        let (members, reusable) = if host == Host::Armor {
-            let mut members = distinct(members, &mut merged);
-            for choice in members.drain(ROLL_POOL.min(members.len())..) {
+        let members = members(&choices, column);
+        // Armor offers every distinct step of each talent, as an owned piece can take any plug of
+        // its column's pool. Damage alternatives are steps of one node, which a roll would cut to
+        // its first step, so every one stays selectable instead.
+        let (members, reusable) = if host == Host::Armor || column == i64::MAX {
+            let mut members = if host == Host::Armor {
+                distinct(&choices, members, &mut merged)
+            } else {
+                members
+            };
+            for index in members.drain(ROLL_POOL.min(members.len())..) {
+                let choice = &choices[index];
                 unsupported.push(json!({"node":choice.node,"step":choice.report["step"],
                     "name":choice.name,"reason":"The column's roll pool is full"}));
             }
             let count = members.len();
             (members, count)
         } else {
-            roll(members, &mut unsupported)
+            roll(&choices, members, &mut unsupported)
         };
         // The runtime base supplies socket layouts, not a limit on source talent columns.
         // Additional columns use a normal perk layout and still receive private plug identities,
@@ -1349,7 +1515,8 @@ pub(super) fn translate(
             &extra
         };
         let mut plugs = Vec::new();
-        for (choice_index, choice) in members.into_iter().enumerate() {
+        for (choice_index, index) in members.into_iter().enumerate() {
+            let choice = &choices[index];
             // The template only lends its layout. Each choice still becomes its own private item,
             // so a pool shorter than the column repeats its plugs.
             let plug = socket.plugs[choice_index % socket.plugs.len()];
@@ -1391,10 +1558,8 @@ pub(super) fn translate(
             }
         }
     }
-    ensure!(
-        host == Host::Armor || nodes.is_empty() || !translated.is_empty(),
-        "No source talent behavior is currently supported for this weapon"
-    );
+    // Talent failures stay in the choice report. A weapon with no translated talents
+    // still keeps its appearance and base behavior, with unused donor perk lanes disabled.
     let mut legacy = false;
     if signature.is_none()
         && host == Host::Weapon
@@ -1410,6 +1575,10 @@ pub(super) fn translate(
             "icon":{"source":"texture","tag":LEGACY_FRAME_ICON}}));
         legacy = true;
     }
+    let intrinsic_socket = intrinsic
+        .as_ref()
+        .filter(|_| signature.is_some() || legacy)
+        .map(|socket| socket.index);
     let intrinsic = if signature.is_some() {
         "signature"
     } else if legacy {
@@ -1420,7 +1589,7 @@ pub(super) fn translate(
     let adaptation = if host == Host::Armor {
         "Supported source armor talents become private equipped socket choices. Source activation, removal, rearm and explicit player or triggering-weapon targets are retained through the bounded translators. Supported charge and script-parameter grants use private properties restricted to matching ability banks. Every action and grant must translate for a choice to be admitted. Donor perk columns and direct perks are cleared. Native base stats remain the baseline. Source stat tiers, progression and unqualified effects remain unsupported. Ornaments keep their separate appearance sockets."
     } else {
-        "Source talent columns become private socket choices, with additional perk sockets when needed. A column offers the first supported step of each of its first four nodes, in row order, and every supported step joins a private randomized plug set the socket rolls from, since Rise of Iron rolled one step of each node. Offered talents are available immediately, with plain stat adjustments as equipped stat contributions. A fixed damage talent sets the weapon's damage type. Alternative damage steps would be damage mods, so the weapon keeps the first source step's damage type, and the base's damage mod socket is disabled unless a talent column needs it. Supported attached status companions remain part of their talent. Source progression, separate auxiliary status rows and unsupported talents are not migrated."
+        "Source talent columns become private socket choices, with additional perk sockets when needed. A column offers the first supported step of each of its first four nodes, in row order, and every supported step joins a private randomized plug set the socket rolls from, since Rise of Iron rolled one step of each node. Offered talents are available immediately, with plain stat adjustments as equipped stat contributions. A fixed damage talent sets the weapon's damage type. One that also carries other effects keeps them on a separate socket. Alternative damage steps would be damage mods, so the weapon keeps the first source step's damage type, and the base's damage mod socket is disabled unless a talent column needs it. A weapon whose talents set no element is Kinetic. On an exotic, a fixed perk named after the item, else a fixed first-column perk, else the grid's structural trait takes the intrinsic socket. Supported attached status companions remain part of their talent. Source progression and unsupported talents are not migrated. Unsupported talents are reported individually and do not block weapon import."
     };
     // Authored columns make the build curate the sockets the base keeps, such as a year-two
     // armor base's random stat intrinsic, so each needs a default.
@@ -1431,6 +1600,7 @@ pub(super) fn translate(
         columns,
         json!(variants),
         json!({"translated":translated,"unsupported":unsupported,"merged":merged,"damage_type":damage,
+        "damage_origin":damage_origin,
         "behaviors":if host == Host::Weapon {
             property_behaviors(&choices.iter().flat_map(|c| c.lowered.raw.iter().cloned()).collect::<Vec<_>>())
         } else {
@@ -1439,6 +1609,8 @@ pub(super) fn translate(
         "native_defaults":native_defaults,
         "status":if translated.is_empty() { "unsupported" } else if unsupported.is_empty() { "translated" } else { "partial" },
         "intrinsic":intrinsic,
+        "intrinsic_socket":intrinsic_socket,
+        "trait_column":trait_at,
         "empty_source_grid":nodes.is_empty(),
         "finished_perk_templates":{"plug":template_hash,"indices":templates},
         "socket_layout_lender":armor_lender.as_ref().map(|lender| &lender["weapon"]),

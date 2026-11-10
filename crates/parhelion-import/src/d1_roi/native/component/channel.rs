@@ -10,6 +10,8 @@ struct Bank {
     /// Parent lookup namespace, parent channel name and local ordinal, sorted by namespace
     /// then name as the native lookup is.
     inherited: Vec<(u32, u32, usize)>,
+    /// First and last default-namespace rows of `inherited`.
+    span: [u16; 2],
     constants: BTreeMap<usize, [u8; 16]>,
     callbacks: BTreeMap<usize, callback::Callback>,
     programs: BTreeMap<usize, program::Program>,
@@ -79,6 +81,13 @@ impl Bank {
                     .windows(2)
                     .all(|pair| (pair[0].0, pair[0].1) < (pair[1].0, pair[1].1)),
             "Source inherited names are absent or unsorted"
+        );
+        let span = crate::tiger::channel::inherited::default_span(
+            inherited.iter().map(|(namespace, _, _)| *namespace),
+        )?;
+        ensure!(
+            [source.u16(schema + 0x128)?, source.u16(schema + 0x12A)?] == span,
+            "Source default channel namespace span differs"
         );
         let inherited_ordinals = inherited
             .iter()
@@ -236,6 +245,7 @@ impl Bank {
         Ok(Self {
             names,
             inherited,
+            span,
             constants,
             callbacks,
             programs,
@@ -441,12 +451,11 @@ impl Assembly<'_> {
         ] {
             put(&mut p.0, schema + at, &u32::try_from(count)?.to_le_bytes())?;
         }
-        put(&mut p.0, schema + 0x128, &0u16.to_le_bytes())?;
-        put(
-            &mut p.0,
-            schema + 0x12A,
-            &u16::try_from(bank.inherited.len() - 1)?.to_le_bytes(),
-        )?;
+        // Sight banks sort visibility's named namespace ahead of the default rows. A span
+        // over every row hides default names such as ammunition `32CC5402` from the lookup.
+        for (at, value) in [0x128, 0x12A].into_iter().zip(bank.span) {
+            put(&mut p.0, schema + at, &value.to_le_bytes())?;
+        }
         let tag = p.u32(0x44)?;
         let mut allocation = (*self.native.tag(tag, None)?).clone();
         for (name, class, before, after) in [
