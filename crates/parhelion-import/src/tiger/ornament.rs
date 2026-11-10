@@ -13,8 +13,11 @@ use std::{
     sync::Arc,
 };
 
-/// Default Ornament, the reset every stock weapon ornament socket starts with.
+/// Default Ornament, the reset a stock legendary weapon ornament socket starts with.
 pub const RESET: u32 = 0xAEBAE371;
+/// Default Ornament of exotic weapon ornament sockets, a plug of its own beside [`RESET`]: Hard
+/// Light's ornament socket (type 90) starts with it.
+pub const EXOTIC_RESET: u32 = 0x74CDDCC6;
 /// The description of every imported ornament's private plug.
 const DESCRIPTION: &str =
     "Changes this weapon's appearance. Select Default Ornament to restore the original appearance.";
@@ -37,6 +40,8 @@ pub struct Layout {
     pub category: u32,
     /// One distinct stock ornament per appearance, in choice order.
     pub plugs: Vec<u32>,
+    /// The Default Ornament the lane starts with: [`RESET`], or [`EXOTIC_RESET`] on an exotic's.
+    pub reset: u32,
     pub report: Value,
 }
 
@@ -122,9 +127,13 @@ fn category(definition: &Payload) -> Result<Option<u32>> {
     Ok((found.len() == 1).then(|| found[0]))
 }
 
-/// A weapon's socket count and its ornament lane with that lane's socket type, the one socket
-/// whose initial plug is Default Ornament.
-fn ornament_lane(r: &mut Reader, t: &Tables, weapon: u32) -> Result<(usize, Option<(usize, u16)>)> {
+/// A weapon's socket count and its ornament lane with that lane's socket type and reset, the one
+/// socket whose initial plug is a Default Ornament.
+fn ornament_lane(
+    r: &mut Reader,
+    t: &Tables,
+    weapon: u32,
+) -> Result<(usize, Option<(usize, u16, u32)>)> {
     let definition = t.definition_of(r, weapon)?;
     if definition.u64(0x68)? == 0 {
         return Ok((0, None));
@@ -133,8 +142,12 @@ fn ornament_lane(r: &mut Reader, t: &Tables, weapon: u32) -> Result<(usize, Opti
     let mut lanes = Vec::new();
     for (lane, &row) in sockets.iter().enumerate() {
         let initial = definition.u16(row + 2)?;
-        if initial != u16::MAX && t.hash(usize::from(initial))? == RESET {
-            lanes.push((lane, definition.u16(row)?));
+        if initial == u16::MAX {
+            continue;
+        }
+        let reset = t.hash(usize::from(initial))?;
+        if matches!(reset, RESET | EXOTIC_RESET) {
+            lanes.push((lane, definition.u16(row)?, reset));
         }
     }
     ensure!(
@@ -251,18 +264,18 @@ pub fn categories(r: &mut Reader) -> Result<BTreeSet<u32>> {
 pub fn layout(r: &mut Reader, donor: u32, kin: &[u32], count: usize) -> Result<Layout> {
     ensure!(count > 0, "No imported appearances to lay out");
     let t = Tables::read(r)?;
-    let reset = t.definition_of(r, RESET)?;
-    let reset = category(&reset)?.context("Default Ornament plug category")?;
     let whitelists = whitelists(r, &t)?;
     let ornaments = collection(r, &t)?;
     let (sockets, own) = ornament_lane(r, &t, donor)?;
-    let mut socket_type = own.map(|(_, socket_type)| socket_type);
+    let mut socket_type = own.map(|(_, socket_type, _)| socket_type);
+    let mut reset_plug = own.map(|(_, _, reset)| reset);
     let mut type_source = own.map(|_| donor);
     if socket_type.is_none() {
         for &weapon in kin.iter().filter(|&&weapon| weapon != donor) {
             match ornament_lane(r, &t, weapon) {
-                Ok((_, Some((_, found)))) => {
+                Ok((_, Some((_, found, reset)))) => {
                     socket_type = Some(found);
+                    reset_plug = Some(reset);
                     type_source = Some(weapon);
                     break;
                 }
@@ -273,6 +286,9 @@ pub fn layout(r: &mut Reader, donor: u32, kin: &[u32], count: usize) -> Result<L
             }
         }
     }
+    let reset_plug = reset_plug.unwrap_or(RESET);
+    let reset = t.definition_of(r, reset_plug)?;
+    let reset = category(&reset)?.context("Default Ornament plug category")?;
     let socket_type = match socket_type {
         Some(socket_type) => socket_type,
         None => {
@@ -328,7 +344,7 @@ pub fn layout(r: &mut Reader, donor: u32, kin: &[u32], count: usize) -> Result<L
         .map(|ornament| ornament.hash)
         .collect::<Vec<_>>();
     let (lane, appended) = match own {
-        Some((lane, _)) => (lane, false),
+        Some((lane, ..)) => (lane, false),
         None => {
             ensure!(
                 sockets < sundial::investment::MAX_WEAPON_SOCKETS,
@@ -339,7 +355,7 @@ pub fn layout(r: &mut Reader, donor: u32, kin: &[u32], count: usize) -> Result<L
     };
     let report = json!({"lane":lane,"appended":appended,"socket_type":socket_type,
         "socket_type_from":type_source.map(|hash| format!("{hash:08X}")),
-        "category":category,"reset_category":reset,"leaf":leaf,
+        "category":category,"reset":format!("{reset_plug:08X}"),"reset_category":reset,"leaf":leaf,
         "plugs":plugs.iter().map(|hash| format!("{hash:08X}")).collect::<Vec<_>>(),
         "stock_ornaments":ornaments.len()});
     Ok(Layout {
@@ -349,6 +365,7 @@ pub fn layout(r: &mut Reader, donor: u32, kin: &[u32], count: usize) -> Result<L
         sockets,
         category,
         plugs,
+        reset: reset_plug,
         report,
     })
 }
@@ -404,7 +421,7 @@ pub fn attach(
     if lanes.len() < layout.lane + 1 {
         lanes.resize(layout.sockets.max(layout.lane + 1), Value::Null);
     }
-    let reset = json!(format!("0x{RESET:08X}"));
+    let reset = json!(format!("0x{:08X}", layout.reset));
     let lane = &lanes[layout.lane];
     ensure!(
         lane.is_null()

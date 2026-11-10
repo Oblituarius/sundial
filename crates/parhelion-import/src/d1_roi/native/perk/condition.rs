@@ -28,6 +28,11 @@ pub(super) fn read(
     at: usize,
     mut native: Option<&mut Reader>,
 ) -> Result<Option<NativeNode>> {
+    // PS4 keeps the stock Orb of Light pickup event for the full-Super orb condition, which
+    // Empyrean Bellicose was imported with. The Xbox One build takes the adjustment event below.
+    if source.platform() == 7 && (p.u32(at - 4)?, p.u8(at + 5)?) == (0x808030AE, 35) {
+        return orb_with_full_super(p, at).map(Some);
+    }
     if let Some(node) = event_filter::read(source, p, at, native.as_deref_mut())? {
         return Ok(Some(node));
     }

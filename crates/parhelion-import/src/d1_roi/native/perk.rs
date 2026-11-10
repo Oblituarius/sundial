@@ -364,6 +364,34 @@ fn effect(
                 keep_after_removal: false,
             })
         }
+        // An owning-weapon fraction on PS4 keeps the authored refill that Bolts from the Blue
+        // was verified with in game. Slot fractions, and the Xbox One build, take the native
+        // node that keeps the source's combined rounding.
+        (0x8080221F, 14)
+            if source.platform() == 7 && data.bytes::<12>(at + 12)? == [0; 12] =>
+        {
+            ensure!(
+                data.u8(at + 1)? == 0 && data.bytes::<2>(at + 6)? == [0; 2],
+                "Unknown ammunition flags"
+            );
+            ensure!(
+                (2..=5).all(|i| data.u8(at + i).is_ok_and(|v| v <= 1)),
+                "Unknown ammunition selector"
+            );
+            ensure!(
+                data.f32(at + 8)?.is_finite(),
+                "Source ammunition fraction is not finite"
+            );
+            Ok(Action::AddFraction {
+                fraction_bits: data.u32(at + 8)?,
+                target: AmmunitionTarget::OwningWeapon,
+                store: AmmunitionStore::from_byte(data.u8(at + 2)?).context("Ammunition store")?,
+                capacity: AmmunitionStore::from_byte(data.u8(at + 4)?)
+                    .context("Ammunition capacity")?,
+                overflow: data.u8(at + 3)? != 0,
+                action_scaled: data.u8(at + 5)? != 0,
+            })
+        }
         (0x8080221F, 14) => scalar::fraction(data, at),
         (0x80802840, 24) | (0x80802C04, 25) => {
             let size = if kind == 24 { 24 } else { 16 };
@@ -694,6 +722,81 @@ fn only_sets_damage(lowered: &Lowered) -> bool {
         && lowered.grants.is_empty()
 }
 
+/// Whether `program` acts for as long as its item is equipped: an Always program with no other
+/// activation, ending, chance, duration or complete native form. Rise of Iron programs lower to
+/// Always or to a native event trigger.
+fn unconditional(program: &Program) -> bool {
+    program.trigger == Trigger::Always
+        && program.native_trigger.is_none()
+        && program.alternative_triggers.is_empty()
+        && program.native_removal.is_none()
+        && program.alternative_removals.is_empty()
+        && program.removal_key.is_none()
+        && program.native.is_none()
+        && program.chance_permyriad == 10_000
+        && program.duration_ms == 0
+}
+
+/// Remove the element changes from `lowered`'s unconditional programs, since the weapon's damage
+/// type stands in for them, and return whether any was removed. Later actions' indices shift down.
+/// A program left with no action goes with its finished perk. An element change an event starts
+/// stays in its program.
+fn strip_elements(lowered: &mut Lowered) -> Result<bool> {
+    let mut stripped = false;
+    let mut index = 0;
+    while index < lowered.raw.len() {
+        let program = &mut lowered.raw[index];
+        let removed = program
+            .actions
+            .iter()
+            .enumerate()
+            .filter(|(_, action)| {
+                matches!(action, Action::SetDamageType { mode, .. } if damage_name(*mode).is_some())
+            })
+            .map(|(at, _)| at)
+            .collect::<Vec<_>>();
+        if removed.is_empty() || !unconditional(program) {
+            index += 1;
+            continue;
+        }
+        for &at in removed.iter().rev() {
+            program.actions.remove(at);
+        }
+        let shift = |at: &mut usize| -> Result<()> {
+            ensure!(
+                !removed.contains(at),
+                "An element change carries a native asset edit"
+            );
+            *at -= removed.iter().filter(|&&r| r < *at).count();
+            Ok(())
+        };
+        for patch in &mut program.native_asset_patches {
+            shift(&mut patch.action_index)?;
+        }
+        for profile in &mut program.damage_profiles {
+            shift(&mut profile.action_index)?;
+        }
+        for asset in &mut program.imported_assets {
+            shift(&mut asset.action_index)?;
+        }
+        stripped = true;
+        if program.actions.is_empty() {
+            ensure!(
+                program.native_asset_patches.is_empty()
+                    && program.damage_profiles.is_empty()
+                    && program.imported_assets.is_empty(),
+                "A program of only element changes carries native assets"
+            );
+            lowered.raw.remove(index);
+            lowered.programs.remove(index);
+            continue;
+        }
+        lowered.programs[index]["program"] = serde_json::to_value(&lowered.raw[index])?;
+        index += 1;
+    }
+    Ok(stripped)
+}
+
 /// Every source step whose talent actions carry a damage effect, as its node, step and damage
 /// type. The effects are read from the source actions, so a step counts even when its other
 /// contributions keep it from translating. A selector outside the four types reads as `None`.
@@ -869,6 +972,8 @@ struct Choice {
     icon: Option<String>,
     lowered: Lowered,
     report: Value,
+    /// The element the choice sets, which the weapon's damage type takes instead of a socket.
+    element: Option<&'static str>,
 }
 
 /// The finished perks that carry translated programs, and the plug that lent the first. A donor
@@ -1051,10 +1156,10 @@ fn trait_column(nodes: &[Value], damage_nodes: &BTreeSet<u64>) -> Result<Option<
 /// randomized pool. Each choice clones a plug from
 /// its native socket's pool as its layout template, distinct while the pool lasts. A choice whose
 /// only effect sets a fixed damage type sets the recipe's damage type. Alternative damage steps
-/// would be damage mods, so only the first is kept, as the weapon's damage type. A fixed damage
-/// choice that does more keeps the rest on a separate socket, as its one choice. Without a
-/// translated damage choice, the source effects set the recipe's damage type, Kinetic when no
-/// talent sets an element.
+/// would be damage mods, so only the first is kept, as the weapon's damage type. A choice that
+/// sets the element and does more keeps the rest in its own column, and the damage type takes the
+/// element. Without a translated element, the source effects set the recipe's damage type, Kinetic
+/// when no talent sets an element.
 /// Unused perk sockets are disabled so the base's own perks do not stand in for the source's.
 /// The base's damage mod sockets hold columns past its perk sockets before any socket is added,
 /// and are otherwise disabled, since an imported weapon offers no damage mods.
@@ -1303,14 +1408,14 @@ pub(super) fn translate(
                     audio_cues,
                 })
             })();
-            let lowered = match lowered {
+            let mut lowered = match lowered {
                 Ok(lowered) => lowered,
                 Err(error) => {
                     unsupported.push(json!({"node":node["index"],"step":step["index"],"name":name,"reason":format!("{error:#}")}));
                     continue;
                 }
             };
-            let report = json!({"node":node["index"],"step":step["index"],"name":name,
+            let mut report = json!({"node":node["index"],"step":step["index"],"name":name,
                 "column":column,"row":row,"source_actions":lowered.tags,
                 "stat_adjustments":lowered.adjustments,"stock_perk_plugs":lowered.stock_plugs,
                 "ability_grants":lowered.grants,
@@ -1320,13 +1425,29 @@ pub(super) fn translate(
             let icon = assembly
                 .talent_icon(container)
                 .with_context(|| format!("Source talent {name} icon"))?;
-            // A choice that sets the weapon's damage type leaves its perk column. When that is
-            // all it does, the recipe's damage type stands in for it. A choice that does more
-            // keeps the rest on the damage socket, after the perk columns.
-            let column = match damage_type(&lowered.raw) {
-                Some(_) if only_sets_damage(&lowered) => i64::MIN,
-                Some(_) => i64::MAX,
-                None => column,
+            // Rise of Iron set elements through talents, which Shadowkeep gives the weapon's damage
+            // type instead, so no socket or plug offers an element. A choice that only sets the
+            // element leaves its perk column. One that does more keeps the rest in its column,
+            // without the element change when that lasts while the weapon is equipped. One an
+            // event starts keeps its element change, and the damage type still takes the element.
+            let element = damage_type(&lowered.raw);
+            let column = if element.is_none() {
+                column
+            } else if only_sets_damage(&lowered) {
+                i64::MIN
+            } else {
+                let stripped = strip_elements(&mut lowered)?;
+                report["element_assigned_to_damage_type"] = json!(element);
+                report["element_action_removed"] = json!(stripped);
+                if lowered.programs.is_empty()
+                    && lowered.stats.is_empty()
+                    && lowered.stock.is_empty()
+                    && lowered.grants.is_empty()
+                {
+                    i64::MIN
+                } else {
+                    column
+                }
             };
             choices.push(Choice {
                 column,
@@ -1337,6 +1458,7 @@ pub(super) fn translate(
                 icon,
                 lowered,
                 report,
+                element,
             });
         }
     }
@@ -1358,10 +1480,7 @@ pub(super) fn translate(
         );
         // Alternative damage steps would be damage mods, which an imported weapon does not
         // offer. It keeps the first source step's damage type, which the recipe can change.
-        let first = choices
-            .iter()
-            .filter(|c| c.column == i64::MIN)
-            .find_map(|c| damage_type(&c.lowered.raw));
+        let first = choices.iter().find_map(|c| c.element);
         choices.retain(|choice| {
             let kind = (choice.column == i64::MIN)
                 .then(|| damage_type(&choice.lowered.raw))
@@ -1377,12 +1496,9 @@ pub(super) fn translate(
     for choice in choices.iter_mut().filter(|c| c.column == i64::MAX) {
         choice.report["damage_choice"] = json!(damage_type(&choice.lowered.raw));
     }
-    // The first damage choice in source order gives the weapon its damage type, the initial one
-    // among alternatives. Without one, the source effects decide it.
-    let chosen = choices
-        .iter()
-        .filter(|c| matches!(c.column, i64::MIN | i64::MAX))
-        .find_map(|c| damage_type(&c.lowered.raw));
+    // The first element a choice sets, in source order, gives the weapon its damage type. Without
+    // one, the source effects decide it.
+    let chosen = choices.iter().find_map(|c| c.element);
     let damage = chosen.or_else(|| {
         (host == Host::Weapon)
             .then(|| effect_damage(&found))
@@ -1589,7 +1705,7 @@ pub(super) fn translate(
     let adaptation = if host == Host::Armor {
         "Supported source armor talents become private equipped socket choices. Source activation, removal, rearm and explicit player or triggering-weapon targets are retained through the bounded translators. Supported charge and script-parameter grants use private properties restricted to matching ability banks. Every action and grant must translate for a choice to be admitted. Donor perk columns and direct perks are cleared. Native base stats remain the baseline. Source stat tiers, progression and unqualified effects remain unsupported. Ornaments keep their separate appearance sockets."
     } else {
-        "Source talent columns become private socket choices, with additional perk sockets when needed. A column offers the first supported step of each of its first four nodes, in row order, and every supported step joins a private randomized plug set the socket rolls from, since Rise of Iron rolled one step of each node. Offered talents are available immediately, with plain stat adjustments as equipped stat contributions. A fixed damage talent sets the weapon's damage type. One that also carries other effects keeps them on a separate socket. Alternative damage steps would be damage mods, so the weapon keeps the first source step's damage type, and the base's damage mod socket is disabled unless a talent column needs it. A weapon whose talents set no element is Kinetic. On an exotic, a fixed perk named after the item, else a fixed first-column perk, else the grid's structural trait takes the intrinsic socket. Supported attached status companions remain part of their talent. Source progression and unsupported talents are not migrated. Unsupported talents are reported individually and do not block weapon import."
+        "Source talent columns become private socket choices, with additional perk sockets when needed. A column offers the first supported step of each of its first four nodes, in row order, and every supported step joins a private randomized plug set the socket rolls from, since Rise of Iron rolled one step of each node. Offered talents are available immediately, with plain stat adjustments as equipped stat contributions. A fixed damage talent sets the weapon's damage type, and no socket offers an element. One that also carries other effects keeps them in its own column, without an element change that lasts while the weapon is equipped. Alternative damage steps would be damage mods, so the weapon keeps the first source step's damage type, and the base's damage mod socket is disabled unless a talent column needs it. A weapon whose talents set no element is Kinetic. On an exotic, a fixed perk named after the item, else a fixed first-column perk, else the grid's structural trait takes the intrinsic socket. Supported attached status companions remain part of their talent. Source progression and unsupported talents are not migrated. Unsupported talents are reported individually and do not block weapon import."
     };
     // Authored columns make the build curate the sockets the base keeps, such as a year-two
     // armor base's random stat intrinsic, so each needs a default.

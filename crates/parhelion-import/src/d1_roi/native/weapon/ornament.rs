@@ -81,6 +81,13 @@ impl Source {
             false,
         )?;
         let mut layout = ornament::layout(&mut reader, owner.donor, owner.kin, ornaments.len())?;
+        // A Rise of Iron weapon offers its ornaments only in the donor's own ornament socket, never
+        // in an appended one, so a donor without that socket keeps none.
+        ensure!(
+            !layout.appended,
+            "Native donor {:08X} has no ornament socket of its own",
+            owner.donor
+        );
         let sockets = crate::tiger::shadowkeep::sockets(&mut reader, owner.donor)?;
         drop(reader);
         let recipe: Value = serde_json::from_slice(&fs::read(owner.recipe)?)?;

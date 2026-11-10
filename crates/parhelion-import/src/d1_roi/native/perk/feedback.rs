@@ -79,12 +79,18 @@ fn omitted_graph(source: &Source, tag: u32) -> Result<()> {
         // Feedback is a creation path, not a presentation type. A modifier bank
         // changes component inputs even when reached through this separate list.
         // It needs its own private graph and creation/lifetime translation.
+        // PS4 keeps omitting it as before this check existed, which Zhalo Supercell's
+        // Persistence and Twilight Garrison's talents were verified with in game.
+        let bank = owner.u32(
+            definition
+                .checked_sub(4)
+                .context("Feedback component marker")?,
+        )? == 0x808020DE;
+        if bank && source.platform() == 7 {
+            continue;
+        }
         ensure!(
-            owner.u32(
-                definition
-                    .checked_sub(4)
-                    .context("Feedback component marker")?
-            )? != 0x808020DE,
+            !bank,
             "Source feedback graph contains an unconverted component modifier"
         );
     }

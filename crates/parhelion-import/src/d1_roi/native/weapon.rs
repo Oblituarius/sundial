@@ -3,6 +3,7 @@ use super::*;
 use crate::GraphReference;
 mod firing;
 mod ornament;
+mod sockets;
 mod stats;
 
 pub(super) fn key(text: &str) -> u32 {
@@ -372,6 +373,10 @@ impl Source {
             json!({"skipped":"Ornaments were not imported"})
         };
         crate::io::write_json(&output.join("ornaments.json"), &ornaments)?;
+        crate::io::write_json(
+            &output.join("sockets.json"),
+            &sockets::disable_untouched(&path)?,
+        )?;
         Ok(path)
     }
 }
