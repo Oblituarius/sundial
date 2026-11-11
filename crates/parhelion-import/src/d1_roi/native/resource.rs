@@ -23,6 +23,9 @@ pub(super) struct Shader {
     /// SM5 bytecode lifted from a PS4 GCN program, which replaces the source program, and
     /// the symbol suffix naming what the lift depended on.
     pub lifted: Option<(Vec<u8>, String)>,
+    /// A transparent pixel program, whose color output reaches the scene before bloom and is
+    /// limited to the source bloom input range.
+    pub bloom_limit: bool,
 }
 
 impl Shader {
@@ -57,6 +60,9 @@ impl Shader {
         }
         if let Some((_, suffix)) = &self.lifted {
             symbol.push_str(&format!("-gcn{suffix}"));
+        }
+        if self.bloom_limit {
+            symbol.push_str("-bloom-limit");
         }
         symbol
     }
@@ -119,57 +125,13 @@ impl Assembly<'_> {
         symbol: &str,
         texture: super::super::texture::Texture,
     ) -> Result<String> {
-        let subtype = if texture.depth > 1 {
-            3
-        } else if texture.layers == 6 {
-            2
-        } else {
-            1
-        };
+        let subtype = texture.subtype();
         let template = self.template(32, subtype)?;
         let data_template = self.template(40, subtype)?;
-        // Preserve a checked native volume descriptor's topology flags. These are not the
-        // cube flag used by 2D resources, and a subtype alone does not establish its shape.
-        let mut header = if texture.depth > 1 {
-            let native = self.native.tag(template, None)?;
-            ensure!(
-                native.0.len() == 40
-                    && native.u16(12)? == 0xCAFE
-                    && native.u16(18)? > 1
-                    && native.u16(20)? == 1,
-                "Native volume texture template differs"
-            );
-            native.0.clone()
-        } else {
-            vec![0; 40]
-        };
-        put(
-            &mut header,
-            0,
-            &u32::try_from(texture.bytes.len())?.to_le_bytes(),
-        )?;
-        put(&mut header, 4, &texture.format.to_le_bytes())?;
-        put(&mut header, 12, &0xCAFEu16.to_le_bytes())?;
-        for (at, value) in [
-            (14, texture.width),
-            (16, texture.height),
-            (18, texture.depth),
-            (20, texture.layers),
-        ] {
-            put(&mut header, at, &value.to_le_bytes())?;
-        }
-        // A 4x4 footprint includes one complete BC block and every uncompressed pixel.
-        header[22] = u8::try_from(super::super::texture::surface(texture.format, 4, 4)?.1 / 2)?;
-        header[23] = texture.mips;
-        if texture.depth == 1 {
-            header[25] = 1;
-            header[31] = 1;
-            header[32] = if texture.layers == 6 { 2 } else { 0 };
-            header[33] = 3;
-            header[34] = 1;
-        }
-        put(&mut header, 36, &u32::MAX.to_le_bytes())?;
-        crate::tiger::texture::resident(&mut header, texture.bytes.len())?;
+        let volume = (texture.depth > 1)
+            .then(|| self.native.tag(template, None))
+            .transpose()?;
+        let header = texture.native_header(volume.as_deref())?;
         let data = format!("{symbol}-data");
         self.node(&data, data_template, &texture.bytes, Some(symbol), &[])?;
         self.node(symbol, template, &header, Some(&data), &[])
@@ -237,28 +199,13 @@ impl Assembly<'_> {
             depth,
             reticle_mask,
             lifted,
+            bloom_limit,
         } = inputs;
         if self.symbols.contains(&symbol) {
             return Ok(symbol);
         }
         let raw = &self.program_bytes(tag, lifted)?;
-        if self.bone_map.is_some() && stage == Stage::Vertex {
-            super::super::shader::rigid_indices(raw)
-                .with_context(|| format!("Source mapped vertex program {tag:08X}"))?;
-        }
-        let mut code = if stage == Stage::Vertex {
-            super::super::shader::skinning(raw)
-                .with_context(|| format!("Source vertex program {tag:08X}"))?
-        } else if gbuffer == Some(Gbuffer::Surface) {
-            super::super::shader::deferred(raw, &self.glow)
-                .with_context(|| format!("Source deferred program {tag:08X}"))?
-        } else if let Some(Gbuffer::Decal { replace }) = gbuffer {
-            super::super::shader::decal(raw, replace)
-                .with_context(|| format!("Source decal program {tag:08X}"))?
-        } else {
-            super::super::shader::compact(raw)
-                .with_context(|| format!("Source GPU program {tag:08X}"))?
-        };
+        let mut code = translate_shader(self, tag, raw, stage, gbuffer)?;
         if no_detail_scale {
             let specialized = super::super::shader::without_detail_scale(&code, layout)
                 .with_context(|| format!("Source vertex program {tag:08X}, layout {layout}"))?;
@@ -281,6 +228,10 @@ impl Assembly<'_> {
         if let Some(slot) = reticle_mask {
             code = super::super::shader::reticle_mask(&code, slot)
                 .with_context(|| format!("Source sight program {tag:08X}"))?;
+        }
+        if bloom_limit {
+            code = super::super::shader::bloom_limit(&code)
+                .with_context(|| format!("Source transparent program {tag:08X}"))?;
         }
         let template_tag = self.template(
             33,
@@ -335,6 +286,33 @@ impl Assembly<'_> {
             )
         }
     }
+}
+
+fn translate_shader(
+    assembly: &Assembly<'_>,
+    tag: u32,
+    raw: &[u8],
+    stage: Stage,
+    gbuffer: Option<Gbuffer>,
+) -> Result<Vec<u8>> {
+    if assembly.bone_map.is_some() && stage == Stage::Vertex {
+        super::super::shader::rigid_indices(raw)
+            .with_context(|| format!("Source mapped vertex program {tag:08X}"))?;
+    }
+    let code = if stage == Stage::Vertex {
+        super::super::shader::skinning(raw)
+            .with_context(|| format!("Source vertex program {tag:08X}"))?
+    } else if gbuffer == Some(Gbuffer::Surface) {
+        super::super::shader::deferred(raw, &assembly.glow)
+            .with_context(|| format!("Source deferred program {tag:08X}"))?
+    } else if let Some(Gbuffer::Decal { replace }) = gbuffer {
+        super::super::shader::decal(raw, replace)
+            .with_context(|| format!("Source decal program {tag:08X}"))?
+    } else {
+        super::super::shader::compact(raw)
+            .with_context(|| format!("Source GPU program {tag:08X}"))?
+    };
+    Ok(code)
 }
 
 #[cfg(test)]

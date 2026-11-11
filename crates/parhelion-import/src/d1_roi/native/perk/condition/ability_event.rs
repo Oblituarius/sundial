@@ -61,8 +61,11 @@ pub(super) fn read(
     p: &Payload,
     at: usize,
 ) -> Result<NativeNode> {
-    let identity = identity(source, p, at)?;
-    let target = target(native, identity)?;
+    identity(source, p, at)?;
+    // The same identity, else the shared counterpart rules (Ward of Dawn → Sentinel Shield).
+    let target = counterpart::find(source, native, p.u32(at + 16)?)?
+        .context("Source ability-reference condition names an ability Shadowkeep lacks")?
+        .entity;
     node(p, at, target)
 }
 
@@ -125,11 +128,6 @@ fn identity(source: &Source, p: &Payload, at: usize) -> Result<u32> {
         );
     }
     pattern_identity(source, p.u32(at + 16)?)
-}
-
-/// The Shadowkeep ability pattern that runs the Rise of Iron ability pattern `pattern`.
-pub(super) fn resolve(source: &Source, native: &mut Reader, pattern: u32) -> Result<u32> {
-    target(native, pattern_identity(source, pattern)?)
 }
 
 /// The Rise of Iron ability identity whose runtime assignment is `pattern`.
