@@ -146,6 +146,22 @@ pub(crate) fn healing(
 /// The stock profile a private healing copy starts from.
 pub(crate) const HEALING_TEMPLATE: u32 = health::TEMPLATE;
 
+/// A damage impulse owner's field, given by its Xbox One offset from the definition root. PS4
+/// starts the description eight bytes earlier (`+78`, not `+80`) and its definition is `110`
+/// long, not `120`, so the arrays after it sit sixteen bytes earlier.
+pub(super) fn image(xbox: usize) -> usize {
+    match xbox {
+        0..0x78 => xbox,
+        0x78..0x120 => crate::d1_roi::platform::field(xbox, xbox - 8),
+        _ => crate::d1_roi::platform::field(xbox, xbox - 0x10),
+    }
+}
+
+/// The relative pointer stored at `field` that names `target`, both Xbox One offsets.
+pub(super) fn relative(field: usize, target: usize) -> u64 {
+    (image(target) - image(field)) as u64
+}
+
 fn profile(source: &Source, native: &mut Reader, tag: u32) -> Result<Checked> {
     ensure!(
         source.reference(tag)? == 0x80800861,
@@ -155,14 +171,16 @@ fn profile(source: &Source, native: &mut Reader, tag: u32) -> Result<Checked> {
     let runtime = owner.pointer(16)?;
     let root = owner.pointer(24)?;
     ensure!(
-        runtime == 0x68 && root == 0x90 && matches!(owner.0.len(), 0x1B0 | 0x230),
+        runtime == 0x68
+            && root == 0x90
+            && (owner.0.len() == 0x90 + image(0x120) || owner.0.len() == 0x90 + image(0x1A0)),
         "Source direct profile has an unqualified runtime envelope"
     );
     let instance_class = owner.u32(runtime - 4)?;
     let definition_class = owner.u32(root - 4)?;
     for (class, binding, base, size) in [
         (instance_class, 0xAC6BA0EF, 0x80802BF8, 0x20),
-        (definition_class, 0x7F9BA830, 0x80802364, 0x120),
+        (definition_class, 0x7F9BA830, 0x80802364, image(0x120) as u32),
     ] {
         ensure!(
             source.reference(class)? == 0x80800000,
@@ -176,9 +194,9 @@ fn profile(source: &Source, native: &mut Reader, tag: u32) -> Result<Checked> {
             "Source direct effect has another profile declaration"
         );
     }
-    let healing = owner.0.len() == 0x230;
-    let amount = owner.f32(root + 0x80)?;
-    let mode = owner.u8(root + 0x8C)?;
+    let healing = owner.0.len() == 0x90 + image(0x1A0);
+    let amount = owner.f32(root + image(0x80))?;
+    let mode = owner.u8(root + image(0x8C))?;
     ensure!(
         amount.is_finite()
             && (if healing {
@@ -201,10 +219,10 @@ fn profile(source: &Source, native: &mut Reader, tag: u32) -> Result<Checked> {
         (0x58, 0x0000_0105_0000_0008),
         (runtime + 8, root as u64),
         (root + 8, runtime as u64),
-        (root + 0x18, 0x68),
-        (root + 0x20, 0xB8),
-        (root + 0x38, 0xB8),
-        (root + 0x40, 0xC8),
+        (root + 0x18, relative(0x18, 0x80)),
+        (root + 0x20, relative(0x20, 0xD8)),
+        (root + 0x38, relative(0x38, 0xF0)),
+        (root + 0x40, relative(0x40, 0x108)),
     ] {
         put(&mut expected, field, &value.to_le_bytes())?;
     }
@@ -218,15 +236,15 @@ fn profile(source: &Source, native: &mut Reader, tag: u32) -> Result<Checked> {
         (root, tag),
         (root + 16, instance_class),
         (root + 0x50, 1.0f32.to_bits()),
-        (root + 0x80, amount.to_bits()),
-        (root + 0x84, amount.to_bits()),
-        (root + 0xB0, 1.0f32.to_bits()),
-        (root + 0xDC, 1.0f32.to_bits()),
-        (root + 0x100, u32::MAX),
+        (root + image(0x80), amount.to_bits()),
+        (root + image(0x84), amount.to_bits()),
+        (root + image(0xB0), 1.0f32.to_bits()),
+        (root + image(0xDC), 1.0f32.to_bits()),
+        (root + image(0x100), u32::MAX),
     ] {
         put(&mut expected, field, &value.to_le_bytes())?;
     }
-    expected[root + 0x8C] = mode;
+    expected[root + image(0x8C)] = mode;
     let (health, flags) = if healing {
         let (health, flags) = health::read(source, native, &owner, &mut expected)?;
         (Some(health), flags)

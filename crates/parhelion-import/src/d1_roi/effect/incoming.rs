@@ -42,6 +42,8 @@ pub(super) fn write(
     p: &Payload,
 ) -> Result<Value> {
     let (si, sd) = (p.pointer(16)?, p.pointer(24)?);
+    // PS4 packs the creation reference at `+60`, so the fields after it sit eight bytes earlier.
+    let after = |xbox: usize| crate::d1_roi::platform::field(xbox, xbox - 8);
     let owner = p.u32(sd)?;
     ensure!(
         p.u32(si - 4)? == 0x80802390 && p.u32(sd - 4)? == 0x808027FA,
@@ -70,12 +72,12 @@ pub(super) fn write(
     )?;
     // Neither factor method reads the array beside the creation reference.
     ensure!(
-        p.u64(sd + 0x78)? == 0 && target.u64(nd + 0x60)? == 0,
+        p.u64(sd + after(0x78))? == 0 && target.u64(nd + 0x60)? == 0,
         "Incoming damage has an unread array"
     );
 
     // The base program. Both builds reserve input slot zero, so slot one is the one named input.
-    let e = sd + 0x98;
+    let e = sd + after(0x98);
     pattern::embedded(p, owner, (si + 0x50, e), (0x808008AC, 0x8080038D))?;
     ensure!(
         p.u64(e + 88)? == 0 && [0, 0x811C9DC5].contains(&p.u64(e + 96)?),
@@ -123,7 +125,7 @@ pub(super) fn write(
     // only `+108`, relation `+109` and accumulator `+10A` at native `+E8..+EA`. A property key
     // names a property whose Shadowkeep counterpart is not established, so only the absent key
     // carries.
-    let gates = p.bytes::<16>(sd + 0x100)?;
+    let gates = p.bytes::<16>(sd + after(0x100))?;
     let native_gates = target.bytes::<16>(nd + 0xE0)?;
     ensure!(
         gates[..8] == [0xC5, 0x9D, 0x1C, 0x81, 0, 0, 0, 0]
@@ -140,7 +142,7 @@ pub(super) fn write(
     // and the factor at `+4C`. Native `80802A1C` holds the type masks and their bypass flags at
     // `+10/+14` and `+28/+29`, the label predicate at `+18`, an empty source list at `+30` and the
     // factor program at `+50`.
-    let rows = p.array(sd + 0x88, 0x50, Some(0x808029F8))?;
+    let rows = p.array(sd + after(0x88), 0x50, Some(0x808029F8))?;
     let native_rows = target.array(nd + 0x70, 0xA0, Some(0x80802A1C))?;
     ensure!(
         !rows.is_empty() && rows.len() == native_rows.len(),
@@ -164,8 +166,13 @@ pub(super) fn write(
                 && factor.is_finite(),
             "Source incoming damage row has other damage types, flags or factor"
         );
-        let (lists, mode, record) =
-            label::masks(source, SOURCE_DICTIONARY, include, exclude, &registry)?;
+        let (lists, mode, record) = label::masks(
+            source,
+            crate::d1_roi::platform::tag(SOURCE_DICTIONARY),
+            include,
+            exclude,
+            &registry,
+        )?;
         let predicate = to + 0x18;
         // With no labels the shared compiler leaves the predicate unset. The two-operation record
         // with both bypass flags set skips both label tests, as an unset predicate does.

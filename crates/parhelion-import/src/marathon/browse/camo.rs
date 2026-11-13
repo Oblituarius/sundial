@@ -373,6 +373,7 @@ pub(super) fn plan(
         let mut link = json!({"target_weapon":owner,"target_socket":lane,
             "native_plug":plug,"native_socket_type":layout.socket_type,
             "plug_category":layout.category,"name":camo.name,"source_item":camo.item});
+        layout.name_reset(&mut link);
         if let Some((tier, rarity)) = camo.tier() {
             link["source_tier"] = json!(tier);
             link["rarity"] = json!(rarity);

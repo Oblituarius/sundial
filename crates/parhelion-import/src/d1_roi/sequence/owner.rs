@@ -75,28 +75,36 @@ impl Owner {
         let definition = owner.pointer(24)?;
         ensure!(
             owner
-                .array(definition + 0x190, 56, Some(0x80800788))?
+                .array(
+                    definition + crate::d1_roi::platform::sequence(0x190),
+                    crate::d1_roi::platform::field(56, 48),
+                    Some(0x80800788),
+                )?
                 .is_empty(),
             "Source effect sequence publishes numeric outputs"
         );
         let names = |field| {
             owner
-                .array(definition + field, 48, Some(0x80800927))?
+                .array(
+                    definition + crate::d1_roi::platform::sequence(field),
+                    crate::d1_roi::platform::input_row().0,
+                    Some(0x80800927),
+                )?
                 .into_iter()
-                .map(|row| owner.u32(row + 0x28))
+                .map(|row| owner.u32(row + crate::d1_roi::platform::input_row().1))
                 .collect::<Result<Vec<_>>>()
         };
         let inputs = names(0x1A0)?;
         let auxiliary = names(0x2A8)?;
         let mut flags = 0;
         for (bit, field) in [(0, 0x2C4), (1, 0x2D0), (2, 0x2D3)] {
-            let value = owner.u8(definition + field)?;
+            let value = owner.u8(definition + crate::d1_roi::platform::sequence(field))?;
             ensure!(value <= 1, "Source sequence root Boolean differs");
             flags |= value << bit;
         }
         // Topology translation owns the entry selector and root predicate.
         ensure!(
-            owner.u32(definition + 0x2C0)? == 0,
+            owner.u32(definition + crate::d1_roi::platform::sequence(0x2C0))? == 0,
             "Source sequence starts at a different root selector"
         );
         let locator_count = locators.count();
@@ -115,8 +123,8 @@ impl Owner {
             auxiliary,
             root: [
                 flags,
-                owner.u8(definition + 0x2D1)?,
-                owner.u8(definition + 0x2D2)?,
+                owner.u8(definition + crate::d1_roi::platform::sequence(0x2D1))?,
+                owner.u8(definition + crate::d1_roi::platform::sequence(0x2D2))?,
             ],
         })
     }
@@ -133,13 +141,17 @@ impl Owner {
     /// written owner's inputs. Graph connection rows name these offsets.
     pub fn definitions(&self) -> Result<Vec<usize>> {
         let definition = self.source.pointer(24)?;
-        let mut rows = self
-            .source
-            .array(definition + 0x1A0, 48, Some(0x80800927))?;
-        rows.extend(
-            self.source
-                .array(definition + 0x2A8, 48, Some(0x80800927))?,
-        );
+        let stride = crate::d1_roi::platform::input_row().0;
+        let mut rows = self.source.array(
+            definition + crate::d1_roi::platform::sequence(0x1A0),
+            stride,
+            Some(0x80800927),
+        )?;
+        rows.extend(self.source.array(
+            definition + crate::d1_roi::platform::sequence(0x2A8),
+            stride,
+            Some(0x80800927),
+        )?);
         Ok(rows)
     }
 

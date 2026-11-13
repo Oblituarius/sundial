@@ -34,7 +34,7 @@ pub(super) fn pair(
 /// writer fills with the HUD priority. So it is admitted when it is zero or already that priority.
 /// The `+90` declaration is never an admitted export, so the source value is unobservable here.
 fn scalar(p: &Payload, settings: usize, priority: i32) -> Result<()> {
-    let value = p.f32(settings + 0xB4)?;
+    let value = p.f32(settings + crate::d1_roi::platform::status::settings(0xB4))?;
     ensure!(
         value == 0.0 || value == priority as f32,
         "Source status scalar differs from its competition priority"
@@ -101,9 +101,9 @@ fn validate(
 ) -> Result<Status> {
     let live = p.pointer(16)?;
     let settings = p.pointer(24)?;
-    let hud = settings + 0xF0;
-    let duration = hud + 0x160;
-    let controller = duration + 0xB8;
+    let hud = settings + crate::d1_roi::platform::status::settings(0xF0);
+    let duration = hud + crate::d1_roi::platform::status::hud(0x160);
+    let controller = duration + crate::d1_roi::platform::status::duration(0xB8);
     ensure!(
         p.u32(live - 4)? == 0x80802A75 && p.u32(settings - 4)? == 0x80802698,
         "Source status root differs"
@@ -134,10 +134,10 @@ fn validate(
         (live + 0x30, hud, 0x8080278D, 0x8080254F),
         (live + 0x50, duration, 0x8080255D, 0x8080223C),
         (live + 0x80, controller, 0x808027B5, 0x80802890),
-        (live + 0xA0, duration + 0x138, 0x808008AC, 0x8080038D),
-        (live + 0xE0, hud + 0xA0, 0x8080084D, 0x808005A0),
-        (live + 0x110, hud + 0x108, 0x8080084D, 0x808005A0),
-        (live + 0x170, settings + 0xB8, 0x808008AF, 0x80800456),
+        (live + 0xA0, duration + crate::d1_roi::platform::status::duration(0x138), 0x808008AC, 0x8080038D),
+        (live + 0xE0, hud + crate::d1_roi::platform::status::hud(0xA0), 0x8080084D, 0x808005A0),
+        (live + 0x110, hud + crate::d1_roi::platform::status::hud(0x108), 0x8080084D, 0x808005A0),
+        (live + 0x170, settings + crate::d1_roi::platform::status::settings(0xB8), 0x808008AF, 0x80800456),
     ] {
         pair(p, owner, i, d, ic, dc)?;
     }
@@ -145,29 +145,29 @@ fn validate(
     // companion. Its complete sequence and resource obligations remain in the graph. Its bound
     // request is required (policy 0) in both builds, as the sound template `80BC5833`'s status
     // `81532CC9` holds it at `+60`, so a required request carries with the companion.
-    let policy = p.u64(settings + 0xD0)?;
+    let policy = crate::d1_roi::platform::status::receiver(p, settings)?.0;
     ensure!(
         (policy == 2 || (policy == 0 && audio.is_some()))
-            && p.u64(settings + 0xD8)? == 0x808003E3
-            && p.u64(settings + 0xE0)? == 0
-            && p.u64(settings + 0xE8)? == u32::MAX as u64
-            && p.u32(settings + 0xA8)? == 0x3C18FBCE
-            && p.u32(settings + 0xAC)? == 0
-            && p.u32(settings + 0xB0)? <= 0xFF,
+            && crate::d1_roi::platform::status::receiver(p, settings)?.1 == 0x808003E3
+            && p.u64(settings + crate::d1_roi::platform::status::settings(0xE0))? == 0
+            && p.u64(settings + crate::d1_roi::platform::status::settings(0xE8))? == u32::MAX as u64
+            && p.u32(settings + crate::d1_roi::platform::status::settings(0xA8))? == 0x3C18FBCE
+            && p.u32(settings + crate::d1_roi::platform::status::settings(0xAC))? == 0
+            && p.u32(settings + crate::d1_roi::platform::status::settings(0xB0))? <= 0xFF,
         "Source status host has a state program or unqualified competition flags"
     );
     // D1 keeps the competition mask on the host and uses the HUD's signed priority.
     // Native 3A61 owns both fields, with a Float32 priority. Keep integer ordering exact.
     // Both builds' activation and reevaluation predicates agree for every mask byte pair,
     // and so do the bit 2 and 3 counters, so any byte mask carries.
-    let priority = i32::from_le_bytes(p.bytes::<4>(hud + 0x8C)?);
+    let priority = i32::from_le_bytes(p.bytes::<4>(hud + crate::d1_roi::platform::status::hud(0x8C))?);
     ensure!(
         (-16_777_216..=16_777_216).contains(&priority),
         "Source status competition priority cannot be represented exactly"
     );
     scalar(p, settings, priority)?;
     let mut competition = [0; 8];
-    competition[0] = p.u8(settings + 0xB0)?;
+    competition[0] = p.u8(settings + crate::d1_roi::platform::status::settings(0xB0))?;
     competition[4..].copy_from_slice(&(priority as f32).to_le_bytes());
     let outputs = graph.array(0x30, 88, Some(0x8080054E))?;
     ensure!(
@@ -181,13 +181,15 @@ fn validate(
             && graph.u32(at + 4)? == 0
             && graph.u32(at + 8)? == owner
             && graph.u32(at + 12)? == 0
-            && graph.u64(at + 16)? == (settings + 0xB8) as u64
+            && graph.u64(at + 16)? == (settings + crate::d1_roi::platform::status::settings(0xB8)) as u64
             && graph.u32(at + 24)? == 0x80800456
             && graph.u32(at + 28)? == 0
             && graph.u64(at + 32)? == 0
             && graph.u64(at + 40)? == 0x811C9DC5
             && graph.u64(at + 48)? == audio.map_or(u32::MAX as u64, |a| a.owner as u64)
-            && graph.u64(at + 56)? == audio.map_or(0, |a| (a.definition + 0xA8) as u64)
+            && graph.u64(at + 56)? == audio.map_or(0, |a| {
+                    (a.definition + crate::d1_roi::platform::sequence(0xA8)) as u64
+                })
             && graph.u64(at + 64)?
                 == if audio.is_some() {
                     0x80800988
@@ -202,31 +204,31 @@ fn validate(
     // Each allowed parameter is a declaration, followed by its literal selector.
     // Check the complete export set and reciprocal runtime references as well.
     let declarations: [(usize, usize, u32, u32, u64, u32); 18] = [
-        (settings + 0x60, live, 0x80802A75, 0x80AAC44B, 0, 0),
-        (settings + 0x78, live, 0x80802A75, 0x80AAC282, 0xFFA2, 0),
-        (settings + 0x90, live, 0x80802A75, 0x80AAC44C, 0, 0),
-        (settings + 0x418, live, 0x80802A75, 0x80AAC44A, 0, 0),
-        (settings + 0x438, live, 0x80802A75, 0x80AAC283, 0, 0),
-        (hud + 0x18, live + 0x30, 0x8080278D, 0x80AAC449, 0, 0),
-        (hud + 0x38, live + 0x30, 0x8080278D, 0x80AAC447, 0, 0),
-        (hud + 0x58, live + 0x30, 0x8080278D, 0x80AAC281, 0, 0),
-        (hud + 0x70, live + 0x30, 0x8080278D, 0x80AAC448, 0, 1),
-        (duration + 0x18, live + 0x50, 0x8080255D, 0x80AAC286, 0, 0),
-        (duration + 0x38, live + 0x50, 0x8080255D, 0x80AAC284, 0, 0),
-        (duration + 0x58, live + 0x50, 0x8080255D, 0x80AAEDB3, 0, 0),
-        (duration + 0x70, live + 0x50, 0x8080255D, 0x80AAC288, 0, 0),
-        (duration + 0x88, live + 0x50, 0x8080255D, 0x80AAC444, 0, 0),
+        (settings + crate::d1_roi::platform::status::settings(0x60), live, 0x80802A75, crate::d1_roi::platform::tag(0x80AAC44B), 0, 0),
+        (settings + crate::d1_roi::platform::status::settings(0x78), live, 0x80802A75, crate::d1_roi::platform::tag(0x80AAC282), 0xFFA2, 0),
+        (settings + crate::d1_roi::platform::status::settings(0x90), live, 0x80802A75, crate::d1_roi::platform::tag(0x80AAC44C), 0, 0),
+        (settings + crate::d1_roi::platform::status::settings(0x418), live, 0x80802A75, crate::d1_roi::platform::tag(0x80AAC44A), 0, 0),
+        (settings + crate::d1_roi::platform::status::settings(0x438), live, 0x80802A75, crate::d1_roi::platform::tag(0x80AAC283), 0, 0),
+        (hud + crate::d1_roi::platform::status::hud(0x18), live + 0x30, 0x8080278D, crate::d1_roi::platform::tag(0x80AAC449), 0, 0),
+        (hud + crate::d1_roi::platform::status::hud(0x38), live + 0x30, 0x8080278D, crate::d1_roi::platform::tag(0x80AAC447), 0, 0),
+        (hud + crate::d1_roi::platform::status::hud(0x58), live + 0x30, 0x8080278D, crate::d1_roi::platform::tag(0x80AAC281), 0, 0),
+        (hud + crate::d1_roi::platform::status::hud(0x70), live + 0x30, 0x8080278D, crate::d1_roi::platform::tag(0x80AAC448), 0, 1),
+        (duration + crate::d1_roi::platform::status::duration(0x18), live + 0x50, 0x8080255D, crate::d1_roi::platform::tag(0x80AAC286), 0, 0),
+        (duration + crate::d1_roi::platform::status::duration(0x38), live + 0x50, 0x8080255D, crate::d1_roi::platform::tag(0x80AAC284), 0, 0),
+        (duration + crate::d1_roi::platform::status::duration(0x58), live + 0x50, 0x8080255D, crate::d1_roi::platform::tag(0x80AAEDB3), 0, 0),
+        (duration + crate::d1_roi::platform::status::duration(0x70), live + 0x50, 0x8080255D, crate::d1_roi::platform::tag(0x80AAC288), 0, 0),
+        (duration + crate::d1_roi::platform::status::duration(0x88), live + 0x50, 0x8080255D, crate::d1_roi::platform::tag(0x80AAC444), 0, 0),
         (
-            controller + 0x18,
+            controller + crate::d1_roi::platform::status::timer(0x18),
             live + 0x80,
             0x808027B5,
-            0x80AAEDB4,
+            crate::d1_roi::platform::tag(0x80AAEDB4),
             0xFF9C,
             0,
         ),
-        (controller + 0x30, live + 0x80, 0x808027B5, 0x80AAC285, 0, 2),
-        (controller + 0x48, live + 0x80, 0x808027B5, 0x80AAC289, 0, 0),
-        (controller + 0x60, live + 0x80, 0x808027B5, 0x80AAC287, 0, 0),
+        (controller + crate::d1_roi::platform::status::timer(0x30), live + 0x80, 0x808027B5, crate::d1_roi::platform::tag(0x80AAC285), 0, 2),
+        (controller + crate::d1_roi::platform::status::timer(0x48), live + 0x80, 0x808027B5, crate::d1_roi::platform::tag(0x80AAC289), 0, 0),
+        (controller + crate::d1_roi::platform::status::timer(0x60), live + 0x80, 0x808027B5, crate::d1_roi::platform::tag(0x80AAC287), 0, 0),
     ];
     for &(a, _, class, declaration, value, _) in &declarations {
         let container = match class {
@@ -241,7 +243,7 @@ fn validate(
             "Source status parameter has another path"
         );
         ensure!(
-            p.u64(a + 8)? == declaration as u64 && p.u64(a + 16)? == value,
+            crate::d1_roi::platform::declared(p, a)? == (declaration as u64, value),
             "Source status parameter has an unqualified driver"
         );
     }
@@ -281,7 +283,7 @@ fn validate(
         let a = usize::try_from(graph.u64(at + 24)?)?;
         let &(_, instance, class, declaration, value, output) = declarations
             .iter()
-            .find(|d| d.0 == a && a != settings + 0x90)
+            .find(|d| d.0 == a && a != settings + crate::d1_roi::platform::status::settings(0x90))
             .context("Unknown source status export")?;
         let selector = if value == 0 {
             0
@@ -305,40 +307,40 @@ fn validate(
     let reset_owned = companion.is_none()
         && bank.is_none()
         && network.is_none()
-        && p.u32(duration + 0xA0)? == 9
-        && p.u64(duration + 0xB0)? == 1
-        && p.u64(controller + 0x78)? == 0;
+        && p.u32(duration + crate::d1_roi::platform::status::duration(0xA0))? == 9
+        && p.u64(duration + crate::d1_roi::platform::status::duration(0xB0))? == 1
+        && p.u64(controller + crate::d1_roi::platform::status::timer(0x78))? == 0;
     ensure!(
-        p.u32(hud + 0x30)? == 0x80800955
-            && p.u32(hud + 0x50)? == 0x80800652
-            && p.u64(hud + 0x98)? == 0
-            && p.u64(duration + 0x30)? == 0x8080299F
-            && p.u64(duration + 0x50)? == 0x80802B20
-            && (p.u32(duration + 0xA0)? == 5
-                || (companion.is_none() && p.u32(duration + 0xA0)? == 9)
-                || (network.is_some() && p.u32(duration + 0xA0)? == 11)
-                || (companion.is_none() && network.is_none() && p.u32(duration + 0xA0)? == 0x17))
-            && i32::from_le_bytes(p.bytes(duration + 0xA8)?) >= 0
-            && (p.u64(duration + 0xB0)? == u64::from(companion.is_some())
-                || (network.is_some() && p.u64(duration + 0xB0)? == 1)
+        p.u32(hud + crate::d1_roi::platform::status::hud(0x30))? == 0x80800955
+            && p.u32(hud + crate::d1_roi::platform::status::hud(0x50))? == 0x80800652
+            && p.u64(hud + crate::d1_roi::platform::status::hud(0x98))? == 0
+            && p.u64(duration + crate::d1_roi::platform::status::duration(0x30))? == 0x8080299F
+            && p.u64(duration + crate::d1_roi::platform::status::duration(0x50))? == 0x80802B20
+            && (p.u32(duration + crate::d1_roi::platform::status::duration(0xA0))? == 5
+                || (companion.is_none() && p.u32(duration + crate::d1_roi::platform::status::duration(0xA0))? == 9)
+                || (network.is_some() && p.u32(duration + crate::d1_roi::platform::status::duration(0xA0))? == 11)
+                || (companion.is_none() && network.is_none() && p.u32(duration + crate::d1_roi::platform::status::duration(0xA0))? == 0x17))
+            && i32::from_le_bytes(p.bytes(duration + crate::d1_roi::platform::status::duration(0xA8))?) >= 0
+            && (p.u64(duration + crate::d1_roi::platform::status::duration(0xB0))? == u64::from(companion.is_some())
+                || (network.is_some() && p.u64(duration + crate::d1_roi::platform::status::duration(0xB0))? == 1)
                 || reset_owned)
-            && (p.u64(controller + 0x78)? == u64::from(companion.is_none()) || reset_owned),
+            && (p.u64(controller + crate::d1_roi::platform::status::timer(0x78))? == u64::from(companion.is_none()) || reset_owned),
         "Source status has additional presentation or duration policy"
     );
     let count = match companion {
         Some(companion) => companion.threshold,
-        None => constant(p, hud + 0xA0, false)?,
+        None => constant(p, hud + crate::d1_roi::platform::status::hud(0xA0), false)?,
     };
     // The connected audio envelope is qualified for the retained timed status.
     // Other reset policies need their own sequence activation and cleanup evidence.
     ensure!(
         audio.is_none()
-            || (p.u32(duration + 0xA0)? == 9
-                && p.u64(duration + 0xB0)? == 0
-                && p.u64(controller + 0x78)? == 1),
+            || (p.u32(duration + crate::d1_roi::platform::status::duration(0xA0))? == 9
+                && p.u64(duration + crate::d1_roi::platform::status::duration(0xB0))? == 0
+                && p.u64(controller + crate::d1_roi::platform::status::timer(0x78))? == 1),
         "Connected status audio needs the qualified duration policy"
     );
-    let seconds = constant(p, duration + 0x138, bank.is_some())?;
+    let seconds = constant(p, duration + crate::d1_roi::platform::status::duration(0x138), bank.is_some())?;
     if reset_owned {
         // Duration construction deactivates this Timer before scalar initialization.
         // A matched message reactivates it without changing its retained zero, then
@@ -349,7 +351,7 @@ fn validate(
         );
         lifecycle::source(p, live)?;
     }
-    if p.u32(duration + 0xA0)? == 0x17 {
+    if p.u32(duration + crate::d1_roi::platform::status::duration(0xA0))? == 0x17 {
         // Both refresh callbacks restore a fixed positive lifetime during countdown.
         // Native preserves a longer current timer, while D1 replaces it. Dynamic and
         // connected lifetime writers cannot use this route. Their absence is checked
@@ -363,9 +365,9 @@ fn validate(
 
     Ok(Status {
         competition,
-        hud: p.bytes(hud + 0x88)?,
-        duration: Some(p.bytes(duration + 0xA0)?),
-        timer: Some(p.bytes(controller + 0x78)?),
+        hud: p.bytes(hud + crate::d1_roi::platform::status::hud(0x88))?,
+        duration: Some(p.bytes(duration + crate::d1_roi::platform::status::duration(0xA0))?),
+        timer: Some(p.bytes(controller + crate::d1_roi::platform::status::timer(0x78))?),
         count,
         seconds,
         display,
@@ -423,9 +425,9 @@ pub(super) fn is_icon(schema: &Payload) -> bool {
 pub(super) fn icon(p: &Payload, owner: u32) -> Result<Connected> {
     let live = p.pointer(16)?;
     let settings = p.pointer(24)?;
-    let hud = settings + 0x60;
-    let duration = hud + 0x160;
-    let controller = duration + 0xB8;
+    let hud = settings + crate::d1_roi::platform::status::settings(0x60);
+    let duration = hud + crate::d1_roi::platform::status::hud(0x160);
+    let controller = duration + crate::d1_roi::platform::status::duration(0xB8);
     ensure!(
         p.u32(live)? == owner && p.u32(settings)? == owner,
         "Source status icon root differs"
@@ -434,33 +436,33 @@ pub(super) fn icon(p: &Payload, owner: u32) -> Result<Connected> {
         (live + 0x30, hud, 0x8080278D, 0x8080254F),
         (live + 0x50, duration, 0x8080255D, 0x8080223C),
         (live + 0x80, controller, 0x808027B5, 0x80802890),
-        (live + 0xA0, duration + 0x138, 0x808008AC, 0x8080038D),
-        (live + 0xE0, hud + 0xA0, 0x8080084D, 0x808005A0),
-        (live + 0x110, hud + 0x108, 0x8080084D, 0x808005A0),
+        (live + 0xA0, duration + crate::d1_roi::platform::status::duration(0x138), 0x808008AC, 0x8080038D),
+        (live + 0xE0, hud + crate::d1_roi::platform::status::hud(0xA0), 0x8080084D, 0x808005A0),
+        (live + 0x110, hud + crate::d1_roi::platform::status::hud(0x108), 0x8080084D, 0x808005A0),
     ] {
         pair(p, owner, i, d, ic, dc)?;
     }
-    let flags = p.u32(duration + 0xA0)?;
+    let flags = p.u32(duration + crate::d1_roi::platform::status::duration(0xA0))?;
     ensure!(
-        p.u32(hud + 0x30)? == 0x80800955
-            && p.u32(hud + 0x50)? == 0x80800652
-            && p.u64(hud + 0x98)? == 0
-            && p.u64(duration + 0x30)? == 0x8080299F
-            && p.u64(duration + 0x50)? == 0x80802B20
+        p.u32(hud + crate::d1_roi::platform::status::hud(0x30))? == 0x80800955
+            && p.u32(hud + crate::d1_roi::platform::status::hud(0x50))? == 0x80800652
+            && p.u64(hud + crate::d1_roi::platform::status::hud(0x98))? == 0
+            && p.u64(duration + crate::d1_roi::platform::status::duration(0x30))? == 0x8080299F
+            && p.u64(duration + crate::d1_roi::platform::status::duration(0x50))? == 0x80802B20
             && flags & !0x1F == 0
-            && i32::from_le_bytes(p.bytes(duration + 0xA8)?) >= 0
-            && p.u64(duration + 0xB0)? <= 1
-            && p.u64(controller + 0x78)? <= 1,
+            && i32::from_le_bytes(p.bytes(duration + crate::d1_roi::platform::status::duration(0xA8))?) >= 0
+            && p.u64(duration + crate::d1_roi::platform::status::duration(0xB0))? <= 1
+            && p.u64(controller + crate::d1_roi::platform::status::timer(0x78))? <= 1,
         "Source status icon has additional presentation or duration policy"
     );
-    let priority = i32::from_le_bytes(p.bytes::<4>(hud + 0x8C)?);
+    let priority = i32::from_le_bytes(p.bytes::<4>(hud + crate::d1_roi::platform::status::hud(0x8C))?);
     ensure!(
         (-16_777_216..=16_777_216).contains(&priority),
         "Source status icon priority cannot be represented exactly"
     );
     let mut competition = [0; 8];
     competition[4..].copy_from_slice(&(priority as f32).to_le_bytes());
-    let lifetime_at = duration + 0x138;
+    let lifetime_at = duration + crate::d1_roi::platform::status::duration(0x138);
     ensure!(
         p.u64(lifetime_at + 88)? == 0 && [0, 0x811C9DC5].contains(&p.u64(lifetime_at + 96)?),
         "Source status icon lifetime has additional flags or a named input"
@@ -470,7 +472,7 @@ pub(super) fn icon(p: &Payload, owner: u32) -> Result<Connected> {
         input.is_none(),
         "Source status icon lifetime reads an input"
     );
-    let indefinite = p.u64(controller + 0x78)? == 1;
+    let indefinite = p.u64(controller + crate::d1_roi::platform::status::timer(0x78))? == 1;
     let lifetime = unnamed(p, lifetime_at, indefinite, code, constants)?;
     if flags & 0x10 != 0 {
         ensure!(
@@ -481,10 +483,10 @@ pub(super) fn icon(p: &Payload, owner: u32) -> Result<Connected> {
     }
     Ok(Connected {
         competition,
-        hud: p.bytes(hud + 0x88)?,
-        duration: p.bytes(duration + 0xA0)?,
-        timer: p.bytes(controller + 0x78)?,
-        count: constant(p, hud + 0xA0, false)?,
+        hud: p.bytes(hud + crate::d1_roi::platform::status::hud(0x88))?,
+        duration: p.bytes(duration + crate::d1_roi::platform::status::duration(0xA0))?,
+        timer: p.bytes(controller + crate::d1_roi::platform::status::timer(0x78))?,
+        count: constant(p, hud + crate::d1_roi::platform::status::hud(0xA0), false)?,
         lifetime,
         lifetime_input: None,
         provider_input: usize::MAX,
@@ -501,9 +503,9 @@ pub(super) fn timer(
     definition: usize,
 ) -> Result<([u8; 8], Lifetime)> {
     pair(p, owner, live, definition, 0x808027B5, 0x80802890)?;
-    let at = definition + 0x80;
+    let at = definition + crate::d1_roi::platform::status::timer(0x80);
     pair(p, owner, live + 0x20, at, 0x808008AC, 0x8080038D)?;
-    let flag = p.u64(definition + 0x78)?;
+    let flag = p.u64(definition + crate::d1_roi::platform::status::timer(0x78))?;
     ensure!(
         flag <= 1 && p.u64(at + 88)? == 0 && [0, 0x811C9DC5].contains(&p.u64(at + 96)?),
         "Source Timer has unknown flags or a named lifetime"
@@ -511,7 +513,7 @@ pub(super) fn timer(
     let (code, constants, input) = program(p, at)?;
     ensure!(input.is_none(), "Source Timer lifetime reads an input");
     Ok((
-        p.bytes(definition + 0x78)?,
+        p.bytes(definition + crate::d1_roi::platform::status::timer(0x78))?,
         unnamed(p, at, flag == 1, code, constants)?,
     ))
 }
@@ -556,7 +558,7 @@ pub(super) fn program(
             .all(|lane| f32::from_le_bytes(lane.try_into().unwrap()).is_finite())),
         "Source status program has a nonfinite constant"
     );
-    let inputs = p.array(at + 72, 48, Some(0x80800927))?;
+    let inputs = p.array(at + 72, crate::d1_roi::platform::input_row().0, Some(0x80800927))?;
     let mut position = 0;
     let mut reads = false;
     while position < code.len() {
@@ -611,11 +613,17 @@ pub(super) fn program(
             0x8080077D,
             0x80800927,
         )?;
+        // PS4 packs the row's empty word and its channel class into eight bytes.
+        let direct = if crate::d1_roi::platform::ps4() {
+            p.u32(row + 24)? == 0 && p.u32(row + 28)? == 0x808003E8
+        } else {
+            p.u64(row + 24)? == 0 && p.u64(row + 32)? == 0x808003E8
+        };
         ensure!(
-            p.u64(row + 24)? == 0 && p.u64(row + 32)? == 0x808003E8,
+            direct,
             "Source status program input is not a direct named channel"
         );
-        Some((p.u32(row + 40)?, row))
+        Some((p.u32(row + crate::d1_roi::platform::input_row().1)?, row))
     } else {
         ensure!(inputs.is_empty(), "Source status program has unused inputs");
         None
@@ -635,9 +643,9 @@ pub(super) fn connected(
 ) -> Result<Connected> {
     let live = p.pointer(16)?;
     let settings = p.pointer(24)?;
-    let hud = settings + 0xF0;
-    let duration = hud + 0x160;
-    let controller = duration + 0xB8;
+    let hud = settings + crate::d1_roi::platform::status::settings(0xF0);
+    let duration = hud + crate::d1_roi::platform::status::hud(0x160);
+    let controller = duration + crate::d1_roi::platform::status::duration(0xB8);
     ensure!(
         p.u32(live - 4)? == 0x80802A75 && p.u32(settings - 4)? == 0x80802698,
         "Source status root differs"
@@ -663,10 +671,10 @@ pub(super) fn connected(
         (live + 0x30, hud, 0x8080278D, 0x8080254F),
         (live + 0x50, duration, 0x8080255D, 0x8080223C),
         (live + 0x80, controller, 0x808027B5, 0x80802890),
-        (live + 0xA0, duration + 0x138, 0x808008AC, 0x8080038D),
-        (live + 0xE0, hud + 0xA0, 0x8080084D, 0x808005A0),
-        (live + 0x110, hud + 0x108, 0x8080084D, 0x808005A0),
-        (live + 0x170, settings + 0xB8, 0x808008AF, 0x80800456),
+        (live + 0xA0, duration + crate::d1_roi::platform::status::duration(0x138), 0x808008AC, 0x8080038D),
+        (live + 0xE0, hud + crate::d1_roi::platform::status::hud(0xA0), 0x8080084D, 0x808005A0),
+        (live + 0x110, hud + crate::d1_roi::platform::status::hud(0x108), 0x8080084D, 0x808005A0),
+        (live + 0x170, settings + crate::d1_roi::platform::status::settings(0xB8), 0x808008AF, 0x80800456),
     ] {
         pair(p, owner, i, d, ic, dc)?;
     }
@@ -675,49 +683,49 @@ pub(super) fn connected(
     // sequence, such as Eliksni Immunity's, whose request stays unbound. The native template
     // keeps its own receiver policy, and its unbound status rows stand in for the request.
     ensure!(
-        matches!(p.u64(settings + 0xD0)?, 0 | 2)
-            && p.u64(settings + 0xD8)? == 0x808003E3
-            && p.u64(settings + 0xE0)? == 0
-            && p.u64(settings + 0xE8)? == u32::MAX as u64
-            && p.u32(settings + 0xA8)? == 0x3C18FBCE
-            && p.u32(settings + 0xAC)? == 0
-            && p.u32(settings + 0xB0)? <= 0xFF,
+        matches!(crate::d1_roi::platform::status::receiver(p, settings)?.0, 0 | 2)
+            && crate::d1_roi::platform::status::receiver(p, settings)?.1 == 0x808003E3
+            && p.u64(settings + crate::d1_roi::platform::status::settings(0xE0))? == 0
+            && p.u64(settings + crate::d1_roi::platform::status::settings(0xE8))? == u32::MAX as u64
+            && p.u32(settings + crate::d1_roi::platform::status::settings(0xA8))? == 0x3C18FBCE
+            && p.u32(settings + crate::d1_roi::platform::status::settings(0xAC))? == 0
+            && p.u32(settings + crate::d1_roi::platform::status::settings(0xB0))? <= 0xFF,
         "Source connected status has a state program or unqualified competition flags"
     );
-    let priority = i32::from_le_bytes(p.bytes::<4>(hud + 0x8C)?);
+    let priority = i32::from_le_bytes(p.bytes::<4>(hud + crate::d1_roi::platform::status::hud(0x8C))?);
     ensure!(
         (-16_777_216..=16_777_216).contains(&priority),
         "Source status competition priority cannot be represented exactly"
     );
     scalar(p, settings, priority)?;
     let mut competition = [0; 8];
-    competition[0] = p.u8(settings + 0xB0)?;
+    competition[0] = p.u8(settings + crate::d1_roi::platform::status::settings(0xB0))?;
     competition[4..].copy_from_slice(&(priority as f32).to_le_bytes());
     let declarations: [(usize, usize, u32, u32, u64, u32); 17] = [
-        (settings + 0x60, live, 0x80802A75, 0x80AAC44B, 0, 0),
-        (settings + 0x78, live, 0x80802A75, 0x80AAC282, 0xFFA2, 0),
-        (settings + 0x418, live, 0x80802A75, 0x80AAC44A, 0, 0),
-        (settings + 0x438, live, 0x80802A75, 0x80AAC283, 0, 0),
-        (hud + 0x18, live + 0x30, 0x8080278D, 0x80AAC449, 0, 0),
-        (hud + 0x38, live + 0x30, 0x8080278D, 0x80AAC447, 0, 0),
-        (hud + 0x58, live + 0x30, 0x8080278D, 0x80AAC281, 0, 0),
-        (hud + 0x70, live + 0x30, 0x8080278D, 0x80AAC448, 0, 1),
-        (duration + 0x18, live + 0x50, 0x8080255D, 0x80AAC286, 0, 0),
-        (duration + 0x38, live + 0x50, 0x8080255D, 0x80AAC284, 0, 0),
-        (duration + 0x58, live + 0x50, 0x8080255D, 0x80AAEDB3, 0, 0),
-        (duration + 0x70, live + 0x50, 0x8080255D, 0x80AAC288, 0, 0),
-        (duration + 0x88, live + 0x50, 0x8080255D, 0x80AAC444, 0, 0),
+        (settings + crate::d1_roi::platform::status::settings(0x60), live, 0x80802A75, crate::d1_roi::platform::tag(0x80AAC44B), 0, 0),
+        (settings + crate::d1_roi::platform::status::settings(0x78), live, 0x80802A75, crate::d1_roi::platform::tag(0x80AAC282), 0xFFA2, 0),
+        (settings + crate::d1_roi::platform::status::settings(0x418), live, 0x80802A75, crate::d1_roi::platform::tag(0x80AAC44A), 0, 0),
+        (settings + crate::d1_roi::platform::status::settings(0x438), live, 0x80802A75, crate::d1_roi::platform::tag(0x80AAC283), 0, 0),
+        (hud + crate::d1_roi::platform::status::hud(0x18), live + 0x30, 0x8080278D, crate::d1_roi::platform::tag(0x80AAC449), 0, 0),
+        (hud + crate::d1_roi::platform::status::hud(0x38), live + 0x30, 0x8080278D, crate::d1_roi::platform::tag(0x80AAC447), 0, 0),
+        (hud + crate::d1_roi::platform::status::hud(0x58), live + 0x30, 0x8080278D, crate::d1_roi::platform::tag(0x80AAC281), 0, 0),
+        (hud + crate::d1_roi::platform::status::hud(0x70), live + 0x30, 0x8080278D, crate::d1_roi::platform::tag(0x80AAC448), 0, 1),
+        (duration + crate::d1_roi::platform::status::duration(0x18), live + 0x50, 0x8080255D, crate::d1_roi::platform::tag(0x80AAC286), 0, 0),
+        (duration + crate::d1_roi::platform::status::duration(0x38), live + 0x50, 0x8080255D, crate::d1_roi::platform::tag(0x80AAC284), 0, 0),
+        (duration + crate::d1_roi::platform::status::duration(0x58), live + 0x50, 0x8080255D, crate::d1_roi::platform::tag(0x80AAEDB3), 0, 0),
+        (duration + crate::d1_roi::platform::status::duration(0x70), live + 0x50, 0x8080255D, crate::d1_roi::platform::tag(0x80AAC288), 0, 0),
+        (duration + crate::d1_roi::platform::status::duration(0x88), live + 0x50, 0x8080255D, crate::d1_roi::platform::tag(0x80AAC444), 0, 0),
         (
-            controller + 0x18,
+            controller + crate::d1_roi::platform::status::timer(0x18),
             live + 0x80,
             0x808027B5,
-            0x80AAEDB4,
+            crate::d1_roi::platform::tag(0x80AAEDB4),
             0xFF9C,
             0,
         ),
-        (controller + 0x30, live + 0x80, 0x808027B5, 0x80AAC285, 0, 2),
-        (controller + 0x48, live + 0x80, 0x808027B5, 0x80AAC289, 0, 0),
-        (controller + 0x60, live + 0x80, 0x808027B5, 0x80AAC287, 0, 0),
+        (controller + crate::d1_roi::platform::status::timer(0x30), live + 0x80, 0x808027B5, crate::d1_roi::platform::tag(0x80AAC285), 0, 2),
+        (controller + crate::d1_roi::platform::status::timer(0x48), live + 0x80, 0x808027B5, crate::d1_roi::platform::tag(0x80AAC289), 0, 0),
+        (controller + crate::d1_roi::platform::status::timer(0x60), live + 0x80, 0x808027B5, crate::d1_roi::platform::tag(0x80AAC287), 0, 0),
     ];
     let exports = graph.array(0x68, 40, Some(0x80800370))?;
     let refs = graph.array(0x78, 24, Some(0x80800790))?;
@@ -756,8 +764,7 @@ pub(super) fn connected(
         };
         ensure!(
             p.pointer(a)? == container
-                && p.u64(a + 8)? == declaration as u64
-                && p.u64(a + 16)? == value
+                && crate::d1_roi::platform::declared(p, a)? == (declaration as u64, value)
                 && exclusion
                 && graph.u32(at + 4)? as usize == instance - live
                 && graph.u32(at + 8)? == selector
@@ -781,20 +788,20 @@ pub(super) fn connected(
     // 80FEF720 stores 07 in the same graph form. The match count at `+A8` carries as stored, zero
     // included, as stock Duration host 8157808D stores it, since both builds decrement and test it
     // on the same matching paths.
-    let flags = p.u32(duration + 0xA0)?;
+    let flags = p.u32(duration + crate::d1_roi::platform::status::duration(0xA0))?;
     ensure!(
-        p.u32(hud + 0x30)? == 0x80800955
-            && p.u32(hud + 0x50)? == 0x80800652
-            && p.u64(hud + 0x98)? == 0
-            && p.u64(duration + 0x30)? == 0x8080299F
-            && p.u64(duration + 0x50)? == 0x80802B20
+        p.u32(hud + crate::d1_roi::platform::status::hud(0x30))? == 0x80800955
+            && p.u32(hud + crate::d1_roi::platform::status::hud(0x50))? == 0x80800652
+            && p.u64(hud + crate::d1_roi::platform::status::hud(0x98))? == 0
+            && p.u64(duration + crate::d1_roi::platform::status::duration(0x30))? == 0x8080299F
+            && p.u64(duration + crate::d1_roi::platform::status::duration(0x50))? == 0x80802B20
             && flags & !0x1F == 0
-            && i32::from_le_bytes(p.bytes(duration + 0xA8)?) >= 0
-            && p.u64(duration + 0xB0)? <= 1
-            && p.u64(controller + 0x78)? <= 1,
+            && i32::from_le_bytes(p.bytes(duration + crate::d1_roi::platform::status::duration(0xA8))?) >= 0
+            && p.u64(duration + crate::d1_roi::platform::status::duration(0xB0))? <= 1
+            && p.u64(controller + crate::d1_roi::platform::status::timer(0x78))? <= 1,
         "Source connected status has additional presentation or duration policy"
     );
-    let lifetime_at = duration + 0x138;
+    let lifetime_at = duration + crate::d1_roi::platform::status::duration(0x138);
     ensure!(
         p.u32(lifetime_at + 16)? == 0x808008AC
             && p.u64(lifetime_at + 88)? == 0
@@ -806,7 +813,7 @@ pub(super) fn connected(
     // source method one clears its active byte, and native setter EDF2E0 calls EDF1E0 with zero,
     // which stores the active byte at +B1. The status then lasts until it is removed, so the
     // indefinite -1 literal carries, as on the elemental armor perks' statuses.
-    let indefinite = p.u64(controller + 0x78)? == 1;
+    let indefinite = p.u64(controller + crate::d1_roi::platform::status::timer(0x78))? == 1;
     let lifetime = match input {
         None => unnamed(p, lifetime_at, indefinite, code, constants)?,
         Some((name, _)) => Lifetime::Program {
@@ -835,14 +842,14 @@ pub(super) fn connected(
     }
     Ok(Connected {
         competition,
-        hud: p.bytes(hud + 0x88)?,
-        duration: p.bytes(duration + 0xA0)?,
-        timer: p.bytes(controller + 0x78)?,
-        count: constant(p, hud + 0xA0, false)?,
+        hud: p.bytes(hud + crate::d1_roi::platform::status::hud(0x88))?,
+        duration: p.bytes(duration + crate::d1_roi::platform::status::duration(0xA0))?,
+        timer: p.bytes(controller + crate::d1_roi::platform::status::timer(0x78))?,
+        count: constant(p, hud + crate::d1_roi::platform::status::hud(0xA0), false)?,
         lifetime,
         lifetime_input: input.map(|(_, row)| row),
-        provider_input: settings + 0xB8,
-        receiver_policy: p.u64(settings + 0xD0)?,
+        provider_input: settings + crate::d1_roi::platform::status::settings(0xB8),
+        receiver_policy: crate::d1_roi::platform::status::receiver(p, settings)?.0,
     })
 }
 

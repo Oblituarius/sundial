@@ -111,12 +111,18 @@ pub(super) fn connections(
             vec![
                 (0, 0x811C9DC5),
                 (8, status.0 as u64),
-                (16, (status.1 + 0xB8) as u64),
+                (
+                    16,
+                    (status.1 + crate::d1_roi::platform::status::settings(0xB8)) as u64,
+                ),
                 (24, 0x80800456),
                 (32, 0),
                 (40, 0x811C9DC5),
                 (48, sequence.0 as u64),
-                (56, (sequence.1 + 0xA8) as u64),
+                (
+                    56,
+                    (sequence.1 + crate::d1_roi::platform::sequence(0xA8)) as u64,
+                ),
                 (64, 0x80800988),
                 (72, 1),
                 (80, 0),
@@ -211,13 +217,18 @@ fn policy(p: &Payload, d: usize, native: bool) -> Result<()> {
             (0x50, 0),
             (0x58, 0),
             (0x158, 0x808006C0),
-            (0x258, 0x8000),
             (0x2C0, 0),
             (0x2C8, 0),
             (0x2D0, 0x100252000),
         ]
     };
     for (offset, value) in fields {
+        // Source fields sit where the source build puts them.
+        let offset = if native {
+            offset
+        } else {
+            crate::d1_roi::platform::sequence(offset)
+        };
         ensure!(
             p.u64(d + offset)? == value,
             "Sound sequence root policy differs at {offset:X}"
@@ -240,16 +251,37 @@ fn policy(p: &Payload, d: usize, native: bool) -> Result<()> {
     };
     for (start, end) in empty {
         ensure!(
-            (start..end)
-                .step_by(8)
-                .all(|at| p.u64(d + at).ok() == Some(0)),
+            (start..end).step_by(8).all(|at| {
+                let at = if native {
+                    at
+                } else {
+                    crate::d1_roi::platform::sequence(at)
+                };
+                p.u64(d + at).ok() == Some(0)
+            }),
             "Sound sequence has additional inputs, outputs or callback state"
         );
     }
-    let descriptor = d + if native { 0x250 } else { 0x248 };
+    let descriptor = d + if native {
+        0x250
+    } else {
+        crate::d1_roi::platform::sequence(0x248)
+    };
+    // The source declaration's trailing word is the `8000` Xbox One keeps at `+258`.
+    let declared = if native {
+        p.u64(descriptor + 8)? == 0x80C70B85
+    } else {
+        crate::d1_roi::platform::declared(p, descriptor)?
+            == (u64::from(crate::d1_roi::platform::tag(0x80AAD53C)), 0x8000)
+    };
     ensure!(
-        p.pointer(descriptor)? == d + if native { 0x1F0 } else { 0x1E0 }
-            && p.u64(descriptor + 8)? == if native { 0x80C70B85 } else { 0x80AAD53C },
+        p.pointer(descriptor)?
+            == d + if native {
+                0x1F0
+            } else {
+                crate::d1_roi::platform::sequence(0x1E0)
+            }
+            && declared,
         "Sound sequence callback parameter differs"
     );
     let rows = if native {
@@ -266,6 +298,11 @@ fn policy(p: &Payload, d: usize, native: bool) -> Result<()> {
         ]
     };
     for (offset, class, expected) in rows {
+        let offset = if native {
+            offset
+        } else {
+            crate::d1_roi::platform::sequence(offset)
+        };
         let rows = p.array(d + offset, expected.len(), Some(class))?;
         ensure!(
             rows.len() == 1
@@ -305,8 +342,18 @@ fn pairs(p: &Payload, owner: u32, (i, d): (usize, usize), native: bool) -> Resul
     } else {
         for (live, definition, ic, dc) in [
             (i, d, 0x8080079A, 0x80800610),
-            (i + 0x1C8, d + 0x1E0, 0x80801A67, 0x80801BEF),
-            (i + 0x1F8, d + 0x260, 0x80801C3B, 0x80801AF6),
+            (
+                i + 0x1C8,
+                d + crate::d1_roi::platform::sequence(0x1E0),
+                0x80801A67,
+                0x80801BEF,
+            ),
+            (
+                i + 0x1F8,
+                d + crate::d1_roi::platform::sequence(0x260),
+                0x80801C3B,
+                0x80801AF6,
+            ),
         ] {
             status::pair(p, owner, live, definition, ic, dc)?;
         }

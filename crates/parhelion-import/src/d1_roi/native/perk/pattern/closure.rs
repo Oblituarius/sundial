@@ -102,9 +102,9 @@ const PORTED: [(u32, u32); 9] = [
 ];
 
 fn ported(graph: u32) -> Option<u32> {
-    PORTED
-        .iter()
-        .find_map(|&(source, stock)| (source == graph).then_some(stock))
+    PORTED.iter().find_map(|&(source, stock)| {
+        (crate::d1_roi::platform::tag(source) == graph).then_some(stock)
+    })
 }
 
 /// The attached graph and every graph its creation events make or its condition volumes give,

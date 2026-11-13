@@ -87,7 +87,7 @@ impl Camera {
     pub fn read(source: &Source, owner: &Payload, at: usize) -> Result<Self> {
         ensure!(
             owner.u32(at.checked_sub(4).context("Source camera marker")?)? == 0x80802045
-                && owner.u32(at + 0x1C)? == 18,
+                && crate::d1_roi::platform::event_kind(owner, at)? == 18,
             "Source camera class or kind differs"
         );
         let body = owner
@@ -111,7 +111,11 @@ impl Camera {
                 ensure!(
                     usize::from(value)
                         < owner
-                            .array(owner.pointer(24)? + 0x1B0, 5, Some(0x80800429))?
+                            .array(
+                                owner.pointer(24)? + crate::d1_roi::platform::sequence(0x1B0),
+                                5,
+                                Some(0x80800429),
+                            )?
                             .len(),
                     "Source camera locator is undeclared"
                 );

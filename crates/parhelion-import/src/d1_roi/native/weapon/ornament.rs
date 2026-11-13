@@ -231,7 +231,8 @@ impl Source {
             "ornament":{"target_weapon":owner.item,"target_socket":choice.layout.lane,
                 "choice_index":choice.choice,"native_plug":choice.plug,
                 "native_socket_type":choice.layout.socket_type,
-                "plug_category":choice.layout.category,"name":name,"source_item":item.hash},
+                "plug_category":choice.layout.category,"default_reset":choice.layout.reset,
+                "name":name,"source_item":item.hash},
             "installable":true,"gameplay_verified":false,"limitations":limitations});
         crate::io::write_json(&folder.join("asset-graph.json"), &graph)?;
         crate::graph::check_particle_bindings(folder)?;

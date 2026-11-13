@@ -19,9 +19,11 @@ pub(super) fn controller_index(source: &Source, graph: &Payload) -> Result<Optio
         .into_iter()
         .map(|row| graph.u32(row))
         .collect::<Result<Vec<_>>>()?;
+    let network = crate::d1_roi::platform::tag(FRAMEWORK_NETWORK_OWNER);
     let index = match owners.as_slice() {
-        [_] | [_, FRAMEWORK_NETWORK_OWNER] => 0,
-        [FRAMEWORK_NETWORK_OWNER, _] => 1,
+        [_] => 0,
+        [_, second] if *second == network => 0,
+        [first, _] if *first == network => 1,
         _ => return Ok(None),
     };
     let owner = source.read(owners[index])?;
@@ -35,9 +37,12 @@ pub(super) fn source_action(source: &Source, graph: &Payload) -> Result<u32> {
         .map(|row| graph.u32(row))
         .collect::<Result<Vec<_>>>()?;
     let conditions = graph.array(0x88, 2, Some(0x80800006))?;
+    let network = crate::d1_roi::platform::tag(FRAMEWORK_NETWORK_OWNER);
+    let network_class = crate::d1_roi::platform::tag(FRAMEWORK_NETWORK_CLASS);
     let index = match owners.as_slice() {
-        [_] | [_, FRAMEWORK_NETWORK_OWNER] => 0,
-        [FRAMEWORK_NETWORK_OWNER, _] => 1,
+        [_] => 0,
+        [_, second] if *second == network => 0,
+        [first, _] if *first == network => 1,
         _ => anyhow::bail!("Nested controller graph has additional owners"),
     };
     ensure!(
@@ -64,8 +69,7 @@ pub(super) fn source_action(source: &Source, graph: &Payload) -> Result<u32> {
             own_exports.push(export);
         } else {
             ensure!(
-                graph.u32(export + 12)? == FRAMEWORK_NETWORK_CLASS
-                    && graph.u32(export + 16)? == FRAMEWORK_NETWORK_OWNER,
+                graph.u32(export + 12)? == network_class && graph.u32(export + 16)? == network,
                 "Nested controller exports additional behavior"
             );
         }
@@ -75,7 +79,7 @@ pub(super) fn source_action(source: &Source, graph: &Payload) -> Result<u32> {
             own_references.push(reference);
         } else {
             ensure!(
-                graph.u32(reference)? == FRAMEWORK_NETWORK_OWNER,
+                graph.u32(reference)? == network,
                 "Nested controller references additional behavior"
             );
         }
@@ -104,7 +108,7 @@ pub(super) fn source_action(source: &Source, graph: &Payload) -> Result<u32> {
             && graph.u32(export + 16)? == owner
             && graph.u32(export + 20)? == 0
             && graph.u64(export + 24)? == (settings + 0x70) as u64
-            && graph.u64(export + 32)? == 0x80AAE896
+            && graph.u64(export + 32)? == u64::from(crate::d1_roi::platform::tag(0x80AAE896))
             && graph.u32(reference)? == owner
             && graph.u32(reference + 4)? == 0
             && graph.u64(reference + 8)? == live as u64
@@ -139,7 +143,6 @@ pub(crate) fn wrapper(p: &Payload, owner: u32) -> Result<(usize, usize, u32)> {
         (0x50, 0),
         (0x58, 0),
         (0x60, 0),
-        (0x80, 0),
     ] {
         ensure!(
             p.u64(settings + offset)? == value,
@@ -148,7 +151,8 @@ pub(crate) fn wrapper(p: &Payload, owner: u32) -> Result<(usize, usize, u32)> {
     }
     ensure!(
         p.pointer(settings + 0x70)? == settings
-            && p.u64(settings + 0x78)? == 0x80AAE896
+            && crate::d1_roi::platform::declared(p, settings + 0x70)?
+                == (u64::from(crate::d1_roi::platform::tag(0x80AAE896)), 0)
             && p.u32(settings + 0x6C)? == 0
             && p.bytes::<40>(live + 0x18)?
                 == [

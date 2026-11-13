@@ -46,6 +46,15 @@ pub struct Layout {
 }
 
 impl Layout {
+    /// Names the lane's reset in an ornament link when it is not the shared Default Ornament.
+    /// The build checks the socket still starts with that reset, and assumes [`RESET`] for a
+    /// weapon link that names none.
+    pub fn name_reset(&self, link: &mut Value) {
+        if self.reset != RESET {
+            link["default_reset"] = json!(self.reset);
+        }
+    }
+
     /// Moves an appended lane past the `columns` lanes a recipe already uses, since a gameplay
     /// translation can add sockets after the donor's. Choose it before any appearance's identities,
     /// which follow the lane.

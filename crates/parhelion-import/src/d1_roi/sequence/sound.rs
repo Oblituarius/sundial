@@ -26,7 +26,7 @@ impl Sound {
     pub fn read(source: &Source, owner: &Payload, at: usize) -> Result<Self> {
         ensure!(
             owner.u32(at.checked_sub(4).context("Source sound event marker")?)? == 0x80801F00
-                && owner.u32(at + 0x1C)? == 2
+                && crate::d1_roi::platform::event_kind(owner, at)? == 2
                 && owner.u32(at + 0x24)? == 0
                 && owner.u64(at + 0x38)? == 0
                 && owner.u64(at + 0x40)? == 0
@@ -39,10 +39,21 @@ impl Sound {
             "Source sound event does not name a cue"
         );
         let definition = owner.pointer(24)?;
-        let inputs = owner.array(definition + 0x1A0, 48, Some(0x80800927))?;
+        let inputs = owner.array(
+            definition + crate::d1_roi::platform::sequence(0x1A0),
+            crate::d1_roi::platform::input_row().0,
+            Some(0x80800927),
+        )?;
         let locator = owner.u8(at + 0x48)?;
         ensure!(
-            (locator as usize) < owner.array(definition + 0x1B0, 5, Some(0x80800429))?.len(),
+            (locator as usize)
+                < owner
+                    .array(
+                        definition + crate::d1_roi::platform::sequence(0x1B0),
+                        5,
+                        Some(0x80800429)
+                    )?
+                    .len(),
             "Source sound locator is undeclared"
         );
         let rows = owner.array(at + 0x28, 4, Some(0x80800007))?;
@@ -59,7 +70,10 @@ impl Sound {
                 let input = *inputs
                     .get(index as usize)
                     .context("Source sound input is undeclared")?;
-                Ok((index, owner.u32(input + 0x28)?))
+                Ok((
+                    index,
+                    owner.u32(input + crate::d1_roi::platform::input_row().1)?,
+                ))
             })
             .collect::<Result<_>>()?;
         Ok(Self {

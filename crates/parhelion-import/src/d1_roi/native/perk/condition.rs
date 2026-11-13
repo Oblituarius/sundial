@@ -9,19 +9,6 @@ mod event_filter;
 mod group;
 mod player;
 
-/// A whole condition list that translates as a set rather than node by node.
-pub(super) fn list(
-    source: &Source,
-    p: &Payload,
-    nodes: &[usize],
-    native: Option<&mut Reader>,
-) -> Result<Option<Vec<NativeNode>>> {
-    match native {
-        Some(native) if !nodes.is_empty() => ability_event::element(source, native, p, nodes),
-        _ => Ok(None),
-    }
-}
-
 /// The refusal of a source game event that has no qualified Shadowkeep event.
 pub(super) const ABSENT_GAME_EVENT: &str =
     "Source game event has no qualified native event and context pair";
@@ -32,11 +19,6 @@ pub(super) fn read(
     at: usize,
     mut native: Option<&mut Reader>,
 ) -> Result<Option<NativeNode>> {
-    // PS4 keeps the stock Orb of Light pickup event for the full-Super orb condition, which
-    // Empyrean Bellicose was imported with. The Xbox One build takes the adjustment event below.
-    if source.platform() == 7 && (p.u32(at - 4)?, p.u8(at + 5)?) == (0x808030AE, 35) {
-        return orb_with_full_super(p, at).map(Some);
-    }
     if let Some(node) = event_filter::read(source, p, at, native.as_deref_mut())? {
         return Ok(Some(node));
     }
@@ -70,9 +52,6 @@ pub(super) fn read(
             at,
         )
         .map(Some);
-    }
-    if (class, kind) == (0x8080313D, 5) {
-        return damage_taken::read(source, p, at, native).map(Some);
     }
     if (class, kind) == (0x80802917, 32) {
         return group::read(source, p, at, native).map(Some);
@@ -110,9 +89,6 @@ pub(super) fn read(
             kind: 32,
             bytes: graph.emit().map_err(anyhow::Error::msg)?,
         }));
-    }
-    if (class, kind) == (0x808030AE, 35) {
-        return orb_with_full_super(p, at).map(Some);
     }
     if (class, kind) == (0x808030ED, 34) {
         ensure!(
@@ -384,32 +360,4 @@ fn weapon(
         kind: native_kind,
         bytes: graph.emit().map_err(anyhow::Error::msg)?,
     })
-}
-
-/// Source event class `808030AE` (kind 35) with no key and an event value of at least 0.0294,
-/// the energy an Orb of Light offers a full Super. Only three source actions read it
-/// (`80A7F0B4`, `80A7F0B5`, `80A7F0DE`: melee, grenade and ammunition on "Orbs collected while
-/// your Super is full"), each nested in a player predicate whose ability range keeps Super at
-/// [1, 1]. It becomes the native Orb of Light pickup event that stock Invigoration (perk 946)
-/// starts on, and the enclosing predicate keeps the full-Super gate.
-fn orb_with_full_super(p: &Payload, at: usize) -> Result<NativeNode> {
-    let low = p.f32(at + 0x18)?;
-    ensure!(
-        (0.0..=1.0).contains(&p.f32(at)?)
-            && p.u8(at + 4)? == 0xFF
-            && p.u8(at + 6)? == 0
-            && p.bytes::<8>(at + 8)? == [0; 8]
-            && p.u32(at + 0x10)? == u32::MAX
-            && p.u32(at + 0x14)? == 0
-            && low > 0.0
-            && low < 0.1
-            && p.f32(at + 0x1C)? == 1.0
-            && p.bytes::<8>(at + 0x20)? == [0; 8],
-        "Source energy-offer event is not the full-Super orb pickup"
-    );
-    let mut bytes = p.bytes::<16>(at)?.to_vec();
-    bytes[5] = 12;
-    bytes[8..12].copy_from_slice(&0x6CEC_7A87u32.to_le_bytes());
-    bytes[12..16].copy_from_slice(&0x18CC_BF24u32.to_le_bytes());
-    Ok(NativeNode { kind: 12, bytes })
 }

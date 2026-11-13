@@ -14,7 +14,11 @@ pub(super) fn lower(
     );
     let m = data.pointer(row + 32)?;
     let children = data.array(m, 8, Some(0x8080299D))?;
-    let inputs = data.array(data.pointer(24)? + 0xC0, 56, Some(0x808023B9))?;
+    let inputs = data.array(
+        data.pointer(24)? + crate::d1_roi::platform::field(0xC0, 0xB0),
+        crate::d1_roi::platform::field(56, 48),
+        Some(0x808023B9),
+    )?;
     let first = usize::try_from(data.u32(m + 16)?)?;
     let count = children.len();
     ensure!(

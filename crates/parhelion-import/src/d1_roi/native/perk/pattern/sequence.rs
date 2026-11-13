@@ -178,7 +178,7 @@ fn providers(
         );
         let &(sf, _nf, si, ni, sc, nc, sm, nm) = PROVIDERS
             .iter()
-            .find(|row| offset == if from { row.0 } else { row.1 })
+            .find(|row| offset == if from { crate::d1_roi::platform::sequence(row.0) } else { row.1 })
             .context("HUD sequence exports an unqualified provider")?;
         let embedded = sf >= 0x278;
         let implementation = match (from, embedded) {
@@ -188,7 +188,7 @@ fn providers(
             (false, true) => 0x808072CB,
         };
         let target = if embedded {
-            d + if from { 0x260 } else { 0x270 }
+            d + if from { crate::d1_roi::platform::sequence(0x260) } else { 0x270 }
         } else {
             d
         };
@@ -204,8 +204,11 @@ fn providers(
         };
         ensure!(
             p.pointer(at)? == target
-                && p.u32(at + 12)? == 0
-                && p.u64(at + 16)? == u64::from(selector as u16)
+                && if from {
+                    crate::d1_roi::platform::declared(p, at)?.1 == u64::from(selector as u16)
+                } else {
+                    p.u32(at + 12)? == 0 && p.u64(at + 16)? == u64::from(selector as u16)
+                }
                 && graph.u32(export)? == if sf == 0x78 { exclusion << 16 } else { 0 }
                 && graph.u32(export + 4)? as usize == live - i
                 && graph.u32(export + 8)? == selector
@@ -290,7 +293,7 @@ pub(super) fn read(
         (0x2D8, 0),
     ] {
         ensure!(
-            p.u64(s + field)? == value,
+            p.u64(s + crate::d1_roi::platform::sequence(field))? == value,
             "HUD sequence root state differs at {field:X}"
         );
     }
@@ -298,7 +301,7 @@ pub(super) fn read(
         ensure!(
             (start..end)
                 .step_by(8)
-                .all(|at| p.u64(s + at).ok() == Some(0)),
+                .all(|at| p.u64(s + crate::d1_roi::platform::sequence(at)).ok() == Some(0)),
             "HUD sequence has additional inputs, outputs, locators or callback state"
         );
     }
@@ -347,7 +350,7 @@ pub(super) fn read(
             "Native HUD sequence has additional state"
         );
     }
-    let controls = p.array(s + 0x160, 8, Some(0x80800629))?;
+    let controls = p.array(s + crate::d1_roi::platform::sequence(0x160), 8, Some(0x80800629))?;
     let control = p.pointer(controls[0])?;
     let native_controls = target.array(n + 0x158, 24, Some(0x808093E6))?;
     let native_events = target.array(n + 0x168, 24, Some(0x808093E6))?;

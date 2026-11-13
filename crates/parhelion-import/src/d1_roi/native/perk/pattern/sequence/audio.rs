@@ -62,7 +62,7 @@ pub(in super::super) fn read(
         "Status sound sequence needs one complete control and event"
     );
     let (s, n) = (p.pointer(24)?, target.pointer(24)?);
-    let control = p.pointer(p.array(s + 0x160, 8, Some(0x80800629))?[0])?;
+    let control = p.pointer(p.array(s + crate::d1_roi::platform::sequence(0x160), 8, Some(0x80800629))?[0])?;
     let event = tree.events()[0].offset;
     let controls = target.array(n + 0x158, 24, Some(0x808093E6))?;
     let events = target.array(n + 0x168, 24, Some(0x808093E6))?;

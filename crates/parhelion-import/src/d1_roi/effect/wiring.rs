@@ -255,7 +255,10 @@ impl Roles<'_> {
             consumer.ordinal,
             "Incoming damage row without its source owner",
         )?;
-        let (_, _, input) = pattern::program(source_owner, source_owner.pointer(24)? + 0x98)?;
+        let (_, _, input) = pattern::program(
+            source_owner,
+            source_owner.pointer(24)? + crate::d1_roi::platform::field(0x98, 0x90),
+        )?;
         ensure!(
             input.map(|(_, at)| at as u64) == Some(row.consumer.offset),
             "Source incoming damage channel input is not its program input"
@@ -385,7 +388,11 @@ impl Roles<'_> {
             "Receiver getter row without its source receiver",
         )?;
         let place = source_receiver
-            .array(source_receiver.pointer(24)? + 0x90, 0x50, Some(0x80800884))?
+            .array(
+                source_receiver.pointer(24)? + crate::d1_roi::platform::receiver_rows().0,
+                crate::d1_roi::platform::receiver_rows().1,
+                Some(0x80800884),
+            )?
             .iter()
             .position(|&at| (at + 0x18) as u64 == row.provider.offset)
             .context("Source receiver getter is not one of its rows'")?;

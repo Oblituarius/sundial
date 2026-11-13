@@ -406,15 +406,15 @@ pub(super) fn armor_attachment_inner(
 fn status_key(owner: &Payload, tag: u32) -> Result<u32> {
     let settings = owner.pointer(24)?;
     let live = owner.pointer(16)?;
-    let duration = settings + 0x250;
+    let duration = settings + crate::d1_roi::platform::status::settings(0xF0) + crate::d1_roi::platform::status::hud(0x160);
     ensure!(
         owner.u32(settings - 4)? == 0x80802698
             && owner.u32(live - 4)? == 0x80802A75
-            && owner.u32(duration + 0xA0)? & !0x1F == 0,
+            && owner.u32(duration + crate::d1_roi::platform::status::duration(0xA0))? & !0x1F == 0,
         "Source attachment cleanup key needs a qualified timed status"
     );
     status::pair(owner, tag, live + 0x50, duration, 0x8080255D, 0x8080223C)?;
-    owner.u32(duration + 0xA4)
+    owner.u32(duration + crate::d1_roi::platform::status::duration(0xA4))
 }
 
 /// Admit a removal key only when this action also creates its status publisher.
@@ -642,10 +642,13 @@ pub(super) fn read(
 /// Eliksni Immunity's status follows the framework network, as Touch of Malice's status and
 /// Duration host do, and Devil's Touch's status follows two other owners.
 pub(super) fn closure_form(source: &Source, p: &Payload, at: usize) -> Result<bool> {
-    // The closure reads source sequence definitions in the Xbox One layout, which PS4 shifts.
-    // PS4 keeps the attachment routes its elemental armor talents (Twilight Garrison) and
-    // Antigrav Thrusters (Empyrean Bellicose) were imported with.
-    if source.platform() == 7 || p.u32(at - 4)? != 0x80802953 || p.u8(at)? != 0 {
+    // PS4 takes the closure as Xbox One does. `PARHELION_D1_PS4_LEGACY_ATTACH` keeps the dedicated
+    // routes its elemental armor talents (Twilight Garrison) and Antigrav Thrusters (Empyrean
+    // Bellicose) were first verified with in game, to compare the two in play.
+    if (source.platform() == 7 && std::env::var_os("PARHELION_D1_PS4_LEGACY_ATTACH").is_some())
+        || p.u32(at - 4)? != 0x80802953
+        || p.u8(at)? != 0
+    {
         return Ok(false);
     }
     if p.u8(at + 2)? == 3 {
@@ -669,7 +672,9 @@ pub(super) fn closure_form(source: &Source, p: &Payload, at: usize) -> Result<bo
         owner.u32(owner.pointer(24)? - 4)
     };
     match owners.as_slice() {
-        [0x80AA_CEA6, status] => Ok(class(*status)? == 0x8080_2698),
+        [network, status] if *network == crate::d1_roi::platform::tag(0x80AA_CEA6) => {
+            Ok(class(*status)? == 0x8080_2698)
+        }
         // A status beside a sequence, or beside a channel bank that inherits nothing, has no
         // dedicated form. The sound form keeps a network as its third owner, and the conditional
         // form's bank inherits the channel the status count reads.
@@ -683,7 +688,7 @@ pub(super) fn closure_form(source: &Source, p: &Payload, at: usize) -> Result<bo
                 // bank that inherits nothing leaves the dedicated route.
                 0x8080_08F6 => {
                     let bank = source.read(*companion)?;
-                    Ok(bank.u64(bank.pointer(24)? + 0x108)? == 0)
+                    Ok(bank.u64(bank.pointer(24)? + crate::d1_roi::platform::bank(0x108))? == 0)
                 }
                 _ => Ok(false),
             }

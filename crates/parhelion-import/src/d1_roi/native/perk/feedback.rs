@@ -96,11 +96,24 @@ fn graph_record(
                 .context("Feedback component marker")?,
         )? == 0x808020DE;
     }
-    // PS4 keeps omitting a modifier-bank feedback graph, as before upstream translated it;
-    // Zhalo Supercell's Persistence and Twilight Garrison's talents were verified so in game.
-    if !modifier || source.platform() == 7 {
+    if !modifier {
         return Ok(None);
     }
+    match modifier_record(source, native, p, at, tag) {
+        // PS4 imports predate this route and left every feedback modifier bank out. One with no
+        // stock counterpart stays left out there rather than refusing a talent that imported.
+        Err(_) if source.platform() == 7 => Ok(None),
+        record => record.map(Some),
+    }
+}
+
+fn modifier_record(
+    source: &Source,
+    native: Option<&mut Reader>,
+    p: &Payload,
+    at: usize,
+    tag: u32,
+) -> Result<NativeRecord> {
     ensure!(
         p.u8(at + 1)? == 0xFF && p.u8(at)? & !15 == 0 && p.u8(at + 2)? <= 3,
         "Source feedback modifier record has another admission, phase or target"
@@ -113,11 +126,11 @@ fn graph_record(
     let mut bytes = vec![0; 24];
     bytes[..3].copy_from_slice(&p.bytes::<3>(at)?);
     bytes[16..20].copy_from_slice(&stock.to_le_bytes());
-    Ok(Some(NativeRecord {
+    Ok(NativeRecord {
         class: 0x80804087,
         bytes,
         hud_status: None,
-    }))
+    })
 }
 
 pub(super) fn read(

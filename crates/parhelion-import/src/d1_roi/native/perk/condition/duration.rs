@@ -96,21 +96,25 @@ fn shared(source: &Source, native: &mut Reader, key: u32, from: u32, to: u32) ->
 }
 
 fn stock(source: &Source, native: &mut Reader, key: u32) -> Result<()> {
-    let tag = 0x80A752C8;
+    let tag = crate::d1_roi::platform::tag(0x80A752C8);
     ensure!(
         source.reference(tag)? == 0x80800861,
         "Source external duration publisher class differs"
     );
     let owner = source.read(tag)?;
     let (instance, duration) = publisher(&owner, tag, true, key)?;
-    for graph in [0x80A6B0F3, 0x80B00C2F] {
+    for graph in [
+        crate::d1_roi::platform::tag(0x80A6B0F3),
+        crate::d1_roi::platform::tag(0x80B00C2F),
+    ] {
         ensure!(
             source.reference(graph)? == 0x80800734,
             "Source external duration graph class differs"
         );
         contains(&source.read(graph)?, 32, tag)?;
     }
-    let provider = source.read(owner.u32(duration + 0x60)?)?;
+    let provider =
+        source.read(owner.u32(duration + crate::d1_roi::platform::status::duration(0x58) + 8)?)?;
     methods(&owner, &provider, instance, true)?;
     for (graph, tag) in [(0x80BEB776, 0x80C3DE2C), (0x80BC8307, 0x80BC49CC)] {
         let graph = native.tag(graph, Some(0x80809C0F))?;
@@ -140,7 +144,13 @@ fn publisher(p: &Payload, tag: u32, from: bool, key: u32) -> Result<(usize, usiz
     let live = p.pointer(16)?;
     let settings = p.pointer(24)?;
     let instance = live + 0x50;
-    let duration = settings + if from { 0x250 } else { 0x228 };
+    let duration = settings
+        + if from {
+            crate::d1_roi::platform::status::settings(0xF0)
+                + crate::d1_roi::platform::status::hud(0x160)
+        } else {
+            0x228
+        };
     let implementation = if from { 0x8080255D } else { 0x80803B32 };
     let definition = if from { 0x8080223C } else { 0x80803B33 };
     ensure!(
@@ -160,14 +170,25 @@ fn publisher(p: &Payload, tag: u32, from: bool, key: u32) -> Result<(usize, usiz
             "External duration publisher has a different reciprocal pair"
         );
     }
-    let policy = duration + if from { 0xA0 } else { 0x98 };
+    let policy = duration
+        + if from {
+            crate::d1_roi::platform::status::duration(0xA0)
+        } else {
+            0x98
+        };
     for (index, expected) in [5, key, 1, 99, 0].into_iter().enumerate() {
         ensure!(
             p.u32(policy + index * 4)? == expected,
             "External duration publisher key or policy differs"
         );
     }
-    let hud = settings + if from { 0x178 } else { 0x160 };
+    let hud = settings
+        + if from {
+            crate::d1_roi::platform::status::settings(0xF0)
+                + crate::d1_roi::platform::status::hud(0x88)
+        } else {
+            0x160
+        };
     ensure!(
         p.u32(hud)? == 0xD491B5AC && p.u32(hud + 4)? == 99,
         "External duration publisher has another status identity"

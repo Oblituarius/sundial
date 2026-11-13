@@ -124,7 +124,7 @@ impl Scope<'_> {
             |stock: u32| !template.owners.contains_key(&Family::Status) || native_tag == stock;
         FRAMEWORK
             .iter()
-            .find(|(s, stock)| *s == owner && retains(*stock))
+            .find(|(s, stock)| crate::d1_roi::platform::tag(*s) == owner && retains(*stock))
             .map(|&(_, stock)| stock)
     }
 }
@@ -238,8 +238,13 @@ fn stock_inputs(
     let mut map = BTreeMap::new();
     for (field, stock_field) in [(0x1A0, 0x188), (0x2A8, 0x2B8)] {
         let stock_inputs = native_owner.array(to + stock_field, 40, Some(0x80809789))?;
-        for row in payload.array(from + field, 48, Some(0x80800927))? {
-            let name = payload.u32(row + 0x28)?;
+        let (stride, name_at) = crate::d1_roi::platform::input_row();
+        for row in payload.array(
+            from + crate::d1_roi::platform::sequence(field),
+            stride,
+            Some(0x80800927),
+        )? {
+            let name = payload.u32(row + name_at)?;
             let matched = stock_inputs
                 .iter()
                 .copied()

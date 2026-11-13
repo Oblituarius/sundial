@@ -113,7 +113,15 @@ pub(super) fn damage(target: &mut Payload, source: &Payload) -> Result<Value> {
         );
     }
     let count = |p: &Payload, at: usize| p.u64(at);
-    let sections = source.array(s + 0x1C8, 0xD0, Some(0x808029BC))?;
+    // PS4 packs the definition's eleven interface declarations, as its class reflection lists
+    // them (schema tag `80AAC4E7`): the routing arrays sit `58` earlier and the accelerations
+    // and display flags `70` earlier. The stats, vitality and sections keep their offsets.
+    let ps4 = crate::d1_roi::platform::ps4();
+    let sections = source.array(
+        s + 0x1C8,
+        crate::d1_roi::platform::field(0xD0, 0xC8),
+        Some(0x808029BC),
+    )?;
     let native_sections = target.array(n + 0x1B0, 0x138, Some(0x80804C11))?;
     // Each section row opens with its reciprocal owner header. The name and its value follow at
     // source `+18/+1C` and native `+10/+14`.
@@ -135,13 +143,15 @@ pub(super) fn damage(target: &mut Payload, source: &Payload) -> Result<Value> {
         (0x380, 0x3A8, 0),
     ] {
         ensure!(
-            count(source, s + from)? == expected && count(target, n + to)? == expected,
+            count(source, s + if ps4 { from - 0x58 } else { from })? == expected
+                && count(target, n + to)? == expected,
             "Source damage component has other routings, shields, meters or regions"
         );
     }
     ensure!(
-        source.bytes::<0x18>(s + 0x500)? == target.bytes::<0x18>(n + 0x500)?
-            && source.bytes::<2>(s + 0x550)? == [1, 1]
+        source.bytes::<0x18>(s + crate::d1_roi::platform::field(0x500, 0x490))?
+            == target.bytes::<0x18>(n + 0x500)?
+            && source.bytes::<2>(s + crate::d1_roi::platform::field(0x550, 0x4E0))? == [1, 1]
             && target.bytes::<2>(n + 0x580)? == [1, 1],
         "Source damage accelerations or display flags differ"
     );
@@ -283,7 +293,8 @@ pub(super) fn receiver(
         source.u32(si - 4)? == 0x808006F7 && source.u32(sd - 4)? == 0x808005A8,
         "Source receiver root differs"
     );
-    let source_rows = source.array(sd + 0x90, 0x50, Some(0x80800884))?;
+    let (table, stride, name_at, lanes_at) = crate::d1_roi::platform::receiver_rows();
+    let source_rows = source.array(sd + table, stride, Some(0x80800884))?;
     let source_live = source.array(si + 0x30, 0x28, Some(0x808004E2))?;
     ensure!(
         !source_rows.is_empty()
@@ -295,11 +306,11 @@ pub(super) fn receiver(
     let mut names = BTreeSet::new();
     for (&row, &live) in source_rows.iter().zip(&source_live) {
         let value = source.f32(live + 0x20)?;
-        let name = source.u32(row + 0x30)?;
+        let name = source.u32(row + name_at)?;
         ensure!(
             source.u64(row + 8)? == live as u64
                 && source.u64(live + 8)? == row as u64
-                && (0..4).all(|lane| source.f32(row + 0x40 + lane * 4).ok() == Some(value))
+                && (0..4).all(|lane| source.f32(row + lanes_at + lane * 4).ok() == Some(value))
                 && value.is_finite()
                 && (-100.0..=100.0).contains(&value)
                 && names.insert(name),
@@ -422,12 +433,20 @@ pub(super) fn shape(p: &Payload, old: bool) -> Result<Shape> {
         found.sort_unstable();
         Ok(found)
     };
+    // A source bank's fields sit where its build puts them.
+    let field = |xbox: usize| {
+        if old {
+            crate::d1_roi::platform::bank(xbox)
+        } else {
+            xbox
+        }
+    };
     Ok(Shape {
-        count: p.array(root + 0xD8, 112, None)?.len(),
-        inherited: ordinals(root + 0x108)?,
-        incoming: ordinals(root + 0x118)?,
-        public: ordinals(root + 0xF8)?,
-        span: p.bytes::<4>(root + 0x128)?,
+        count: p.array(root + field(0xD8), 112, None)?.len(),
+        inherited: ordinals(root + field(0x108))?,
+        incoming: ordinals(root + field(0x118))?,
+        public: ordinals(root + field(0xF8))?,
+        span: p.bytes::<4>(root + field(0x128))?,
     })
 }
 
@@ -438,7 +457,7 @@ pub(super) fn channel(target: &mut Payload, source: &Payload) -> Result<Value> {
     ensure!(
         source.u32(s - 4)? == 0x808008F6
             && source.u32(source.pointer(16)? - 4)? == 0x80800594
-            && source.u64(s + 0xE8)? == 0,
+            && source.u64(s + crate::d1_roi::platform::bank(0xE8))? == 0,
         "Source channel bank root differs"
     );
     let (_, c) = pair(target)?;
@@ -446,18 +465,28 @@ pub(super) fn channel(target: &mut Payload, source: &Payload) -> Result<Value> {
         target.u32(c - 4)? == 0x80809790,
         "Native channel bank root differs"
     );
-    let source_rows = source.array(s + 0xD8, 112, Some(0x80800883))?;
+    let source_rows = source.array(
+        s + crate::d1_roi::platform::bank(0xD8),
+        112,
+        Some(0x80800883),
+    )?;
     let native_rows = target.array(c + 0xD8, 112, Some(0x808097A1))?;
     let names = source_rows
         .iter()
         .map(|&row| source.u32(row))
         .collect::<Result<Vec<_>>>()?;
-    let (inherited, incoming) = (lookup(source, s + 0x108)?, lookup(source, s + 0x118)?);
+    let (inherited, incoming) = (
+        lookup(source, s + crate::d1_roi::platform::bank(0x108))?,
+        lookup(source, s + crate::d1_roi::platform::bank(0x118))?,
+    );
     let (native_inherited, native_incoming) =
         (lookup(target, c + 0x108)?, lookup(target, c + 0x118)?);
     // Public `+F8` rows export a declaration for other banks on the host to inherit, sorted by
     // name. They carry when both banks export the same ordinals.
-    let (public, native_public) = (lookup(source, s + 0xF8)?, lookup(target, c + 0xF8)?);
+    let (public, native_public) = (
+        lookup(source, s + crate::d1_roi::platform::bank(0xF8))?,
+        lookup(target, c + 0xF8)?,
+    );
     let ordinals = |rows: &[(u32, u32, u32)]| {
         let mut found = rows.iter().map(|row| row.2).collect::<Vec<_>>();
         found.sort_unstable();
@@ -468,7 +497,8 @@ pub(super) fn channel(target: &mut Payload, source: &Payload) -> Result<Value> {
             && ordinals(&inherited) == ordinals(&native_inherited)
             && ordinals(&incoming) == ordinals(&native_incoming)
             && ordinals(&public) == ordinals(&native_public)
-            && source.bytes::<4>(s + 0x128)? == target.bytes::<4>(c + 0x128)?,
+            && source.bytes::<4>(s + crate::d1_roi::platform::bank(0x128))?
+                == target.bytes::<4>(c + 0x128)?,
         "Native channel bank declarations have other roles"
     );
     for (&from, &to) in source_rows.iter().zip(&native_rows) {

@@ -20,7 +20,7 @@ pub(crate) struct Host {
 pub(crate) fn read(graph: &Payload, p: &Payload, owner: u32, ordinal: usize) -> Result<Host> {
     let (live, s) = (p.pointer(16)?, p.pointer(24)?);
     let d = s + 0x60;
-    let timer = d + 0xB8;
+    let timer = d + crate::d1_roi::platform::status::duration(0xB8);
     ensure!(
         p.u32(s - 4)? == 0x808029C3 && p.u32(live - 4)? == 0x8080222E,
         "Source Duration host root differs"
@@ -29,7 +29,12 @@ pub(crate) fn read(graph: &Payload, p: &Payload, owner: u32, ordinal: usize) -> 
         (live, s, 0x8080222E, 0x808029C3),
         (live + 0x30, d, 0x8080255D, 0x8080223C),
         (live + 0x60, timer, 0x808027B5, 0x80802890),
-        (live + 0x80, d + 0x138, 0x808008AC, 0x8080038D),
+        (
+            live + 0x80,
+            d + crate::d1_roi::platform::status::duration(0x138),
+            0x808008AC,
+            0x8080038D,
+        ),
     ] {
         pair(p, owner, i, def, ic, dc)?;
     }
@@ -50,15 +55,78 @@ pub(crate) fn read(graph: &Payload, p: &Payload, owner: u32, ordinal: usize) -> 
         );
     }
     let declarations: [(usize, usize, u32, u32, u64, u32); 9] = [
-        (d + 0x18, live + 0x30, 0x8080255D, 0x80AAC286, 0, 0),
-        (d + 0x38, live + 0x30, 0x8080255D, 0x80AAC284, 0, 0),
-        (d + 0x58, live + 0x30, 0x8080255D, 0x80AAEDB3, 0, 0),
-        (d + 0x70, live + 0x30, 0x8080255D, 0x80AAC288, 0, 0),
-        (d + 0x88, live + 0x30, 0x8080255D, 0x80AAC444, 0, 0),
-        (timer + 0x18, live + 0x60, 0x808027B5, 0x80AAEDB4, 0xFF9C, 0),
-        (timer + 0x30, live + 0x60, 0x808027B5, 0x80AAC285, 0, 1),
-        (timer + 0x48, live + 0x60, 0x808027B5, 0x80AAC289, 0, 0),
-        (timer + 0x60, live + 0x60, 0x808027B5, 0x80AAC287, 0, 0),
+        (
+            d + crate::d1_roi::platform::status::duration(0x18),
+            live + 0x30,
+            0x8080255D,
+            crate::d1_roi::platform::tag(0x80AAC286),
+            0,
+            0,
+        ),
+        (
+            d + crate::d1_roi::platform::status::duration(0x38),
+            live + 0x30,
+            0x8080255D,
+            crate::d1_roi::platform::tag(0x80AAC284),
+            0,
+            0,
+        ),
+        (
+            d + crate::d1_roi::platform::status::duration(0x58),
+            live + 0x30,
+            0x8080255D,
+            crate::d1_roi::platform::tag(0x80AAEDB3),
+            0,
+            0,
+        ),
+        (
+            d + crate::d1_roi::platform::status::duration(0x70),
+            live + 0x30,
+            0x8080255D,
+            crate::d1_roi::platform::tag(0x80AAC288),
+            0,
+            0,
+        ),
+        (
+            d + crate::d1_roi::platform::status::duration(0x88),
+            live + 0x30,
+            0x8080255D,
+            crate::d1_roi::platform::tag(0x80AAC444),
+            0,
+            0,
+        ),
+        (
+            timer + crate::d1_roi::platform::status::timer(0x18),
+            live + 0x60,
+            0x808027B5,
+            crate::d1_roi::platform::tag(0x80AAEDB4),
+            0xFF9C,
+            0,
+        ),
+        (
+            timer + crate::d1_roi::platform::status::timer(0x30),
+            live + 0x60,
+            0x808027B5,
+            crate::d1_roi::platform::tag(0x80AAC285),
+            0,
+            1,
+        ),
+        (
+            timer + crate::d1_roi::platform::status::timer(0x48),
+            live + 0x60,
+            0x808027B5,
+            crate::d1_roi::platform::tag(0x80AAC289),
+            0,
+            0,
+        ),
+        (
+            timer + crate::d1_roi::platform::status::timer(0x60),
+            live + 0x60,
+            0x808027B5,
+            crate::d1_roi::platform::tag(0x80AAC287),
+            0,
+            0,
+        ),
     ];
     let exports = graph.array(0x68, 40, Some(0x80800370))?;
     let refs = graph.array(0x78, 24, Some(0x80800790))?;
@@ -91,8 +159,7 @@ pub(crate) fn read(graph: &Payload, p: &Payload, owner: u32, ordinal: usize) -> 
         };
         ensure!(
             p.pointer(a)? == container
-                && p.u64(a + 8)? == declaration as u64
-                && p.u64(a + 16)? == value
+                && crate::d1_roi::platform::declared(p, a)? == (declaration as u64, value)
                 && exclusion
                 && graph.u32(at + 4)? as usize == instance - live
                 && graph.u32(at + 8)? == selector
@@ -110,17 +177,18 @@ pub(crate) fn read(graph: &Payload, p: &Payload, owner: u32, ordinal: usize) -> 
         "Source Duration host exports are incomplete"
     );
     // The Duration flags and Timer byte have the consumers recorded on connected statuses.
-    let flags = p.u32(d + 0xA0)?;
+    let flags = p.u32(d + crate::d1_roi::platform::status::duration(0xA0))?;
     ensure!(
-        p.u64(d + 0x30)? == 0x8080299F
-            && p.u64(d + 0x50)? == 0x80802B20
+        p.u64(d + crate::d1_roi::platform::status::duration(0x30))? == 0x8080299F
+            && p.u64(d + crate::d1_roi::platform::status::duration(0x50))? == 0x80802B20
             && flags & !0x1F == 0
-            && i32::from_le_bytes(p.bytes(d + 0xA8)?) >= 0
-            && p.u64(d + 0xB0)? <= 1
-            && p.u64(timer + 0x78)? <= 1,
+            && i32::from_le_bytes(p.bytes(d + crate::d1_roi::platform::status::duration(0xA8))?)
+                >= 0
+            && p.u64(d + crate::d1_roi::platform::status::duration(0xB0))? <= 1
+            && p.u64(timer + crate::d1_roi::platform::status::timer(0x78))? <= 1,
         "Source Duration host has another matching or timer policy"
     );
-    let lifetime_at = d + 0x138;
+    let lifetime_at = d + crate::d1_roi::platform::status::duration(0x138);
     ensure!(
         p.u32(lifetime_at + 16)? == 0x808008AC
             && p.u64(lifetime_at + 88)? == 0
@@ -128,7 +196,7 @@ pub(crate) fn read(graph: &Payload, p: &Payload, owner: u32, ordinal: usize) -> 
         "Source Duration host lifetime has additional flags or a named input"
     );
     let (code, constants, input) = program(p, lifetime_at)?;
-    let indefinite = p.u64(timer + 0x78)? == 1;
+    let indefinite = p.u64(timer + crate::d1_roi::platform::status::timer(0x78))? == 1;
     let lifetime = match input {
         None => unnamed(p, lifetime_at, indefinite, code, constants)?,
         Some((name, _)) => Lifetime::Program {
@@ -148,8 +216,8 @@ pub(crate) fn read(graph: &Payload, p: &Payload, owner: u32, ordinal: usize) -> 
         );
     }
     Ok(Host {
-        duration: p.bytes(d + 0xA0)?,
-        timer: p.bytes(timer + 0x78)?,
+        duration: p.bytes(d + crate::d1_roi::platform::status::duration(0xA0))?,
+        timer: p.bytes(timer + crate::d1_roi::platform::status::timer(0x78))?,
         lifetime,
         lifetime_input: input.map(|(_, row)| row),
     })

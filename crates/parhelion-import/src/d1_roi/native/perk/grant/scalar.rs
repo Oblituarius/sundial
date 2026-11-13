@@ -17,7 +17,11 @@ pub(super) fn lower(
     let end = first
         .checked_add(count)
         .context("Source numeric input range overflow")?;
-    let inputs = data.array(data.pointer(24)? + 0xC0, 56, Some(0x808023B9))?;
+    let inputs = data.array(
+        data.pointer(24)? + crate::d1_roi::platform::field(0xC0, 0xB0),
+        crate::d1_roi::platform::field(56, 48),
+        Some(0x808023B9),
+    )?;
     ensure!(
         count > 0 && count == declarations.len() && end <= inputs.len(),
         "Source numeric declarations and flattened input range differ"
@@ -156,6 +160,19 @@ pub(super) fn validate_input(
 ) -> Result<()> {
     let owner = data.u32(data.pointer(16)?)?;
     let instance = usize::try_from(data.u64(flat + 8)?)?;
+    // PS4 packs the row's provider declaration, so the change and operation follow it eight
+    // bytes earlier. Its runtime rows come in two lengths across all twenty PS4 banks with such
+    // rows, 72 bytes as on Xbox One and 56, which keeps the weight and its flag sixteen bytes
+    // earlier.
+    let ps4 = crate::d1_roi::platform::ps4();
+    let weight = |at: usize| -> Result<bool> {
+        Ok(data.f32(instance + at)? == 1.0 && data.bytes::<4>(instance + at + 4)? == [1, 0, 0, 0])
+    };
+    let padding = if ps4 {
+        data.u32(flat + 36)? == 0
+    } else {
+        data.bytes::<12>(flat + 36)? == [0; 12]
+    };
     ensure!(
         data.u32(flat)? == owner
             && data.u32(flat + 16)? == 0x8080284A
@@ -164,11 +181,10 @@ pub(super) fn validate_input(
             && data.u32(instance + 16)? == 0x808023B9
             && data.pointer(instance + 24)? == data.pointer(16)?
             && data.pointer(flat + 24)? == flat
-            && data.bytes::<12>(flat + 36)? == [0; 12]
-            && data.u32(flat + 48)? == change.to_bits()
-            && data.u32(flat + 52)? == u32::from(operation)
-            && data.f32(instance + 64)? == 1.0
-            && data.bytes::<4>(instance + 68)? == [1, 0, 0, 0],
+            && padding
+            && data.u32(flat + crate::d1_roi::platform::field(48, 40))? == change.to_bits()
+            && data.u32(flat + crate::d1_roi::platform::field(52, 44))? == u32::from(operation)
+            && (weight(64)? || (ps4 && weight(48)?)),
         "Source numeric input pair, value or activation weight differs"
     );
     let provider = data.u32(flat + 32)?;

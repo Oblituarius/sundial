@@ -102,7 +102,11 @@ impl Topology {
             );
             rows.into_iter().map(|row| source.pointer(row)).collect()
         };
-        let tables = [read(0x160)?, read(0x170)?, read(0x180)?];
+        let tables = [
+            read(crate::d1_roi::platform::sequence(0x160))?,
+            read(crate::d1_roi::platform::sequence(0x170))?,
+            read(crate::d1_roi::platform::sequence(0x180))?,
+        ];
         ensure!(!tables[0].is_empty(), "Source sequence has no root control");
         let mut events = Vec::new();
         let mut unique = BTreeSet::new();
@@ -122,7 +126,7 @@ impl Topology {
                     events.push(Event {
                         offset,
                         class,
-                        kind: source.u32(offset + 0x1C)?,
+                        kind: crate::d1_roi::platform::event_kind(source, offset)?,
                         domain: if domain == 1 {
                             Domain::Numeric
                         } else {
@@ -137,12 +141,16 @@ impl Topology {
             tables,
             events,
             inputs: source
-                .array(definition + 0x1A0, 48, Some(0x80800927))?
+                .array(
+                    definition + crate::d1_roi::platform::sequence(0x1A0),
+                    crate::d1_roi::platform::input_row().0,
+                    Some(0x80800927),
+                )?
                 .len(),
         };
         // Validate every stored branch, even when its event converter is not available yet.
         result.tree(source, None)?;
-        condition::read(source, definition + 0x2C8, result.inputs)?;
+        condition::read(source, definition + crate::d1_roi::platform::sequence(0x2C8), result.inputs)?;
         Ok(result)
     }
 
@@ -225,7 +233,12 @@ impl Topology {
             "External sequence mappings include absent or duplicate events"
         );
         let tree = self.tree(source, Some(&classes))?;
-        let source_inputs = source.array(source.pointer(24)? + 0x1A0, 48, Some(0x80800927))?;
+        let (input_stride, input_name) = crate::d1_roi::platform::input_row();
+        let source_inputs = source.array(
+            source.pointer(24)? + crate::d1_roi::platform::sequence(0x1A0),
+            input_stride,
+            Some(0x80800927),
+        )?;
         let native_inputs = target.array(target.pointer(24)? + 0x188, 40, Some(0x80809789))?;
         ensure!(
             native_inputs.len() == self.inputs,
@@ -233,7 +246,7 @@ impl Topology {
         );
         for (from, to) in source_inputs.into_iter().zip(native_inputs) {
             ensure!(
-                source.u32(from + 0x28)? == target.u32(to + 0x20)?,
+                source.u32(from + input_name)? == target.u32(to + 0x20)?,
                 "Native sequence input names do not match source ordinals"
             );
         }
@@ -274,13 +287,17 @@ impl Topology {
         }
         let source_definition = source.pointer(24)?;
         ensure!(
-            source.u32(source_definition + 0x2C0)? == 0,
+            source.u32(source_definition + crate::d1_roi::platform::sequence(0x2C0))? == 0,
             "Source sequence starts at a different root selector"
         );
         condition::write(
             &mut output,
             definition + 0x2D8,
-            condition::read(source, source_definition + 0x2C8, self.inputs)?,
+            condition::read(
+                source,
+                source_definition + crate::d1_roi::platform::sequence(0x2C8),
+                self.inputs,
+            )?,
         )?;
         let length = u64::try_from(output.0.len())?;
         put(&mut output.0, 0, &length.to_le_bytes())?;

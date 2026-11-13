@@ -45,7 +45,11 @@ pub(crate) fn row_parameters(data: &Payload, row: usize) -> Result<Option<Vec<Mo
         return Ok(None);
     }
     let settings = data.pointer(24)?;
-    let table = data.array(settings + 0xB0, 16, Some(0x80802122))?;
+    let table = data.array(
+        settings + crate::d1_roi::platform::field(0xB0, 0xA0),
+        16,
+        Some(0x80802122),
+    )?;
     let start = usize::try_from(data.u32(modifier + 16)?)?;
     let count = usize::try_from(data.u32(modifier + 20)?)?;
     let Some(parameters) = table.get(start..start.saturating_add(count)) else {

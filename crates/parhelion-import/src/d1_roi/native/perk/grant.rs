@@ -247,11 +247,17 @@ impl Catalog {
         let Some((name, reset, value)) = parameter else {
             return Ok(None);
         };
-        let supers = source
-            .subclass_choices()?
-            .iter()
-            .map(|choice| usize::from(choice.ability_row))
-            .collect::<BTreeSet<_>>();
+        // Subclass discovery reads the Xbox One build only. The Super rows alone need none of
+        // the layouts that differ.
+        let supers = if source.platform() == 7 {
+            source.subclass_super_rows()?.into_iter().map(usize::from).collect()
+        } else {
+            source
+                .subclass_choices()?
+                .iter()
+                .map(|choice| usize::from(choice.ability_row))
+                .collect::<BTreeSet<_>>()
+        };
         if holders != supers {
             return Ok(None);
         }

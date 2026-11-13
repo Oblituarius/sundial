@@ -14,8 +14,11 @@
 //! supers, and its roster conditions keep them through `counterpart`.
 use super::*;
 
-/// The source area profile definition class, damage type at definition `+8C`.
-const PROFILE: u32 = 0x80AA_C28B;
+/// The source area profile definition class (`c_damage_impulse_definition`) and its damage type
+/// field, on Xbox One and on PS4. Each build numbers its schema tags and lays the definition out
+/// on its own. The PS4 values are the class's own reflection in schema tag `80AACBA2`.
+const PROFILE: (u32, u32) = (0x80AA_C28B, 0x80AA_CBA2);
+const DAMAGE_TYPE: (usize, usize) = (0x8C, 0xB8);
 /// Graph and component owner classes the closure walk follows.
 const WALKED: [u32; 2] = [0x8080_0734, 0x8080_0861];
 const DEPTH: usize = 6;
@@ -43,6 +46,11 @@ fn damage_types(source: &Source, pattern: u32) -> Result<BTreeSet<u8>> {
     let mut seen = BTreeSet::new();
     let mut stack = vec![(pattern, 0)];
     let mut types = BTreeSet::new();
+    let profile = if source.platform() == 7 {
+        PROFILE.1
+    } else {
+        PROFILE.0
+    };
     while let Some((tag, depth)) = stack.pop() {
         if depth > DEPTH || !seen.insert(tag) {
             continue;
@@ -53,9 +61,9 @@ fn damage_types(source: &Source, pattern: u32) -> Result<BTreeSet<u8>> {
         if source.reference(tag)? == 0x8080_0861
             && let Ok(root) = payload.pointer(24)
             && root >= 4
-            && payload.u32(root - 4).ok() == Some(PROFILE)
+            && payload.u32(root - 4).ok() == Some(profile)
         {
-            let damage = payload.u32(root + 0x8C)?;
+            let damage = payload.u32(root + source.field(DAMAGE_TYPE.0, DAMAGE_TYPE.1))?;
             ensure!(damage <= 3, "Source super profile damage type is unknown");
             if damage != 0 {
                 types.insert(u8::try_from(damage)?);
@@ -90,10 +98,20 @@ pub(super) fn read(source: &Source, data: &Payload) -> Result<Option<(u8, BTreeS
         return Ok(None);
     }
     let assignments = source.runtime_assignments(&mut BTreeMap::new())?;
-    let supers = source
-        .subclass_choices()?
-        .into_iter()
-        .filter_map(|choice| assignments.get(&choice.pattern).copied())
+    // Subclass discovery reads the Xbox One build only. PS4 takes the supers alone, which need
+    // none of the layouts that differ.
+    let patterns = if source.platform() == 7 {
+        source.subclass_supers()?
+    } else {
+        source
+            .subclass_choices()?
+            .into_iter()
+            .map(|choice| choice.pattern)
+            .collect()
+    };
+    let supers = patterns
+        .iter()
+        .filter_map(|pattern| assignments.get(pattern).copied())
         .collect::<BTreeSet<_>>();
     if !added.iter().all(|pattern| supers.contains(pattern)) {
         return Ok(None);

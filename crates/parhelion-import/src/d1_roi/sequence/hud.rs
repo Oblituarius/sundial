@@ -23,7 +23,7 @@ impl Hud {
     pub fn read(source: &Source, owner: &Payload, at: usize) -> Result<Self> {
         ensure!(
             owner.u32(at.checked_sub(4).context("Source HUD event marker")?)? == 0x80802573
-                && owner.u32(at + 0x1C)? == 8
+                && crate::d1_roi::platform::event_kind(owner, at)? == 8
                 && owner.u32(at + 0x24)? == 0,
             "Source HUD event class, kind or padding differs"
         );

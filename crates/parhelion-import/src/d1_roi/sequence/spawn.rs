@@ -128,7 +128,7 @@ impl Spawn {
     pub fn read(source: &Source, owner: &Payload, at: usize) -> Result<Self> {
         ensure!(
             owner.u32(at.checked_sub(4).context("Source creation marker")?)? == 0x808003BB
-                && owner.u32(at + 0x1C)? == 10,
+                && crate::d1_roi::platform::event_kind(owner, at)? == 10,
             "Source creation event class or kind differs"
         );
         owner.bytes::<0x80>(at)?;
@@ -140,14 +140,15 @@ impl Spawn {
         // duration, and the source never does, so mode 0 needs an event with no flags or timing.
         let speed = [owner.f32(at + 0x40)?, owner.f32(at + 0x44)?];
         let single = owner.u32(at + 0x50)?;
-        let mode = owner.u8(at + 0x20)?;
+        // PS4 keeps the mode in the header padding and the graph where Xbox One pads it.
+        let mode = owner.u8(at + crate::d1_roi::platform::field(0x20, 0x1D))?;
         ensure!(
             mode != 0 || owner.0[at + 0x08..at + 0x1C].iter().all(|b| *b == 0),
             "Source attached creation has flags or timing"
         );
         ensure!(
             matches!(mode, 0 | 2)
-                && owner.bytes::<3>(at + 0x21)? == [0; 3]
+                && owner.bytes::<3>(at + crate::d1_roi::platform::field(0x21, 0x24))? == [0; 3]
                 && owner.u8(at + 0x38)? == 0
                 && owner.u8(at + 0x39)? <= 1
                 && owner.bytes::<2>(at + 0x3A)? == [0; 2]
@@ -164,21 +165,29 @@ impl Spawn {
             single == 1 || spread.is_some(),
             "Source creation spread and single-object word disagree"
         );
-        let graph = owner.u32(at + 0x24)?;
+        let graph = owner.u32(at + crate::d1_roi::platform::field(0x24, 0x20))?;
         ensure!(
             source.reference(graph)? == 0x80800734,
             "Source creation does not name an entity graph"
         );
         let locator = owner.u32(at + 0x3C)?;
         let declared = owner
-            .array(owner.pointer(24)? + 0x1B0, 5, Some(0x80800429))?
+            .array(
+                owner.pointer(24)? + crate::d1_roi::platform::sequence(0x1B0),
+                5,
+                Some(0x80800429),
+            )?
             .len();
         ensure!(
             (locator as usize) < declared,
             "Source creation locator is undeclared"
         );
         let declared_inputs = owner
-            .array(owner.pointer(24)? + 0x1A0, 48, Some(0x80800927))?
+            .array(
+                owner.pointer(24)? + crate::d1_roi::platform::sequence(0x1A0),
+                crate::d1_roi::platform::input_row().0,
+                Some(0x80800927),
+            )?
             .len();
         Ok(Self {
             source_offset: at,

@@ -84,6 +84,85 @@ impl Source {
         anyhow::bail!("Source subclass {item:08X} has no item strings")
     }
 
+    /// The ability pattern of every subclass's equipped Super. This reads only the investment
+    /// tables, the ability table's identities and each subclass grid's grants, which PS4 and
+    /// Xbox One lay out alike, where [`Self::subclass_choices`] also reads every ability's
+    /// owners in the Xbox One layout.
+    pub(crate) fn subclass_supers(&self) -> Result<BTreeSet<u32>> {
+        let (_, table) = self.table(0x80803432)?;
+        let abilities = table
+            .array(8, 40, Some(0x8080343C))?
+            .into_iter()
+            .map(|row| table.u32(row))
+            .collect::<Result<Vec<_>>>()?;
+        self.subclass_super_rows()?
+            .into_iter()
+            .map(|row| {
+                abilities
+                    .get(usize::from(row))
+                    .copied()
+                    .context("Source subclass grant exceeds the ability table")
+            })
+            .collect()
+    }
+
+    /// The ability table row of every subclass's equipped Super, read as
+    /// [`Self::subclass_supers`] reads them.
+    pub(crate) fn subclass_super_rows(&self) -> Result<BTreeSet<u8>> {
+        let (_, definitions) = self.table(0x80801933)?;
+        let mut supers = BTreeSet::new();
+        for row in definitions.array(8, 24, Some(0x808016BD))? {
+            let definition_tag = definitions.u32(row + 16)?;
+            let definition = self.read(definition_tag)?;
+            ensure!(
+                self.reference(definition_tag)? == 0x80801806
+                    && definition.u32(0x78)? == definitions.u32(row)?,
+                "Source subclass item identity differs"
+            );
+            if definition.u64(0x18)? == 0 {
+                continue;
+            }
+            let client = definition.pointer(0x18)?;
+            ensure!(
+                definition.u32(client.checked_sub(4).context("Source item client marker")?)?
+                    == 0x80801706,
+                "Source subclass client type differs"
+            );
+            if definition.u8(client + 0x18)? != 0 {
+                continue;
+            }
+            let talents = self.item_talents(definition_tag, &mut BTreeMap::new())?;
+            let mut equipped = BTreeSet::new();
+            for node in talents["nodes"]
+                .as_array()
+                .context("Source subclass nodes")?
+            {
+                for step in node["steps"].as_array().context("Source subclass steps")? {
+                    for variant in step["variants"]
+                        .as_array()
+                        .context("Source subclass variants")?
+                    {
+                        for grant in grants(variant)? {
+                            if grant.u8(11)? != u8::MAX && grant.u8(12)? == 1 {
+                                equipped.insert(grant.u8(11)?);
+                            }
+                        }
+                    }
+                }
+            }
+            let mut equipped = equipped.into_iter();
+            let (Some(ability), None) = (equipped.next(), equipped.next()) else {
+                anyhow::bail!(
+                    "Source subclass {:08X} has no unique equipped Super grant",
+                    definitions.u32(row)?
+                );
+            };
+            supers.insert(ability);
+        }
+        ensure!(!supers.is_empty(), "Source has no subclass Super");
+        Ok(supers)
+    }
+
     /// Preserve every source subclass grid and all of its referenced ability families.
     /// A catalog is an intake record and does not certify native materialization.
     pub fn subclass_choices(&self) -> Result<Vec<SubclassCatalog>> {

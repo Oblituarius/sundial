@@ -392,10 +392,11 @@ fn convert_all(
         let plug = layout.plugs[converted.len()];
         let roles = crate::tiger::ornament::roles(namespace, layout.lane, choice);
         let ordinal = free_ordinal(&roles, &ordinals);
-        let link = json!({"source_weapon":request.source,"source_socket":socket,
+        let mut link = json!({"source_weapon":request.source,"source_socket":socket,
             "target_weapon":owner,"target_socket":layout.lane,"choice_index":choice,
             "native_plug":plug,"native_socket_type":layout.socket_type,
             "plug_category":layout.category,"name":name,"source_item":ornament});
+        layout.name_reset(&mut link);
         let out = request.out.join(format!("{ornament:08X}"));
         let result = prepare(
             &Request {

@@ -26,7 +26,7 @@ impl Profile {
     pub fn read(source: &Source, owner: &Payload, at: usize) -> Result<Self> {
         ensure!(
             owner.u32(at.checked_sub(4).context("Source profile event marker")?)? == 0x80802402
-                && owner.u32(at + 0x1C)? == 24,
+                && crate::d1_roi::platform::event_kind(owner, at)? == 24,
             "Source profile event class or kind differs"
         );
         ensure!(

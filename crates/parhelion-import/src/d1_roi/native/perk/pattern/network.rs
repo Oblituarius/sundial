@@ -16,6 +16,24 @@ const PROVIDERS: [(usize, u32, u32, u32, u32, u32); 7] = [
     (0x100, 0x8080063F, 0x80800753, 0x80809497, 0x80809496, 6),
 ];
 
+/// A source provider's offset in the network definition, given by its Xbox One offset. Xbox One
+/// stores the two message handlers in 32 bytes and the five interfaces in 24. PS4 packs them
+/// into 24 and 16, as the definition's reflection in schema tag `80AADB7F` lists them.
+fn provider(xbox: usize) -> usize {
+    if !crate::d1_roi::platform::ps4() {
+        return xbox;
+    }
+    match xbox {
+        0x60 => 0x60,
+        0x80 => 0x78,
+        0xA0 => 0x90,
+        0xB8 => 0xA0,
+        0xD0 => 0xB0,
+        0xE8 => 0xC0,
+        _ => 0xD0,
+    }
+}
+
 fn schema(p: &Payload, base: u32, size: u32, name: &[u8]) -> Result<()> {
     ensure!(
         p.u64(0)? == p.0.len() as u64
@@ -75,7 +93,7 @@ fn exports(
             .context("Network export precedes definition")?;
         let &(source_offset, _, _, _, _, method) = PROVIDERS
             .iter()
-            .find(|row| row.0 - if native { 24 } else { 0 } == offset)
+            .find(|row| if native { row.0 - 24 } else { provider(row.0) } == offset)
             .context("Unknown network export")?;
         let flags = graph.u32(at)?;
         ensure!(
@@ -120,7 +138,13 @@ fn lifecycle(p: &Payload, native: bool) -> Result<()> {
                 == p.pointer(24)?
                     .checked_sub(p.pointer(16)?)
                     .context("Network definition precedes instance")? as u64
-            && p.0.len() == p.pointer(24)? + if native { 0x188 } else { 0x198 },
+            && p.0.len()
+                == p.pointer(24)?
+                    + if native {
+                        0x188
+                    } else {
+                        crate::d1_roi::platform::field(0x198, 0x168)
+                    },
         "Network constructor or dependencies differ"
     );
     Ok(())
@@ -271,7 +295,7 @@ fn companion(
         schema(
             &definition,
             0x80800362,
-            368,
+            crate::d1_roi::platform::field(368, 312) as u32,
             b"c_network_component_tag_definition\0",
         )?;
     }
@@ -356,8 +380,8 @@ fn companion(
             (
                 &p,
                 d,
-                d + offset,
-                source.read(p.u32(d + offset + 8)?)?,
+                d + provider(offset),
+                source.read(p.u32(d + provider(offset) + 8)?)?,
                 si,
                 sc,
                 0x808006F9,
@@ -378,7 +402,8 @@ fn companion(
             ensure!(
                 payload.pointer(at)? == base
                     && payload.u32(at + 12)? == 0
-                    && payload.u64(at + 16)? == 0
+                    // A PS4 source provider ends with that word.
+                    && ((interface == si && crate::d1_roi::platform::ps4()) || payload.u64(at + 16)? == 0)
                     && metadata.u64(0)? == metadata.0.len() as u64
                     && metadata.u32(8)? == interface
                     && metadata.u32(12)? == instance
@@ -391,14 +416,15 @@ fn companion(
         }
     }
     ensure!(
-        p.u64(d + 0x78)? == 0x8080083E
-            && p.u64(d + 0x98)? == 0x80800F3A
+        p.u64(d + crate::d1_roi::platform::field(0x78, 0x70))? == 0x8080083E
+            && p.u64(d + crate::d1_roi::platform::field(0x98, 0x88))? == 0x80800F3A
             && target.u64(nd + 0x60)? == 0x808090EB
             && target.u64(nd + 0x80)? == 0x808090EA
-            && p.bytes::<68>(d + 0x118)? == target.bytes::<68>(nd + 0x100)?
-            && p.u32(d + 0x15C)? == 0
-            && p.u64(d + 0x160)? == 0
-            && p.u64(d + 0x168)? == u32::MAX as u64
+            && p.bytes::<68>(d + crate::d1_roi::platform::field(0x118, 0xE0))?
+                == target.bytes::<68>(nd + 0x100)?
+            && p.u32(d + crate::d1_roi::platform::field(0x15C, 0x124))? == 0
+            && p.u64(d + crate::d1_roi::platform::field(0x160, 0x128))? == 0
+            && p.u64(d + crate::d1_roi::platform::field(0x168, 0x130))? == u32::MAX as u64
             && target.u32(nd + 0x144)? == 0
             && target.u64(nd + 0x148)? == 0
             && target.u64(nd + 0x150)? == u32::MAX as u64,

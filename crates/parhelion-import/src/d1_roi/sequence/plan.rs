@@ -84,9 +84,13 @@ impl Plan {
     ) -> Result<Self> {
         let topology = Topology::read(owner)?;
         let outputs = owner
-            .array(owner.pointer(24)? + 0x190, 56, Some(0x80800788))?
+            .array(
+                owner.pointer(24)? + crate::d1_roi::platform::sequence(0x190),
+                crate::d1_roi::platform::field(56, 48),
+                Some(0x80800788),
+            )?
             .into_iter()
-            .map(|row| owner.bytes::<8>(row + 48))
+            .map(|row| owner.bytes::<8>(row + crate::d1_roi::platform::field(48, 40)))
             .collect::<Result<Vec<_>>>()?;
         let mut bodies = BTreeMap::new();
         for event in topology.events() {

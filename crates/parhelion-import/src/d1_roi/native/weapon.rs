@@ -403,6 +403,10 @@ impl Source {
         progress("Translating source perks…".into());
         let (columns, variants, perks, damage) =
             perk::translate(&mut assembly, source, donor, perk::Host::Weapon)?;
+        let unused_lanes = sockets::unused_lanes(&crate::tiger::shadowkeep::sockets(
+            &mut assembly.native,
+            donor,
+        )?)?;
         let limitations = weapon_limitations(
             &runtime_animation,
             &first_person_animation,
@@ -508,7 +512,7 @@ impl Source {
         crate::io::write_json(&output.join("ornaments.json"), &ornaments)?;
         crate::io::write_json(
             &output.join("sockets.json"),
-            &sockets::disable_untouched(&path)?,
+            &sockets::disable_untouched(&path, &unused_lanes)?,
         )?;
         Ok(path)
     }

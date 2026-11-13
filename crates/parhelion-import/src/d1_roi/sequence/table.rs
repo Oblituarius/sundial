@@ -110,28 +110,41 @@ impl Table {
     pub fn read(source: &Source, owner: &Payload, at: usize, silent: bool) -> Result<Self> {
         ensure!(
             owner.u32(at.checked_sub(4).context("Source table event marker")?)? == 0x8080237E
-                && owner.u32(at + 0x1C)? == 27,
+                && crate::d1_roi::platform::event_kind(owner, at)? == 27,
             "Source table event class or kind differs"
         );
+        // PS4 keeps the group byte in the header padding at `+1D`, so the fields after the
+        // reserved words sit eight bytes earlier.
+        let ps4 = crate::d1_roi::platform::ps4();
+        let body = if ps4 { at - 8 } else { at };
+        let reserved = if ps4 {
+            owner.bytes::<8>(at + 0x20)? == [0; 8]
+        } else {
+            owner.bytes::<12>(at + 0x24)? == [0; 12]
+        };
         ensure!(
-            owner.bytes::<12>(at + 0x24)? == [0; 12] && owner.u32(at + 0x34)? == 0,
+            reserved && owner.u32(body + 0x34)? == 0,
             "Source table event reserved fields differ"
         );
-        let bounds = owner.bytes::<8>(at + 0x38)?;
-        let (lower, upper) = (owner.f32(at + 0x38)?, owner.f32(at + 0x3C)?);
+        let bounds = owner.bytes::<8>(body + 0x38)?;
+        let (lower, upper) = (owner.f32(body + 0x38)?, owner.f32(body + 0x3C)?);
         ensure!(
             lower.is_finite() && upper.is_finite() && lower <= upper,
             "Source table event bounds are invalid"
         );
-        let flags = owner.bytes::<4>(at + 0x44)?;
+        let flags = owner.bytes::<4>(body + 0x44)?;
         ensure!(
             flags[..2].iter().all(|&flag| flag <= 1) && flags[2..] == [0, 0],
             "Source table event flags need translation"
         );
         let declared = owner
-            .array(owner.pointer(24)? + 0x1B0, 5, Some(0x80800429))?
+            .array(
+                owner.pointer(24)? + crate::d1_roi::platform::sequence(0x1B0),
+                5,
+                Some(0x80800429),
+            )?
             .len();
-        let (locator, origin) = match owner.u32(at + 0x40)? {
+        let (locator, origin) = match owner.u32(body + 0x40)? {
             u32::MAX => (declared, true),
             locator => {
                 ensure!(
@@ -141,7 +154,7 @@ impl Table {
                 (locator as usize, false)
             }
         };
-        let table = owner.u32(at + 0x30)?;
+        let table = owner.u32(body + 0x30)?;
         ensure!(
             source.reference(table)? == 0x808005F7,
             "Source presentation table class differs"
@@ -187,7 +200,11 @@ impl Table {
         Ok(Self {
             offset: at,
             table,
-            group: owner.u32(at + 0x20)?,
+            group: if ps4 {
+                u32::from(owner.u8(at + 0x1D)?)
+            } else {
+                owner.u32(at + 0x20)?
+            },
             bounds,
             locator: u8::try_from(locator).context("Source table event locator ordinal")?,
             origin,

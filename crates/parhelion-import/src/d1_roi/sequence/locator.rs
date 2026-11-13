@@ -58,9 +58,21 @@ impl Locators {
         let instance = source.pointer(16)?;
         let definition = source.pointer(24)?;
         let result = Self {
-            rows: rows(source, definition + 0x1B0, 0x80800429)?,
-            declarations: rows(source, definition + 0x1C0, 0x80800819)?,
-            names: rows(source, definition + 0x1D0, 0x80800696)?,
+            rows: rows(
+                source,
+                definition + crate::d1_roi::platform::sequence(0x1B0),
+                0x80800429,
+            )?,
+            declarations: rows(
+                source,
+                definition + crate::d1_roi::platform::sequence(0x1C0),
+                0x80800819,
+            )?,
+            names: rows(
+                source,
+                definition + crate::d1_roi::platform::sequence(0x1D0),
+                0x80800696,
+            )?,
             owners: rows(source, instance + 0x150, OWNER)?,
             points: rows(source, instance + 0x160, OWNER)?,
             states: rows::<1>(source, instance + 0x170, STATE)?

@@ -20,7 +20,7 @@ pub(super) fn read(
     // `5DDFD0` treats them as mode 0.
     let [mode, first, second, pad] = owner.bytes::<4>(at)?;
     ensure!(
-        at == root + 0x14C
+        at == root + image(0x14C)
             && owner.u32(at - 4)? == 0x80802976
             && mode <= 3
             && first <= 1
@@ -38,7 +38,7 @@ pub(super) fn read(
         "Source healing has invalid response operands"
     );
     let names = [0x4EFCDCF5, 0xCD887E0F];
-    let labels = owner.array(root + 0xC8, 24, Some(0x80800365))?;
+    let labels = owner.array(root + image(0xC8), 24, Some(0x80800365))?;
     ensure!(
         labels.len() == names.len(),
         "Source healing has other categories"
@@ -75,14 +75,14 @@ pub(super) fn read(
     ability_damage::healing_labels(&registry.0).map_err(anyhow::Error::msg)?;
     for (offset, value) in [
         (0x28, 1u64),
-        (0x30, 0x100),
+        (0x30, relative(0x30, 0x130)),
         (0xC8, 2),
-        (0xD0, 0x90),
+        (0xD0, relative(0xD0, 0x160)),
         (0x130, 1),
         (0x140, 0xC),
         (0x160, 2),
     ] {
-        put(expected, root + offset, &value.to_le_bytes())?;
+        put(expected, root + image(offset), &value.to_le_bytes())?;
     }
     for (offset, value) in [
         (0xF0, 1u32),
@@ -102,8 +102,8 @@ pub(super) fn read(
         (0x188, names[1]),
         (0x198, dictionary.context("Source healing dictionary")?),
     ] {
-        put(expected, root + offset, &value.to_le_bytes())?;
+        put(expected, root + image(offset), &value.to_le_bytes())?;
     }
-    put(expected, root + 0x90, &mask)?;
+    put(expected, root + image(0x90), &mask)?;
     Ok((health, [first, second]))
 }

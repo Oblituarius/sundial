@@ -50,14 +50,22 @@ pub(super) fn read(
             "Conditional channel has additional host state"
         );
     }
-    let rows = p.array(s + 0xD8, 112, Some(0x80800883))?;
-    let inherited = p.array(s + 0x108, 12, Some(0x8080087B))?;
+    let rows = p.array(
+        s + crate::d1_roi::platform::bank(0xD8),
+        112,
+        Some(0x80800883),
+    )?;
+    let inherited = p.array(
+        s + crate::d1_roi::platform::bank(0x108),
+        12,
+        Some(0x8080087B),
+    )?;
     ensure!(
         rows.len() == 1
             && inherited.len() == 1
-            && p.u64(s + 0xE8)? == 0
-            && p.u64(s + 0xF8)? == 0
-            && p.u32(s + 0x128)? == 0,
+            && p.u64(s + crate::d1_roi::platform::bank(0xE8))? == 0
+            && p.u64(s + crate::d1_roi::platform::bank(0xF8))? == 0
+            && p.u32(s + crate::d1_roi::platform::bank(0x128))? == 0,
         "Conditional channel needs additional declarations"
     );
     let (row, parent) = (rows[0], inherited[0]);
@@ -105,10 +113,30 @@ pub(super) fn read(
         "Conditional export references differ"
     );
     let expected: [(usize, u32, u64, u32); 4] = [
-        (0x60, 0x80AAD526, 0u64, 0),
-        (0x78, 0x80AAD525, 0xFFF7, 4),
-        (0x90, 0x80AAD523, 12, 0),
-        (0xA8, 0x80AAD524, 0, 0),
+        (
+            crate::d1_roi::platform::bank(0x60),
+            crate::d1_roi::platform::tag(0x80AAD526),
+            0u64,
+            0,
+        ),
+        (
+            crate::d1_roi::platform::bank(0x78),
+            crate::d1_roi::platform::tag(0x80AAD525),
+            0xFFF7,
+            4,
+        ),
+        (
+            crate::d1_roi::platform::bank(0x90),
+            crate::d1_roi::platform::tag(0x80AAD523),
+            12,
+            0,
+        ),
+        (
+            crate::d1_roi::platform::bank(0xA8),
+            crate::d1_roi::platform::tag(0x80AAD524),
+            0,
+            0,
+        ),
     ];
     let mut seen = BTreeSet::new();
     for (&at, &reference) in exports.iter().zip(&references) {
@@ -122,8 +150,8 @@ pub(super) fn read(
             .context("Unknown conditional channel export")?;
         ensure!(
             p.pointer(parameter)? == s
-                && p.u64(parameter + 8)? == declaration as u64
-                && p.u64(parameter + 16)? == selector
+                && crate::d1_roi::platform::declared(&p, parameter)?
+                    == (declaration as u64, selector)
                 && graph.u32(at)? == output << 16
                 && graph.u32(at + 4)? == 0
                 && graph.u32(at + 8)? == (selector as u16 as i16 as i32) as u32
@@ -143,14 +171,20 @@ pub(super) fn read(
     );
 
     let root = status.pointer(24)?;
-    let expression = root + 0x190;
+    let expression = root
+        + crate::d1_roi::platform::status::settings(0xF0)
+        + crate::d1_roi::platform::status::hud(0xA0);
     let code = status
         .array(expression + 24, 1, Some(0x80800009))?
         .into_iter()
         .map(|a| status.u8(a))
         .collect::<Result<Vec<_>>>()?;
     let constants = status.array(expression + 40, 16, Some(0x80800090))?;
-    let inputs = status.array(expression + 72, 48, Some(0x80800927))?;
+    let inputs = status.array(
+        expression + 72,
+        crate::d1_roi::platform::input_row().0,
+        Some(0x80800927),
+    )?;
     ensure!(
         !constants.is_empty()
             && inputs.len() == 1
@@ -185,18 +219,26 @@ pub(super) fn read(
         .context("Conditional status count program")?;
     let threshold = status.bytes::<16>(constants[0])?;
     let input = inputs[0];
-    pair(
-        status,
-        status_tag,
-        status.pointer(16)? + 0x1F0,
-        input,
-        0x8080077D,
-        0x80800927,
-    )?;
-    ensure!(
+    // The input's runtime twin follows the status's own runtime records. PS4 packs the row's
+    // empty word, channel class and name into twelve bytes, and its twin is taken from the row.
+    let ps4 = crate::d1_roi::platform::ps4();
+    let twin = if ps4 {
+        usize::try_from(status.u64(input + 8)?)?
+    } else {
+        status.pointer(16)? + 0x1F0
+    };
+    pair(status, status_tag, twin, input, 0x8080077D, 0x80800927)?;
+    let direct = if ps4 {
+        status.u32(input + 24)? == 0
+            && status.u32(input + 28)? == 0x808003E8
+            && status.u64(input + 32)? == name as u64
+    } else {
         status.u64(input + 24)? == 0
             && status.u64(input + 32)? == 0x808003E8
-            && status.u64(input + 40)? == name as u64,
+            && status.u64(input + 40)? == name as u64
+    };
+    ensure!(
+        direct,
         "Conditional status input is not a direct named channel"
     );
     let outputs = graph.array(0x30, 88, Some(0x8080054E))?;

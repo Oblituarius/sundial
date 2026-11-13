@@ -42,7 +42,7 @@ impl Feedback {
     pub fn read(source: &Source, owner: &Payload, at: usize) -> Result<Self> {
         ensure!(
             owner.u32(at.checked_sub(4).context("Source feedback marker")?)? == 0x80802891
-                && owner.u32(at + 0x1C)? == 7,
+                && crate::d1_roi::platform::event_kind(owner, at)? == 7,
             "Source feedback event class or kind differs"
         );
         owner.bytes::<0x310>(at)?;

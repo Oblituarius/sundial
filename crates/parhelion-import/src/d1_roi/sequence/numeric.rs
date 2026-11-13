@@ -22,7 +22,10 @@ impl Numeric {
             event.class
         );
         let from = event.offset;
-        let ordinal = source.u32(from + 0x24)?;
+        // PS4 keeps the leading flag byte in the header padding at `+1D` and the output ordinal
+        // at `+20`. The native header takes the Xbox One form of both.
+        let ps4 = crate::d1_roi::platform::ps4();
+        let ordinal = source.u32(from + if ps4 { 0x20 } else { 0x24 })?;
         ensure!(
             (ordinal as usize) < outputs,
             "Source numeric event output exceeds its table"
@@ -58,7 +61,14 @@ impl Numeric {
         );
         procedure::validate(&source.0[code.clone()], &lanes, 1)?;
         Ok(Self::Scalar {
-            header: source.bytes::<8>(from + 0x20)?,
+            header: if ps4 {
+                let mut header = [0; 8];
+                header[0] = source.u8(from + 0x1D)?;
+                header[4..].copy_from_slice(&ordinal.to_le_bytes());
+                header
+            } else {
+                source.bytes::<8>(from + 0x20)?
+            },
             code: source.0[code].to_vec(),
             constants: constants
                 .into_iter()

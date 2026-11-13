@@ -101,13 +101,17 @@ impl Query {
     pub fn read(source: &Source, owner: &Payload, at: usize) -> Result<Self> {
         ensure!(
             owner.u32(at.checked_sub(4).context("Source query marker")?)? == 0x808028A6
-                && owner.u32(at + 0x1C)? == 26,
+                && crate::d1_roi::platform::event_kind(owner, at)? == 26,
             "Source query event class or kind differs"
         );
         owner.bytes::<0x520>(at)?;
         let locator = owner.u32(at + 0x20)?;
         let declared = owner
-            .array(owner.pointer(24)? + 0x1B0, 5, Some(0x80800429))?
+            .array(
+                owner.pointer(24)? + crate::d1_roi::platform::sequence(0x1B0),
+                5,
+                Some(0x80800429),
+            )?
             .len();
         ensure!(
             (locator as usize) < declared && owner.u32(at + 0x24)? == 0,

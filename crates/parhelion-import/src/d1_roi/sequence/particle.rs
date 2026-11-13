@@ -20,7 +20,7 @@ impl Particle {
     pub fn read(source: &Source, owner: &Payload, at: usize) -> Result<Self> {
         ensure!(
             owner.u32(at.checked_sub(4).context("Source particle event marker")?)? == 0x8080037A
-                && owner.u32(at + 0x1C)? == 0
+                && crate::d1_roi::platform::event_kind(owner, at)? == 0
                 && owner.u32(at + 0x24)? == u32::MAX
                 && owner.u16(at + 0x2A)? == 0,
             "Source particle event needs another class, override or extension policy"
@@ -32,7 +32,11 @@ impl Particle {
         );
         let locators = owner.bytes::<2>(at + 0x28)?;
         let count = owner
-            .array(owner.pointer(24)? + 0x1B0, 5, Some(0x80800429))?
+            .array(
+                owner.pointer(24)? + crate::d1_roi::platform::sequence(0x1B0),
+                5,
+                Some(0x80800429),
+            )?
             .len();
         ensure!(
             locators.iter().all(|&index| usize::from(index) < count),

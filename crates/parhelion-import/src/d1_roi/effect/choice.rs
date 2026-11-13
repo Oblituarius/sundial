@@ -68,7 +68,7 @@ fn fallback(
             let family = (*family)?;
             FRAMEWORK
                 .iter()
-                .find(|(source, _)| source == owner)
+                .find(|(source, _)| crate::d1_roi::platform::tag(*source) == *owner)
                 .map(|&(_, stock)| (family, stock))
         })
         .collect::<BTreeMap<_, _>>();

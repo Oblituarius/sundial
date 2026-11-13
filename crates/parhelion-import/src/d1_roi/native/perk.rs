@@ -420,17 +420,11 @@ fn conditions(
     // `34FD8483` has a Shadowkeep event. Removal and rearm alternatives keep every condition,
     // since leaving one out would lengthen the effect.
     let mut absent = None;
-    let pointers = data
+    let nodes = data
         .array(descriptor, 8, None)?
         .into_iter()
-        .map(|at| data.pointer(at))
-        .collect::<Result<Vec<_>>>()?;
-    if let Some(list) = condition::list(source, data, &pointers, native.as_deref_mut())? {
-        return Ok(list);
-    }
-    let nodes = pointers
-        .into_iter()
-        .map(|node| {
+        .map(|at| {
+            let node = data.pointer(at)?;
             let read = condition::read(source, data, node, native.as_deref_mut());
             if descriptor == 0x20
                 && (data.u32(node - 4)?, data.u8(node + 5)?) == (0x808030D4, 12)
@@ -768,14 +762,8 @@ fn action_program(
         "Source choice has no executable effects"
     );
     // Activation on equipping a super of one damage type, ending when it leaves, becomes a
-    // subclass gate the build expands over the installed subclasses' supers. Its subclass
-    // discovery reads the Xbox One build only, so PS4 keeps the element condition lists the
-    // elemental armor talents were imported with (`condition::list`).
-    let gate = if source.platform() == 7 {
-        None
-    } else {
-        super_gate::read(source, &data)?
-    };
+    // subclass gate the build expands over the installed subclasses' supers.
+    let gate = super_gate::read(source, &data)?;
     let (mut activation, mut removal) = if gate.is_some() {
         (Vec::new().into_iter(), Vec::new().into_iter())
     } else {

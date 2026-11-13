@@ -80,7 +80,7 @@ pub fn translate(
     );
     let p = source.read(tag)?;
     // A profile event's healing owner has the direct healing family's envelope.
-    if p.0.len() == 0x230 {
+    if p.0.len() == crate::d1_roi::platform::field(0x230, 0x220) {
         return health::translate(source, native, tag, prefix);
     }
     // The family's runtime and root classes fix its fields. Its payload size follows its
@@ -89,26 +89,26 @@ pub fn translate(
     ensure!(
         runtime == 0x68
             && root == 0x90
-            && p.u32(runtime - 4)? == 0x80AA_C28C
-            && p.u32(root - 4)? == 0x80AA_C28B,
+            && p.u32(runtime - 4)? == crate::d1_roi::platform::tag(0x80AA_C28C)
+            && p.u32(root - 4)? == crate::d1_roi::platform::tag(0x80AA_C28B),
         "Source area profile has another envelope"
     );
-    let lower = p.f32(root + 0x80)?;
-    let upper = p.f32(root + 0x84)?;
-    let kind = p.u32(root + 0x8C)?;
+    let lower = p.f32(root + impulse(0x80))?;
+    let upper = p.f32(root + impulse(0x84))?;
+    let kind = p.u32(root + impulse(0x8C))?;
     ensure!(
         lower.is_finite()
             && upper.is_finite()
             && 0.0 <= lower
             && lower <= upper
-            && p.u32(root + 0x88)? == 0
+            && p.u32(root + impulse(0x88))? == 0
             && kind <= 3
-            && word(&p, root + 0xC0, kind)?,
+            && word(&p, root + impulse(0xC0), kind)?,
         "Source area profile amount or damage type is unqualified"
     );
     // The remaining definition fields with a native counterpart are fixed across the admitted
     // family, apart from `+B0/+B4`, which carry over.
-    let (scale, flag) = (p.f32(root + 0xB0)?, p.u32(root + 0xB4)?);
+    let (scale, flag) = (p.f32(root + impulse(0xB0))?, p.u32(root + impulse(0xB4))?);
     ensure!(
         scale.is_finite() && flag <= 1,
         "Source area profile field B0 or B4 is unqualified"
@@ -117,13 +117,13 @@ pub fn translate(
     // them. The scalar modifiers, behaviors, attacker responses and routing bytes have no
     // translation and must be empty.
     ensure!(
-        p.pointer(root + 0x18)? == root + 0x80
-            && p.pointer(root + 0x20)? == root + 0xD8
-            && p.pointer(root + 0x38)? == root + 0xF0
+        p.pointer(root + 0x18)? == root + impulse(0x80)
+            && p.pointer(root + 0x20)? == root + impulse(0xD8)
+            && p.pointer(root + 0x38)? == root + impulse(0xF0)
             && p.u64(root + 0x60)? == 0
             && p.u64(root + 0x70)? == 0
-            && p.u64(root + 0xE0)? == 0
-            && p.u64(root + 0x108)? == 0,
+            && p.u64(root + impulse(0xE0))? == 0
+            && p.u64(root + impulse(0x108))? == 0,
         "Source area profile has a field without a translation"
     );
     // The description's optional `80802DAA` record attributes a kill when the damage has no owner
@@ -132,10 +132,10 @@ pub fn translate(
     // `+8` and `+A` (`0067D250`) and gives the death screen `+4`, `+9` and, unless empty, `+0`
     // (`00976C00`). Native root `+58` names an `80804B17` record read the same way at the same
     // offsets (`00D7DE90`, `00F93650`, `013A0790`), so it carries byte for byte.
-    let attribution = if p.u64(root + 0xB8)? == 0 {
+    let attribution = if p.u64(root + impulse(0xB8))? == 0 {
         None
     } else {
-        let at = p.pointer(root + 0xB8)?;
+        let at = p.pointer(root + impulse(0xB8))?;
         ensure!(
             at >= 4 && p.u32(at - 4)? == 0x80802DAA && p.u8(at + 0x0B)? == 0,
             "Source area profile attribution record differs"
@@ -146,7 +146,7 @@ pub fn translate(
     // `005DDBB0`, and native `00B87740`, from `00B83E10`, read the low byte and test the same
     // eight relationship bits as the query masks, zeroing the damage of an exempt recipient.
     // Bit 6 reads its scale at source `+DC` and native `+74`.
-    let flags = p.u32(root + 0xD8)?;
+    let flags = p.u32(root + impulse(0xD8))?;
     ensure!(
         flags <= 0xFF,
         "Source area profile exemption flags exceed their byte"
@@ -154,18 +154,18 @@ pub fn translate(
     // The victim response's first byte keeps damage indicators from pointing at the damage owner
     // (source getter `005DF7E0`). Native moves the whole response `18` bytes later, its feedback
     // from `+100` to `+B0` and this byte from `+F0` to `+A0`. Stock pairs agree, which is inferred.
-    let indicator = p.u8(root + 0xF0)?;
+    let indicator = p.u8(root + impulse(0xF0))?;
     ensure!(
-        indicator <= 1 && p.bytes::<15>(root + 0xF1)? == [0; 15] && p.u32(root + 0x104)? == 0,
+        indicator <= 1 && p.bytes::<15>(root + impulse(0xF1))? == [0; 15] && p.u32(root + impulse(0x104))? == 0,
         "Source area profile victim response has other fields"
     );
     for (field, value) in [(0x50, 1.0f32.to_bits()), (0xDC, 1.0f32.to_bits())] {
         ensure!(
-            word(&p, root + field, value)?,
+            word(&p, root + if field < 0x78 { field } else { impulse(field) }, value)?,
             "Source area profile field {field:X} differs from the qualified family"
         );
     }
-    let feedback = p.u32(root + 0x100)?;
+    let feedback = p.u32(root + impulse(0x100))?;
     let Responses {
         push,
         fixed,
@@ -177,12 +177,12 @@ pub fn translate(
         audio = None;
     }
     let categories = p
-        .array(root + 0xC8, 0x18, Some(0x80800365))?
+        .array(root + impulse(0xC8), 0x18, Some(0x80800365))?
         .into_iter()
         .map(|row| {
             ensure!(
                 p.bytes::<12>(row + 4)? == [0; 12]
-                    && word(&p, row + 0x10, SOURCE_DICTIONARY)?
+                    && word(&p, row + 0x10, crate::d1_roi::platform::tag(SOURCE_DICTIONARY))?
                     && p.u32(row + 0x14)? == 0,
                 "Source area profile category row differs"
             );
@@ -332,10 +332,17 @@ pub fn translate(
     Ok(Translated {
         assets,
         cues,
-        unqualified: [p.u32(root + 0x90)?, p.u32(root + 0xA8)?],
+        unqualified: [p.u32(root + impulse(0x90))?, p.u32(root + impulse(0xA8))?],
         absent,
         silent,
     })
+}
+
+/// A damage impulse definition field from its description on, given by its Xbox One offset. PS4
+/// starts the description at `+78`, eight bytes before Xbox One's `+80`, as its class reflection
+/// in schema tag `80AACBA2` lists it, and keeps the same order after it.
+fn impulse(xbox: usize) -> usize {
+    crate::d1_roi::platform::field(xbox, xbox - 8)
 }
 
 struct AudioRows {

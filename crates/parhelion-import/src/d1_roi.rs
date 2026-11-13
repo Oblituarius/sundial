@@ -20,6 +20,7 @@ mod model;
 mod native;
 mod ornament;
 mod package;
+pub(crate) mod platform;
 pub mod particle;
 mod procedure;
 pub mod sequence;
@@ -226,6 +227,7 @@ impl Source {
             exotic_talents: std::sync::OnceLock::new(),
             exotic_armor_talents: std::sync::OnceLock::new(),
         };
+        platform::set(source.platform());
         source.report.builds.sort();
         source.report.builds.dedup();
         source.report.model_count = source.classes(0x80801AB5).len();

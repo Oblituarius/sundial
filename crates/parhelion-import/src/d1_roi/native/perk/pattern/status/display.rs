@@ -2,14 +2,14 @@
 use super::*;
 
 pub(super) fn read(p: &Payload, hud: usize) -> Result<bool> {
-    let at = hud + 0x108;
+    let at = hud + crate::d1_roi::platform::status::hud(0x108);
     let code = p
         .array(at + 24, 1, Some(0x80800009))?
         .into_iter()
         .map(|a| p.u8(a))
         .collect::<Result<Vec<_>>>()?;
     let values = p.array(at + 40, 16, Some(0x80800090))?;
-    let enabled = p.u64(hud + 0xF8)?;
+    let enabled = p.u64(hud + crate::d1_roi::platform::status::hud(0xF8))?;
     let identity = code == [0x3C, 0, 0x3E, 0] && values.is_empty();
     let literal = if code == [0x34, 0, 0x3E, 0] && values.len() == 1 {
         let bits = p.u32(values[0])?;
@@ -24,7 +24,7 @@ pub(super) fn read(p: &Payload, hud: usize) -> Result<bool> {
     // Inactive literals are safe only because both reporters bypass the whole program.
     ensure!(
         enabled <= 1
-            && p.u64(hud + 0x100)? == 0
+            && p.u64(hud + crate::d1_roi::platform::status::hud(0x100))? == 0
             && (identity
                 || (enabled == 0
                     && ((code == [0x3C, 0, 0x23, 0x3E, 0] && values.is_empty()) || literal)))
