@@ -226,14 +226,7 @@ impl Material {
                         );
                     }
                     Kind::Sampler => {
-                        let header = source.read(reference.source)?;
-                        let descriptor = source.read(source.reference(reference.source)?)?;
-                        ensure!(
-                            header.0 == [0; 8]
-                                && descriptor.0.len() == 60
-                                && descriptor.0[52..] == [255; 8],
-                            "Source particle sampler layout differs"
-                        );
+                        let descriptor = source.sampler_descriptor(reference.source)?;
                         let header = template(native, 34, 1)?;
                         let data = pair(native, header, 34, 1)?;
                         let payload = native.tag(header, None)?;

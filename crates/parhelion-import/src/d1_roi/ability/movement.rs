@@ -107,7 +107,13 @@ fn bank_rows(data: &Payload, bank: u32, family: Family) -> Result<Vec<usize>> {
         "Source {} bank is not a reciprocal qualified pair",
         family.name()
     );
-    data.array(settings + 0xA0, 40, Some(0x80802A84))
+    // PS4 property rows sit 0x10 earlier, as in the perk ability banks (`grant.rs`), with
+    // unchanged row fields.
+    data.array(
+        settings + crate::d1_roi::platform::field(0xA0, 0x90),
+        40,
+        Some(0x80802A84),
+    )
 }
 
 /// The source glide's default horizontal burst factor, which the accumulator reset restores

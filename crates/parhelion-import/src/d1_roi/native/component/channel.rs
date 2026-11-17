@@ -3,7 +3,6 @@ use super::*;
 mod callback;
 mod incoming;
 pub(super) mod program;
-pub(super) mod ps4;
 
 struct Bank {
     names: Vec<u32>,
@@ -368,7 +367,7 @@ impl Bank {
 impl Bank {
     fn read(source: &Payload) -> Result<Self> {
         let schema = source.pointer(24)?;
-        let rows = source.array(schema + 0xD8, 112, Some(0x80800883))?;
+        let rows = source.array(schema + crate::d1_roi::platform::bank(0xD8), 112, Some(0x80800883))?;
         // 342 Shadowkeep stock banks hold more than 64 declarations, one 255, so 64 is not a
         // native capacity. Slots and lookup positions are UInt16 with FFFF as their sentinel.
         ensure!(
@@ -385,7 +384,7 @@ impl Bank {
         );
         let mut inherited = Vec::new();
         for (slot, at) in source
-            .array(schema + 0x108, 12, None)?
+            .array(schema + crate::d1_roi::platform::bank(0x108), 12, None)?
             .into_iter()
             .enumerate()
         {
@@ -418,7 +417,7 @@ impl Bank {
             inherited.iter().map(|(namespace, _, _)| *namespace),
         )?;
         ensure!(
-            [source.u16(schema + 0x128)?, source.u16(schema + 0x12A)?] == span,
+            [source.u16(schema + crate::d1_roi::platform::bank(0x128))?, source.u16(schema + crate::d1_roi::platform::bank(0x12A))?] == span,
             "Source default channel namespace span differs"
         );
         let inherited_ordinals = inherited
@@ -541,7 +540,7 @@ impl Bank {
             dependencies.push(bytes);
         }
         program::validate_graph(&programs)?;
-        let local = source.array(schema + 0xF8, 12, None)?;
+        let local = source.array(schema + crate::d1_roi::platform::bank(0xF8), 12, None)?;
         ensure!(
             local.len() == constants.len() + callbacks.len() + programs.len() + public.len(),
             "Source channel local names differ"
@@ -570,7 +569,7 @@ impl Bank {
         }
         let instance = source.pointer(16)?;
         ensure!(
-            source.u64(instance + 0x80)? == 0 && source.u64(schema + 0xE8)? == 0,
+            source.u64(instance + 0x80)? == 0 && source.u64(schema + crate::d1_roi::platform::bank(0xE8))? == 0,
             "Source channel has unsupported receivers"
         );
         let values = source.array(instance + 0x50, 16, Some(0x80800090))?;
@@ -619,13 +618,22 @@ fn lookup(rows: &[(u32, u32, usize)]) -> Result<Vec<u8>> {
 }
 
 impl Assembly<'_> {
+    /// `connect` is false when an incoming channel's provider has no translation
+    /// ([`Self::incoming_fed`]): the incoming channels then stay plain channels at zero.
     pub(in crate::d1_roi::native) fn channel_bank(
         &mut self,
         source: &Payload,
         symbol: &str,
         index: usize,
+        connect: bool,
     ) -> Result<(Component, Vec<u32>)> {
-        self.write_bank(Bank::read(source)?, source, symbol, index)
+        let mut bank = Bank::read(source)?;
+        if !connect && !bank.inputs.is_empty() {
+            bank.inputs.clear();
+            self.approximations
+                .insert("Source channels written by untranslated components hold zero".to_owned());
+        }
+        self.write_bank(bank, source, symbol, index)
     }
 
     /// A source bank followed by the declarations only `carrier` has, for a native carrier

@@ -287,15 +287,8 @@ impl Assembly<'_> {
         let mut components = Vec::new();
         let mut source_owners = BTreeMap::new();
         let mut bank = None;
-        // PS4 banks take their receivers from optic feeds; Xbox One banks connect their
-        // incoming channels through `channel_connections`.
+        // Banks connect their incoming channels through `channel_connections`.
         let ps4 = self.source.platform() == 7;
-        let feeds = if ps4 && self.weapon {
-            self.optic_feeds(&source_entity)?
-        } else {
-            BTreeMap::new()
-        };
-        let mut optics = BTreeMap::new();
         // Connection rows name a component by tag and by its ordinal in this list, which
         // distinguishes repeated instances of one component.
         let rows = source_entity.array(0x20, 12, Some(0x80800715))?;
@@ -373,16 +366,12 @@ impl Assembly<'_> {
                 }
                 0x808008F6 => {
                     ensure!(bank.is_none(), "Source body contains multiple inherited banks");
-                    let (component, names, receivers) = if ps4 {
-                        let declarations = source.array(sr - 0x20 + 0xC8, 32, None)?;
-                        let fed = !declarations.is_empty()
-                            && declarations.iter().all(|at| feeds.contains_key(&(tag, *at as u64)));
-                        self.channel_bank_ps4(&source, &name, components.len(), fed)?
-                    } else {
-                        let (component, names) = self.channel_bank(&source, &name, components.len())?;
-                        (component, names, Vec::new())
-                    };
-                    bank = Some((components.len(), names, tag, receivers));
+                    // A PS4 bank keeps incoming channels only when weapon optics feed them all;
+                    // others hold zero, as PS4 imports always have. Xbox One banks connect every
+                    // incoming channel.
+                    let connect = !ps4 || (self.weapon && self.incoming_fed(&source_entity, tag, &source)?);
+                    let (component, names) = self.channel_bank(&source, &name, components.len(), connect)?;
+                    bank = Some((components.len(), names, tag));
                     components.push(component);
                 }
                 0x80802818 => {
@@ -451,7 +440,6 @@ impl Assembly<'_> {
                     components.push(component);
                 }
                 0x808027FC if self.weapon => {
-                    optics.insert(tag, components.len());
                     source_owners.insert(ordinal, components.len());
                     components.push(self.optic(tag, &source, &source_entity, &name, components.len())?);
                 }
@@ -558,28 +546,6 @@ impl Assembly<'_> {
                 put(&mut row, 56, &(*bank_index as u64).to_le_bytes())?;
                 put(&mut row, 64, &(ordinal as u32).to_le_bytes())?;
                 connections.push(row);
-            }
-        }
-        if let Some((bank_index, _, bank_tag, receivers)) = bank.as_ref().filter(|_| ps4) {
-            let bank_payload = &components[*bank_index].payload;
-            let declarations =
-                bank_payload.array(bank_payload.pointer(24)? + 0xC8, 32, Some(0x808097A8))?;
-            ensure!(
-                declarations.len() == receivers.len(),
-                "Native receiver declarations differ"
-            );
-            for (receiver, declaration) in receivers.iter().zip(declarations) {
-                let optic = feeds
-                    .get(&(*bank_tag, receiver.declaration as u64))
-                    .and_then(|tag| optics.get(tag))
-                    .context("Source receiver provider was not converted")?;
-                connections.push(optic::receiver_connection(
-                    &components[*optic].template,
-                    [components[*bank_index].id, components[*optic].id],
-                    declaration,
-                    [*bank_index, *optic],
-                    &mut self.native,
-                )?);
             }
         }
         let entity_template_tag = if self.weapon {

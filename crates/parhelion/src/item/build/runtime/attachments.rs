@@ -69,7 +69,7 @@ pub(super) fn author_groups(
 ) -> AuthoringResult<Vec<sundial::package_authoring::sandbox_perk::program::HudStatus>> {
     // Weapon runtimes bound the statuses of the groups they allocated. Their images go first.
     let mut statuses = std::mem::take(&mut *assets.hud_statuses);
-    author_images(manager, &statuses, assets.packages, layers)?;
+    author_images(manager, &statuses, assets.packages, assets.placed, layers)?;
     // Entries these groups hold in common across items, such as the effect of one perk on
     // several armor pieces, are allocated once.
     let mut shared = super::cache::AnimationCache::new();
@@ -258,10 +258,13 @@ pub(super) fn imported_abilities(
 }
 
 /// Authors the image of each imported HUD status that `layers` doesn't hold yet, and records it.
+/// The HUD draws status images in every world, so their layers and textures join `placed` and
+/// stay loaded, as the programs' own HUD status images do.
 fn author_images(
     manager: &PackageManager,
     displays: &[sundial::package_authoring::sandbox_perk::program::HudStatus],
     packages: &mut crate::asset_packages::AssetPackages,
+    placed: &mut Vec<TagHash>,
     layers: &mut BTreeMap<(String, u32), TagHash>,
 ) -> AuthoringResult<()> {
     let missing = displays
@@ -275,7 +278,18 @@ fn author_images(
         })
         .cloned()
         .collect::<Vec<_>>();
+    let before = packages
+        .packages
+        .iter()
+        .map(|package| (package.id, package.tags.len()))
+        .collect::<BTreeMap<_, _>>();
     let authored = crate::item::hud_status::imported_images(manager, &missing, packages)?;
+    for package in &packages.packages {
+        let start = before.get(&package.id).copied().unwrap_or(0);
+        placed.extend(
+            (start..package.tags.len()).map(|index| TagHash::new(package.id, index as u16)),
+        );
+    }
     for (key, tag) in authored {
         if layers.insert(key, tag).is_some() {
             return Err(invalid("Imported HUD image was allocated twice"));
@@ -296,7 +310,7 @@ fn allocate(
     statuses: &mut Vec<sundial::package_authoring::sandbox_perk::program::HudStatus>,
 ) -> AuthoringResult<()> {
     let displays = particles.bind_hud(manager)?;
-    author_images(manager, &displays, assets.packages, layers)?;
+    author_images(manager, &displays, assets.packages, assets.placed, layers)?;
     statuses.extend(displays);
     // These groups are read and allocated on every build, outside entity cache replay, so their
     // shared entries are recorded apart from the record cached runtimes replay against. Audio and

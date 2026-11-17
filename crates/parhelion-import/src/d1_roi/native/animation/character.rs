@@ -62,6 +62,43 @@ pub(super) fn profile(
         names.len() == 1,
         "Native weapon has ambiguous holding profiles"
     );
+    // Shadowkeep still keeps attachment rows for some Rise of Iron content groups that no stock
+    // weapon selects (The First Curse's E5D04AD2). That row's profile is what the source weapon
+    // played, so on PS4 the private profile aliases it when the third-person dictionary and any
+    // first-person one name it, and the weapon's own rows take the kept row's family with the
+    // private profile.
+    if source.platform() == 7 {
+        let native_profile = *names.first().unwrap();
+        let mut binding = json!({"builtin":3,"parent":native_profile,"owner":owner,"content":content,"alias":true});
+        let source_content = u32::try_from(
+            runtime["content_key"]
+                .as_u64()
+                .context("Source weapon content")?,
+        )?;
+        let kept = data
+            .array(at + 0x588, 0xE8, Some(0x80803E72))?
+            .into_iter()
+            .filter(|&row| data.u32(row).ok() == Some(source_content))
+            .map(|row| Ok((data.u32(row + 0x6C)?, data.u32(row + 0x20)?)))
+            .collect::<Result<BTreeSet<_>>>()?;
+        if let [(kept, family)] = kept.into_iter().collect::<Vec<_>>()[..] {
+            let mut lookups = vec![0x80EF62E5];
+            lookups.extend(controls::optional_owner(rig, true, 0x8080344B, false)?);
+            let mut named = true;
+            for owner in lookups {
+                let lookup = native.tag(owner, Some(0x80809C36))?;
+                let parameters =
+                    native.tag(lookup.u32(lookup.pointer(24)? + 0x94)?, Some(0x80808EE1))?;
+                named &= target::state::parameter::contains(&parameters, 3, kept)?;
+            }
+            if named {
+                binding["parent"] = json!(kept);
+                binding["replaces"] = json!(native_profile);
+                binding["family"] = json!(family);
+            }
+        }
+        return Ok((source_profile, binding));
+    }
     Ok((
         source_profile,
         json!({"builtin":3,"parent":names.first().unwrap(),"owner":owner,"content":content,"alias":true}),
@@ -73,7 +110,7 @@ fn compatible_controls(
     native: &Payload,
     rig: &target::control::Rig,
 ) -> Result<Vec<[f32; 8]>> {
-    let from = source.read(SOURCE_CONTROLS_OWNER)?;
+    let from = source.read(crate::d1_roi::platform::tag(SOURCE_CONTROLS_OWNER))?;
     control_defaults(&from, native, rig)
 }
 
@@ -93,7 +130,7 @@ pub(super) fn control_defaults(
         (0xD8, 2, 0x80800006, 0x80800006),
         (0xE8, 2, 0x80800006, 0x80800006),
     ] {
-        let sa = from.array(a + field, stride, Some(sc))?;
+        let sa = from.array(a + crate::d1_roi::platform::controls(field), stride, Some(sc))?;
         let na = native.array(b + field, stride, Some(nc))?;
         ensure!(
             sa.len() == na.len()
@@ -104,7 +141,7 @@ pub(super) fn control_defaults(
             "Human control groups or slot maps differ"
         );
     }
-    let sa = from.array(a + 0xA0, 48, Some(0x80800638))?;
+    let sa = from.array(a + crate::d1_roi::platform::controls(0xA0), 48, Some(0x80800638))?;
     let na = native.array(b + 0xA0, 52, Some(0x80809076))?;
     ensure!(
         sa.len() == rig.defaults.len()
@@ -116,7 +153,7 @@ pub(super) fn control_defaults(
         "Human control operations differ"
     );
     let defaults = from
-        .array(a + 0xB0, 32, Some(0x808001B0))?
+        .array(a + crate::d1_roi::platform::controls(0xB0), 32, Some(0x808001B0))?
         .into_iter()
         .map(|r| {
             let mut pose = [0.; 8];
@@ -316,14 +353,14 @@ pub(in crate::d1_roi::native) fn prepare(
             && lookup.u32(lp + 0x90)? == pose.u32(pp + 0x108)?,
         "Native human controller differs"
     );
-    let source_lookup = source.read(SOURCE_LOOKUP_OWNER)?;
+    let source_lookup = source.read(crate::d1_roi::platform::tag(SOURCE_LOOKUP_OWNER))?;
     let sl = source_lookup.pointer(24)?;
-    let source_pose = source.read(SOURCE_POSE_OWNER)?;
+    let source_pose = source.read(crate::d1_roi::platform::tag(SOURCE_POSE_OWNER))?;
     let sp = source_pose.pointer(24)?;
     ensure!(
         source_lookup.u32(sl - 4)? == SOURCE_LOOKUP
             && source_pose.u32(sp - 4)? == 0x80802790
-            && source_lookup.u32(sl + 0xA8)? == source_pose.u32(sp + 0x108)?,
+            && source_lookup.u32(sl + crate::d1_roi::platform::lookup(0xA8))? == source_pose.u32(sp + crate::d1_roi::platform::pose(0x108))?,
         "Source playable human controller differs"
     );
     let source_tag = |tag, class| -> Result<Payload> {
@@ -333,11 +370,11 @@ pub(in crate::d1_roi::native) fn prepare(
         );
         source.read(tag)
     };
-    let sb = source_tag(source_lookup.u32(sl + 0xA8)?, SOURCE_BANK)?;
-    let sd = source_tag(source_lookup.u32(sl + 0xAC)?, 0x80800368)?;
-    let st = source_tag(source_lookup.u32(sl + 0xB8)?, 0x8080287E)?;
-    let ss = source_tag(source_lookup.u32(sl + 0xBC)?, 0x808025D6)?;
-    let layers = source_tag(source_pose.u32(sp + 0x118)?, 0x80802919)?;
+    let sb = source_tag(source_lookup.u32(sl + crate::d1_roi::platform::lookup(0xA8))?, SOURCE_BANK)?;
+    let sd = source_tag(source_lookup.u32(sl + crate::d1_roi::platform::lookup(0xAC))?, 0x80800368)?;
+    let st = source_tag(source_lookup.u32(sl + crate::d1_roi::platform::lookup(0xB8))?, 0x8080287E)?;
+    let ss = source_tag(source_lookup.u32(sl + crate::d1_roi::platform::lookup(0xBC))?, 0x808025D6)?;
+    let layers = source_tag(source_pose.u32(sp + crate::d1_roi::platform::pose(0x118))?, 0x80802919)?;
     fs::create_dir_all(directory.join("character"))?;
     let mut files = BTreeMap::new();
     let mut tags = BTreeMap::new();

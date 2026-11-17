@@ -58,7 +58,7 @@ impl Sets {
         let source_markers = source.read(source_owner)?;
         let from = markers::read(
             &source_markers,
-            source_markers.pointer(0x18)? + 0xD8,
+            source_markers.pointer(0x18)? + crate::d1_roi::platform::markers(0xD8),
             markers::Layout {
                 row_class: SOURCE_ROW,
                 ..markers::NATIVE

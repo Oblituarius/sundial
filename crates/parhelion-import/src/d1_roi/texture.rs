@@ -2,8 +2,8 @@
 use super::*;
 use serde::Deserialize;
 mod amd;
-mod ps4;
 mod native;
+mod ps4;
 pub use amd::{LICENSE, SOURCE_URL};
 
 /// Storage metadata from the Xbox One source descriptor. Multisampled render targets and
@@ -359,5 +359,44 @@ impl Source {
             mips,
             bytes,
         })
+    }
+}
+
+impl Source {
+    /// A source texture's top mip as a DDS file with a DX10 header, for inspection tools such as
+    /// `d1probe texture`. Cube faces and lower mips are left out.
+    pub fn texture_dds(&self, tag: u32) -> Result<Vec<u8>> {
+        let texture = self.linear_texture(tag, None)?;
+        let (_, size) = surface(
+            texture.format,
+            usize::from(texture.width),
+            usize::from(texture.height),
+        )?;
+        let top = texture
+            .bytes
+            .get(..size)
+            .context("Source texture top mip is truncated")?;
+        let mut words = [0u32; 37];
+        words[0] = u32::from_le_bytes(*b"DDS ");
+        words[1] = 124;
+        // Caps, height, width, pixel format and linear size.
+        words[2] = 0x81007;
+        words[3] = u32::from(texture.height);
+        words[4] = u32::from(texture.width);
+        words[5] = u32::try_from(size)?;
+        words[7] = 1;
+        words[19] = 32;
+        words[20] = 4;
+        words[21] = u32::from_le_bytes(*b"DX10");
+        words[27] = 0x1000;
+        words[32] = texture.format;
+        words[33] = 3;
+        words[35] = 1;
+        let mut bytes = words
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>();
+        bytes.extend_from_slice(top);
+        Ok(bytes)
     }
 }

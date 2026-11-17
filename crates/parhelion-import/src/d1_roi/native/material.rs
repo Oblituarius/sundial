@@ -1067,6 +1067,40 @@ impl Assembly<'_> {
         ))
     }
 
+    /// The stage's listed technique whose vertex program reads only inputs `layout` declares,
+    /// for a layout no stock model draws at that stage. Shadowkeep draws nothing at stage 3 with
+    /// layout 123 (position; texcoord, normal and tangent), which Rise of Iron weapons use for
+    /// their shadow draws, while layout 139's stage-3 program `815B91EB` declares exactly those
+    /// four inputs and reads only the position. Among fitting techniques the one whose stock
+    /// layout declares the fewest elements `layout` lacks wins, then the table's order.
+    fn covering_technique(&mut self, pass: usize, layout: u16) -> Result<Option<u32>> {
+        let mut best: Option<(usize, u32)> = None;
+        for &(stage, stock, technique) in &BORROWED_TECHNIQUES {
+            if stage != pass {
+                continue;
+            }
+            let shader = self.native.tag(technique, Some(0x808071E8))?.u32(0x48)?;
+            if shader == u32::MAX {
+                continue;
+            }
+            let bytecode = self.native.tag(self.native.reference(shader)?, None)?;
+            let inputs = crate::tiger::shader::dxbc::signature(&bytecode.0, b"ISGN")?;
+            if !self.layouts.provides(layout, stock, &inputs) {
+                continue;
+            }
+            let lacking = self.layouts.lacking(layout, stock);
+            if best.is_none_or(|(fewest, _)| lacking < fewest) {
+                best = Some((lacking, technique));
+            }
+        }
+        if best.is_some() {
+            self.approximations.insert(format!(
+                "PS4 stage {pass} draws on layout {layout}, which no stock model draws at that stage, borrow the stage's technique whose vertex program reads only inputs the layout declares"
+            ));
+        }
+        Ok(best.map(|(_, technique)| technique))
+    }
+
     /// Copy the stock technique that draws this stage with the same vertex elements, and bind
     /// the gear resources its programs read to the converted plates and the draw's dye.
     fn borrowed_technique(
@@ -1083,13 +1117,16 @@ impl Assembly<'_> {
                 .find(|(stage, stock, _)| *stage == pass && fits(*stock))
                 .map(|(.., technique)| *technique)
         };
-        let technique = borrowed(&|stock| self.layouts.same_elements(layout, stock))
+        let technique = match borrowed(&|stock| self.layouts.same_elements(layout, stock))
             .or_else(|| borrowed(&|stock| self.layouts.feeds(layout, stock)))
-            .with_context(|| {
+        {
+            Some(technique) => technique,
+            None => self.covering_technique(pass, layout)?.with_context(|| {
                 format!(
                     "No stock technique draws stage {pass} with the elements of layout {layout}"
                 )
-            })?;
+            })?,
+        };
         let stock = self.native.tag(technique, Some(0x808071E8))?;
         let dye_tag = equipment.dyes.get(&(draw.dye / 2)).copied();
         let dye = dye_tag.map(|tag| self.source.read(tag)).transpose()?;

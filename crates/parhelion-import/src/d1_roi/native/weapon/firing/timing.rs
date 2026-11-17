@@ -1,7 +1,7 @@
 //! The Rise of Iron stat translator behind a source weapon's firing pattern, translated onto the
 //! base's native table by [`crate::tiger::weapon::timing`].
 use super::*;
-use crate::tiger::weapon::timing::{RISE_OF_IRON, Translator, translate};
+use crate::tiger::weapon::timing::{RISE_OF_IRON, RISE_OF_IRON_PS4, Translator, translate};
 
 pub(super) fn prepare(
     source: &Source,
@@ -56,7 +56,11 @@ pub(super) fn prepare(
         owner,
         payload,
         key,
-        dialect: &RISE_OF_IRON,
+        dialect: if crate::d1_roi::platform::ps4() {
+            &RISE_OF_IRON_PS4
+        } else {
+            &RISE_OF_IRON
+        },
     };
     translate(&translator, native, donor, &stats)
 }

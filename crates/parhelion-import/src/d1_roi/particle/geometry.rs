@@ -160,7 +160,12 @@ impl Source {
         );
         let material = source.u32(part)?;
         ensure!(
-            self.reference(material)? == 0x80801C32,
+            self.reference(material)?
+                == if self.platform() == 7 {
+                    0x80801AD7
+                } else {
+                    0x80801C32
+                },
             "Source particle model material class differs"
         );
         for at in (0x20..0x30).step_by(4).chain((mesh..mesh + 48).step_by(4)) {
@@ -270,8 +275,14 @@ fn buffer(source: &Source, tag: u32, kind: Kind) -> Result<Buffer> {
     );
     let mut header = source.read(tag)?;
     if kind == Kind::VertexBuffer {
+        // Size, stride and the build's marker: PS4 vertex headers (80AA8554) end in BEEFCACE.
+        let marker = if source.platform() == 7 {
+            0xBEEFCACE
+        } else {
+            0xBEEFDEAD
+        };
         ensure!(
-            header.0.len() == 12 && header.u32(8)? == 0xBEEFDEAD,
+            header.0.len() == 12 && header.u32(8)? == marker,
             "Source particle vertex header marker differs"
         );
         put(&mut header.0, 8, &0xDEADBEEFu32.to_le_bytes())?;

@@ -202,11 +202,11 @@ pub(super) fn prepare(
     let lookup = source.read(controls::owner(runtime, true, SOURCE_LOOKUP, true)?)?;
     let a = lookup.pointer(24)?;
     let from = Tables {
-        bank: source.read(lookup.u32(a + 0xA8)?)?,
-        states: source.read(lookup.u32(a + 0xB4)?)?,
-        dictionary: source.read(lookup.u32(a + 0xAC)?)?,
-        state_tag: lookup.u32(a + 0xB4)?,
-        dictionary_tag: lookup.u32(a + 0xAC)?,
+        bank: source.read(lookup.u32(a + crate::d1_roi::platform::lookup(0xA8))?)?,
+        states: source.read(lookup.u32(a + crate::d1_roi::platform::lookup(0xB4))?)?,
+        dictionary: source.read(lookup.u32(a + crate::d1_roi::platform::lookup(0xAC))?)?,
+        state_tag: lookup.u32(a + crate::d1_roi::platform::lookup(0xB4))?,
+        dictionary_tag: lookup.u32(a + crate::d1_roi::platform::lookup(0xAC))?,
     };
     let lookup = native.tag(
         controls::owner(rig, true, 0x8080344B, false)?,

@@ -1,5 +1,6 @@
 //! Match bound input identities through their owning response destinations.
 use super::*;
+use crate::d1_roi::platform;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(super) enum Role {
@@ -39,6 +40,13 @@ pub(super) enum Role {
 
 impl Role {
     fn read(class: u32, old: bool) -> Result<Self> {
+        // The network owner's definition is a script class, numbered by build.
+        const NETWORK: u32 = 0x80AACEA8;
+        let class = if old && class == platform::tag(NETWORK) {
+            NETWORK
+        } else {
+            class
+        };
         Ok(match (old, class) {
             (true, 0x808020AC) | (false, 0x8080388F) => Self::Movement,
             (true, 0x80800610) | (false, 0x808084E9) => Self::Sequence,
@@ -52,7 +60,7 @@ impl Role {
             (true, 0x80802947) | (false, 0x80803813) => Self::Query,
             (true, 0x808008FB) | (false, 0x80808507) => Self::Markers,
             (true, 0x8080046A) | (false, 0x80809426) => Self::Auxiliary,
-            (true, 0x80AACEA8) | (false, 0x80C70EDD) => Self::Network,
+            (true, NETWORK) | (false, 0x80C70EDD) => Self::Network,
             (true, 0x80802A9A) | (false, 0x808037A9) => Self::Attachment,
             (false, 0x80803F6E) => Self::Extra,
             (true, 0x808030BA) | (false, 0x8080378A) => Self::Provider,
@@ -340,23 +348,26 @@ pub(super) type ReceiverRow = (u32, u32, [u8; 16]);
 /// the provider at row `+10`.
 fn receiver(owner: &Owner, old: bool) -> Result<Vec<ReceiverRow>> {
     let p = &owner.payload;
+    // PS4 packs each source row's declaration, which puts the default right after the name and
+    // flag word, where Xbox One pads eight bytes between them.
+    let (table, stride, name, default) = if old {
+        crate::d1_roi::platform::receiver_rows()
+    } else {
+        (0x78, 0x40, 0x28, 0x30)
+    };
     p.array(
-        owner.definition + if old { 0x90 } else { 0x78 },
-        if old { 0x50 } else { 0x40 },
+        owner.definition + table,
+        stride,
         Some(if old { 0x80800884 } else { 0x80808BFA }),
     )?
     .into_iter()
     .map(|row| {
-        let at = row + if old { 0x30 } else { 0x28 };
+        let at = row + name;
         ensure!(
-            !old || p.u64(at + 8)? == 0,
+            !old || default - name == 8 || p.u64(at + 8)? == 0,
             "Projectile receiver row has unexpected fields"
         );
-        Ok((
-            p.u32(at)?,
-            p.u32(at + 4)?,
-            p.bytes::<16>(at + if old { 0x10 } else { 8 })?,
-        ))
+        Ok((p.u32(at)?, p.u32(at + 4)?, p.bytes::<16>(row + default)?))
     })
     .collect()
 }
@@ -389,8 +400,16 @@ struct Channel {
 fn bank(owner: &Owner, old: bool) -> Result<(Vec<u32>, BTreeMap<u32, Channel>)> {
     let p = &owner.payload;
     let d = owner.definition;
+    // Shadowkeep banks keep the Xbox One fields.
+    let field = |x| {
+        if old {
+            crate::d1_roi::platform::bank(x)
+        } else {
+            x
+        }
+    };
     let rows = p.array(
-        d + 0xD8,
+        d + field(0xD8),
         112,
         Some(if old { 0x80800883 } else { 0x808097A1 }),
     )?;
@@ -413,8 +432,8 @@ fn bank(owner: &Owner, old: bool) -> Result<(Vec<u32>, BTreeMap<u32, Channel>)> 
         }
         Ok(values)
     };
-    let inherited = lookup(0x108)?;
-    let incoming = lookup(0x118)?;
+    let inherited = lookup(field(0x108))?;
+    let incoming = lookup(field(0x118))?;
     let mut channels = BTreeMap::new();
     for (index, row) in rows.into_iter().enumerate() {
         let dependencies = p
@@ -547,8 +566,9 @@ impl Graph {
             let shared = SHARED
                 .iter()
                 .find(|(r, _)| *r == role)
-                .map(|(_, tag)| *tag)
+                .map(|(_, tag)| platform::tag(*tag))
                 .context("Projectile variant role has no shared owner")?;
+            let from = platform::retained::query(from);
             let shared = read(shared, source(shared)?)?;
             let reference = read(reference, stock(reference)?)?;
             ensure!(
@@ -581,6 +601,7 @@ impl Graph {
             native.owners.get(&Role::Attachment),
         ) {
             for (from, to, length) in ATTACHMENT {
+                let from = platform::retained::spawner(from);
                 ensure!(
                     owner
                         .payload
@@ -602,7 +623,8 @@ impl Graph {
             native.owners.get(&Role::Tracking),
         ) {
             let (shared, from, common, to) = &TRACKING;
-            let shared = read(*shared, source(*shared)?)?;
+            let shared = platform::tag(*shared);
+            let shared = read(shared, source(shared)?)?;
             let common = read(*common, stock(*common)?)?;
             if owner.tag != shared.tag {
                 same_form(owner, &shared, from, 0x80800184)?;
@@ -629,14 +651,19 @@ impl Graph {
         }
         // A source model owner may differ from the shared one in presentation alone.
         if let Some(owner) = self.owners.get(&Role::Model) {
-            let (_, shared) = SHARED
+            let shared = SHARED
                 .iter()
                 .find(|(role, _)| *role == Role::Model)
+                .map(|(_, tag)| platform::tag(*tag))
                 .context("Projectile model role has no shared owner")?;
-            if owner.tag != *shared {
-                let shared = read(*shared, source(*shared)?)?;
+            if owner.tag != shared {
+                let shared = read(shared, source(shared)?)?;
+                let model = MODEL.map(|range| {
+                    platform::retained::model(range.start)
+                        ..platform::retained::model(range.end - 4) + 4
+                });
                 ensure!(
-                    same_except(owner, &shared, &MODEL)?,
+                    same_except(owner, &shared, &model)?,
                     "Projectile model owner {:08X} differs from the shared one beyond its model",
                     owner.tag
                 );
@@ -661,6 +688,10 @@ impl Graph {
                     .to_vec())
             };
             let [(name, native_name, length), (from, to, width)] = PROVIDER;
+            let (name, from) = (
+                platform::retained::provider(name),
+                platform::retained::provider(from),
+            );
             ensure!(
                 field(owner, name, length)? == field(carrier, native_name, length)?,
                 "Projectile provider name differs from the carrier's"
@@ -851,7 +882,7 @@ impl Graph {
         }
         EXTERNAL
             .iter()
-            .find(|(from, to)| e.tag == if self.old { *from } else { *to })
+            .find(|(from, to)| e.tag == if self.old { platform::tag(*from) } else { *to })
             .map(|(_, to)| *to)
     }
 
@@ -881,9 +912,14 @@ impl Graph {
         let named = if self.old { 0x80800927 } else { 0x80809789 };
         let settings = if self.old { 0x8080099E } else { 0x80809BD9 };
         if e.class == named {
-            let name = owner
-                .payload
-                .u32(e.offset + if self.old { 40 } else { 32 })?;
+            let name = owner.payload.u32(
+                e.offset
+                    + if self.old {
+                        crate::d1_roi::platform::input_row().1
+                    } else {
+                        32
+                    },
+            )?;
             let path = match role {
                 Role::Movement => {
                     ensure!(seen.insert(e.offset), "Projectile input is connected twice");
@@ -927,16 +963,29 @@ impl Graph {
             role == Role::Bank && e.class == if self.old { 0x80800668 } else { 0x808097A8 },
             "Unsupported projectile consumer class"
         );
+        let field = |x| {
+            if self.old {
+                crate::d1_roi::platform::bank(x)
+            } else {
+                x
+            }
+        };
         let getters = owner.payload.array(
-            owner.definition + 0xC8,
-            if self.old { 40 } else { 32 },
+            owner.definition + field(0xC8),
+            if self.old {
+                crate::d1_roi::platform::getter_stride()
+            } else {
+                32
+            },
             Some(e.class),
         )?;
         let ordinal = getters
             .iter()
             .position(|&at| at == e.offset)
             .context("Projectile bank consumer is not a getter")?;
-        let lookup = owner.payload.array(owner.definition + 0x118, 12, None)?;
+        let lookup = owner
+            .payload
+            .array(owner.definition + field(0x118), 12, None)?;
         let names = lookup
             .into_iter()
             .filter(|&at| owner.payload.u32(at + 8).ok() == Some(ordinal as u32))
@@ -1149,7 +1198,10 @@ impl Graph {
         // carrier's programs.
         for (&role, owner) in self.owners.iter().filter(|(role, _)| role.retained()) {
             ensure!(
-                SHARED.contains(&(role, owner.tag)) || variants.contains(&role),
+                SHARED
+                    .iter()
+                    .any(|&(r, tag)| r == role && platform::tag(tag) == owner.tag)
+                    || variants.contains(&role),
                 "Projectile {} owner {:08X} is not the shared one",
                 role.name(),
                 owner.tag

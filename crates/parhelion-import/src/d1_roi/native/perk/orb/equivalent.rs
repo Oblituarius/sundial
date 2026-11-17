@@ -93,6 +93,33 @@ struct Comparison<'a> {
 }
 
 impl Comparison<'_> {
+    /// The PS4 form of the declared comparison, which has no PS4 declarations to read: two
+    /// payloads of one class may differ only at aligned words where both name a tag, each pair
+    /// being the owners themselves or resources that compare equal in turn. Any other differing
+    /// word refuses, so a payload whose values differ is never taken for the default.
+    fn tag_words(&mut self, a: &Payload, b: &Payload, owners: (u32, u32)) -> Result<()> {
+        ensure!(
+            a.0.len() <= 16 * 1024 * 1024,
+            "Source orb resource exceeds comparison limit"
+        );
+        for at in (0..a.0.len() / 4 * 4).step_by(4) {
+            let (x, y) = (a.u32(at)?, b.u32(at)?);
+            if x == y || (x, y) == owners {
+                continue;
+            }
+            ensure!(
+                self.source.reference(x).is_ok() && self.source.reference(y).is_ok(),
+                "Source pickup has non-resource differences from its configured default"
+            );
+            self.compare(x, y)?;
+        }
+        ensure!(
+            a.0[a.0.len() / 4 * 4..] == b.0[b.0.len() / 4 * 4..],
+            "Source pickup has non-resource differences from its configured default"
+        );
+        Ok(())
+    }
+
     fn texture(&self, tag: u32, header: &Payload) -> Result<Vec<u8>> {
         let mut assets = BTreeMap::new();
         let description = self.source.texture(tag, &mut assets)?;
@@ -138,7 +165,17 @@ impl Comparison<'_> {
             a.0.len() == b.0.len(),
             "Source pickup differs from the configured default"
         );
-        if a.0.len() == 68 && a.u32(0x2C)? == 0xBEEFCAFE {
+        if self.source.platform() == 7 && a.0.len() == 60 && a.u32(0x24)? == 0xBEEFCAFE {
+            // A PS4 texture header (60 bytes, marker at `+24`): equal headers and equal decoded
+            // texels of every mip. Raw data may differ in the padding its tiling leaves unused,
+            // as Versatile Shooter's ramp `80A6A4A9` and the default's `80AACC59` do.
+            ensure!(
+                a.0 == b.0
+                    && self.source.linear_texture(left, None)?.bytes
+                        == self.source.linear_texture(right, None)?.bytes,
+                "Source pickup texture differs from the configured default"
+            );
+        } else if a.0.len() == 68 && a.u32(0x2C)? == 0xBEEFCAFE {
             // The source texture reader checks entry types, subtypes and streamed buffers.
             // Compare every authored mip, excluding Xbox tiling padding.
             ensure!(
@@ -151,7 +188,9 @@ impl Comparison<'_> {
                 class == self.source.reference(right)?,
                 "Source orb dependency classes differ"
             );
-            if a.0 != b.0 {
+            if a.0 != b.0 && self.source.platform() == 7 {
+                self.tag_words(&a, &b, (left, right))?;
+            } else if a.0 != b.0 {
                 ensure!(
                     a.0.len() <= 16 * 1024 * 1024,
                     "Source orb resource exceeds comparison limit"

@@ -8,6 +8,9 @@ impl Assembly<'_> {
                 .context("Source optic needs a weapon runtime")?,
         )?;
         let components = root.array(0x20, 12, Some(0x80800715))?;
+        // The aim input is a connection input, whose packed declaration moves its later fields
+        // on PS4 (`platform::input`).
+        let field = crate::d1_roi::platform::input;
         let mut found = Vec::new();
         for at in root.array(0x30, 88, Some(0x8080054E))? {
             if root.u64(at + 24)? != 0x8080073D {
@@ -16,7 +19,7 @@ impl Assembly<'_> {
             let tag = u32::try_from(root.u64(at + 8)?)?;
             let input = usize::try_from(root.u64(at + 16)?)?;
             let owner = self.source.read(tag)?;
-            if owner.u32(input + 0x3C)? != marker {
+            if owner.u32(input + field(0x3C))? != marker {
                 continue;
             }
             let component = usize::try_from(root.u64(at + 32)?)?;
@@ -73,16 +76,16 @@ impl Assembly<'_> {
             ensure!(
                 owner.u64(input)? == u64::from(tag)
                     && owner.u64(input + 0x10)? == 0x80800862
-                    && owner.u64(input + 0x18)? == 0
-                    && owner.u64(input + 0x20)? == 0x8080052A
-                    && owner.u32(input + 0x28)? == 1
-                    && owner.u32(input + 0x2C)? == u32::MAX
-                    && owner.u64(input + 0x30)? == 0
-                    && owner.u32(input + 0x38)? == 0x80800608
-                    && owner.u64(input + 0x40)? == 1,
+                    && (crate::d1_roi::platform::ps4() || owner.u64(input + 0x18)? == 0)
+                    && crate::d1_roi::platform::input_class(&owner, input)?
+                    && owner.u32(input + field(0x28))? == 1
+                    && owner.u32(input + field(0x2C))? == u32::MAX
+                    && owner.u64(input + field(0x30))? == 0
+                    && owner.u32(input + field(0x38))? == 0x80800608
+                    && owner.u64(input + field(0x40))? == 1,
                 "Inherited aim input layout differs"
             );
-            let rows = owner.array(input + 0x48, 64, Some(0x80800608))?;
+            let rows = owner.array(input + field(0x48), 64, Some(0x80800608))?;
             ensure!(rows.len() == 1, "Inherited aim needs one default row");
             let row = rows[0];
             ensure!(

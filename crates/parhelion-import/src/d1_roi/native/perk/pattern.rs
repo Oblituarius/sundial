@@ -642,13 +642,7 @@ pub(super) fn read(
 /// Eliksni Immunity's status follows the framework network, as Touch of Malice's status and
 /// Duration host do, and Devil's Touch's status follows two other owners.
 pub(super) fn closure_form(source: &Source, p: &Payload, at: usize) -> Result<bool> {
-    // PS4 takes the closure as Xbox One does. `PARHELION_D1_PS4_LEGACY_ATTACH` keeps the dedicated
-    // routes its elemental armor talents (Twilight Garrison) and Antigrav Thrusters (Empyrean
-    // Bellicose) were first verified with in game, to compare the two in play.
-    if (source.platform() == 7 && std::env::var_os("PARHELION_D1_PS4_LEGACY_ATTACH").is_some())
-        || p.u32(at - 4)? != 0x80802953
-        || p.u8(at)? != 0
-    {
+    if p.u32(at - 4)? != 0x80802953 || p.u8(at)? != 0 {
         return Ok(false);
     }
     if p.u8(at + 2)? == 3 {

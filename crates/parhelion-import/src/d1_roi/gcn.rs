@@ -122,6 +122,36 @@ pub(super) fn lift(
     elements: &[(u8, u8)],
     cubes: &std::collections::BTreeSet<u8>,
 ) -> Result<Lifted> {
+    lift_with(source, vertex, pixel, elements, cubes, false)
+}
+
+/// Lift a particle material's programs: its vertex program reads `rows` appearance records,
+/// one Float4 each as `TEXCOORD0` onward, and declares all of them at four lanes whatever its
+/// fetch takes, as the record the particle draw binds and the Xbox One programs declare it. A
+/// model particle (`model`) then fetches its mesh's three float streams, which the Xbox One
+/// programs declare as `POSITION0` to `POSITION2`.
+pub(super) fn lift_records(
+    source: &Source,
+    vertex: u32,
+    pixel: u32,
+    (rows, model): (u8, bool),
+    cubes: &std::collections::BTreeSet<u8>,
+) -> Result<Lifted> {
+    let mut elements = (0..rows).map(|row| (5, row)).collect::<Vec<_>>();
+    if model {
+        elements.extend((0..3).map(|stream| (0, stream)));
+    }
+    lift_with(source, vertex, pixel, &elements, cubes, true)
+}
+
+fn lift_with(
+    source: &Source,
+    vertex: u32,
+    pixel: u32,
+    elements: &[(u8, u8)],
+    cubes: &std::collections::BTreeSet<u8>,
+    whole: bool,
+) -> Result<Lifted> {
     let (vertex_header, vertex_code) = program(source, vertex, true)?;
     let (pixel_header, pixel_code) = program(source, pixel, false)?;
     let Interface::Vertex { exports, .. } = &vertex_header.interface else {
@@ -133,12 +163,13 @@ pub(super) fn lift(
         .into_iter()
         .map(|(semantic, _)| semantic)
         .collect::<Vec<_>>();
-    let vertex_hlsl = lift::hlsl(
+    let vertex_hlsl = lift::hlsl_with(
         &vertex_header,
         &vertex_code,
         elements,
         &[],
         &Default::default(),
+        whole,
     )
     .with_context(|| format!("Source vertex program {vertex:08X}"))?;
     let pixel_hlsl = lift::hlsl(&pixel_header, &pixel_code, &[], &linkage, cubes)

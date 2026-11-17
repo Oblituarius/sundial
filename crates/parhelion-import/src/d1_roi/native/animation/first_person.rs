@@ -106,10 +106,10 @@ pub(in crate::d1_roi::native) fn prepare(
     let lookup = native.tag(native_owner, Some(0x80809C36))?;
     let sr = source_lookup.pointer(24)?;
     let nr = lookup.pointer(24)?;
-    let source_bank = source.read(source_lookup.u32(sr + 0xA8)?)?;
+    let source_bank = source.read(source_lookup.u32(sr + crate::d1_roi::platform::lookup(0xA8))?)?;
     let bank_tag = lookup.u32(nr + 0x90)?;
     let bank = native.tag(bank_tag, Some(0x808036F6))?;
-    let source_states = source.read(source_lookup.u32(sr + 0xB4)?)?;
+    let source_states = source.read(source_lookup.u32(sr + crate::d1_roi::platform::lookup(0xB4))?)?;
     let native_states = native.tag(lookup.u32(nr + 0x9C)?, Some(0x80803465))?;
     let from = choices(&source_states, &source_bank, true)?;
     let to = choices(&native_states, &bank, false)?;

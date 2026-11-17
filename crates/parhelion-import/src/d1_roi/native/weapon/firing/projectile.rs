@@ -1,5 +1,6 @@
 //! Source-selected retained projectiles with checked response operands and native compatibility.
 use super::*;
+use crate::d1_roi::platform::impulse;
 use sha2::{Digest, Sha256};
 use sundial::package_authoring::{ability_damage, entity::weapon_component_bindings, runtime};
 
@@ -17,7 +18,9 @@ mod tree;
 const CONTENT: u32 = 0x5F0DD954;
 const MOVEMENT: u32 = 0x0437756D;
 /// Category dictionaries named by profile category rows at `+10`.
-const SOURCE_CATEGORIES: u32 = 0x80AAC26E;
+fn source_categories() -> u32 {
+    crate::d1_roi::platform::tag(0x80AAC26E)
+}
 const NATIVE_CATEGORIES: u32 = 0x80C70CA1;
 
 /// What a carrier profile's private copy takes from its source: the damage type and the category
@@ -54,11 +57,11 @@ fn profile(
     let declaration = source.read(s.u32(sd - 4)?)?;
     ensure!(
         declaration.u32(16)? == 0x80802364
-            && declaration.u32(20)? == 0x120
+            && declaration.u32(20)? == crate::d1_roi::platform::field(0x120, 0x110) as u32
             && n.u32(nd - 4)? == 0x80804B02,
         "Projectile profile layout differs"
     );
-    let amount = s.pointer(sd + 24)?;
+    let amount = s.pointer(sd + impulse(24))?;
     let (source_amount, native_amount) = (s.bytes::<13>(amount)?, n.bytes::<13>(nd + 20)?);
     ensure!(
         source_amount[..12] == native_amount[..12] && n.u8(nd + 16)? == 0 && n.u8(nd + 0x53)? == 0,
@@ -93,7 +96,7 @@ fn profile(
             })
             .collect()
     };
-    let from_categories = categories(&s, sd + 0xC8, SOURCE_CATEGORIES)?;
+    let from_categories = categories(&s, sd + impulse(0xC8), source_categories())?;
     let to_categories = categories(&n, nd + 0x60, NATIVE_CATEGORIES)?;
     let recategorized = from_categories.iter().collect::<BTreeSet<_>>()
         != to_categories.iter().collect::<BTreeSet<_>>();
@@ -110,7 +113,7 @@ fn profile(
             "Projectile profile categories differ"
         );
     }
-    let sr = s.array(sd + 0x28, 8, None)?;
+    let sr = s.array(sd + impulse(0x28), 8, None)?;
     let nr = n.array(nd + 0x78, 8, None)?;
     // Responses pair by position and class. A graph response, Rise of Iron `8080218E` and
     // Shadowkeep `80804B54`, has the selector 8 layout: a graph at `+08` and a label filter at
@@ -224,7 +227,10 @@ fn resources(
     let mut types = BTreeMap::<u32, Private>::new();
     for &(kind, from, to) in pairs {
         if matches!(from, 0 | u32::MAX) || matches!(to, 0 | u32::MAX) {
-            ensure!(from == to, "Projectile resource presence differs");
+            ensure!(
+                from == to,
+                "Projectile resource presence differs: kind {kind}, source {from:08X}, carrier {to:08X}"
+            );
             continue;
         }
         if kind == 9 {
@@ -495,7 +501,9 @@ fn prepare_pair(
         (31, 0x200, 0x1F0),
         (32, 0x210, 0x200),
     ] {
-        let from = sm.payload.u32(sm.definition + a)?;
+        let from = sm
+            .payload
+            .u32(sm.definition + crate::d1_roi::platform::movement(a))?;
         let to = nm.payload.u32(nm.definition + b)?;
         if kind == 9
             && !matches!(from, 0 | u32::MAX)

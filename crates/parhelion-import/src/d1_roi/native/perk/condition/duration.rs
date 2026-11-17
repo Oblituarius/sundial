@@ -63,6 +63,8 @@ const SHARED: [(u32, u32, u32); 3] = [
 ];
 
 fn shared(source: &Source, native: &mut Reader, key: u32, from: u32, to: u32) -> Result<()> {
+    use crate::d1_roi::platform::{status, tag};
+    let from = tag(from);
     ensure!(
         source.reference(from)? == 0x80800861,
         "Source shared duration publisher class differs"
@@ -79,12 +81,22 @@ fn shared(source: &Source, native: &mut Reader, key: u32, from: u32, to: u32) ->
                 && p.u32(live)? == tag,
             "Shared duration publisher has another root pair"
         );
-        let policy = settings + if source { 0x250 + 0xA0 } else { 0x228 + 0x98 };
+        let policy = settings
+            + if source {
+                status::settings(0xF0) + status::hud(0x160) + status::duration(0xA0)
+            } else {
+                0x228 + 0x98
+            };
         let mut words = [0; 5];
         for (index, word) in words.iter_mut().enumerate() {
             *word = p.u32(policy + index * 4)?;
         }
-        Ok((words, p.u32(settings + if source { 0x178 } else { 0x160 })?))
+        let hud = if source {
+            status::settings(0xF0) + status::hud(0x88)
+        } else {
+            0x160
+        };
+        Ok((words, p.u32(settings + hud)?))
     };
     let (source_policy, source_hud) = read(&source_owner, from, true)?;
     let (native_policy, native_hud) = read(&native_owner, to, false)?;

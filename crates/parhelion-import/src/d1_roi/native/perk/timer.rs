@@ -27,8 +27,13 @@ pub(super) fn read(
     for child in children {
         let child = p.pointer(child)?;
         let kind = p.u8(child + 5)?;
+        // A PS4 source admits any stateless predicate the condition translators below accept,
+        // which qualify its producer, identity and filters, as the note after this loop asks:
+        // Unrepentant extends its superburst on each shot (kind 27). Xbox One keeps the checked
+        // kill, game-event and reload predicates.
         ensure!(
-            matches!(kind, 2 | 12 | 19) && (kind == 2 || p.u8(child + 6)? == 0),
+            (matches!(kind, 2 | 12 | 19) || source.platform() == 7)
+                && (kind == 2 || p.u8(child + 6)? == 0),
             "Source timer extension requires qualified kill, game-event or reload predicates"
         );
         source_mask |= 1u64 << kind;

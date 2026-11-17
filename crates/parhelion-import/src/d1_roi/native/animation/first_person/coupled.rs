@@ -103,13 +103,13 @@ fn tables(inputs: &Inputs) -> Result<Option<Tables>> {
         "Source pose resource differs"
     );
     let lookup = source.read(controls::owner(inputs.runtime, true, SOURCE_LOOKUP, true)?)?;
-    let bank = pose.u32(at + 0x108)?;
+    let bank = pose.u32(at + crate::d1_roi::platform::pose(0x108))?;
     ensure!(
-        lookup.u32(lookup.pointer(24)? + 0xA8)? == bank,
+        lookup.u32(lookup.pointer(24)? + crate::d1_roi::platform::lookup(0xA8))? == bank,
         "Source pose and lookup name different banks"
     );
     let read = |offset: usize, class: u32| -> Result<(u32, Payload)> {
-        let tag = pose.u32(at + offset)?;
+        let tag = pose.u32(at + crate::d1_roi::platform::pose(offset))?;
         ensure!(
             source.reference(tag)? == class,
             "Source pose table {tag:08X} class differs"

@@ -483,8 +483,27 @@ impl<'a> Lift<'a> {
             4 => 16,
             _ => bail!("Unsupported GCN scalar load {op}"),
         };
-        let SmrdOffset::Dwords(offset) = offset else {
-            bail!("GCN scalar load has a register offset")
+        let offset = match offset {
+            SmrdOffset::Dwords(offset) => offset,
+            // A constant buffer read at a byte offset a scalar register computes, as particle
+            // programs index their emitter rows: each dword comes from the row and lane that
+            // offset addresses, in a buffer of unknown extent.
+            SmrdOffset::Register(register) if op >= 8 && register < 104 => {
+                let Some(Desc::Buffer(slot, 0)) = self.sgpr.get(&base).copied() else {
+                    bail!("GCN buffer load through s{base}");
+                };
+                self.cbuffers.insert(slot, None);
+                let bytes = self.s(register);
+                for k in 0..count {
+                    let dword = format!("(({bytes} >> 2) + {k}u)");
+                    let value = format!("asuint(cb{slot}[{dword} >> 2][{dword} & 3u])");
+                    self.write_sgpr(dst + k as u8, value)?;
+                }
+                return Ok(());
+            }
+            SmrdOffset::Register(register) => {
+                bail!("GCN scalar load {op} has a register offset s{register}")
+            }
         };
         let pointer = self.sgpr.get(&base).copied();
         if op < 8 {
@@ -1007,10 +1026,44 @@ impl Lift<'_> {
         &self,
         elements: &[(u8, u8)],
         linkage: &[u8],
+        whole: bool,
     ) -> Result<(Vec<String>, Vec<String>)> {
         let mut parameters = Vec::new();
         let mut outputs = Vec::new();
         match &self.header.interface {
+            Interface::Vertex { inputs, exports } if whole => {
+                // Every record element (`TEXCOORD`), fetched or not, at its full four lanes: the
+                // input record the draw binds, whatever lanes the program's fetch takes. Other
+                // elements are declared as fetched.
+                for (element, &(code, index)) in elements.iter().enumerate() {
+                    let (name, integer) = semantic_name(code)?;
+                    let ty = if integer { "uint" } else { "float" };
+                    let fetched = inputs
+                        .iter()
+                        .find(|&&(e, ..)| usize::from(e) == element)
+                        .map(|&(.., size)| size);
+                    match (code, fetched) {
+                        (5, Some(_)) => {
+                            parameters.push(format!("in {ty}4 i{element} : {name}{index}"))
+                        }
+                        (5, None) => {
+                            parameters.push(format!("in {ty}4 unused{element} : {name}{index}"))
+                        }
+                        (_, Some(size)) => {
+                            parameters.push(format!("in {ty}{size} i{element} : {name}{index}"))
+                        }
+                        (_, None) => {}
+                    }
+                }
+                let mut params = exports.clone();
+                params.sort_unstable_by_key(|(_, param)| *param);
+                for (semantic, param) in &params {
+                    parameters.push(format!("out float4 o{param} : TEXCOORD{semantic}"));
+                    outputs.push(format!("o{param}"));
+                }
+                parameters.push("out float4 position : SV_Position".to_owned());
+                outputs.push("position".to_owned());
+            }
             Interface::Vertex { inputs, exports } => {
                 let mut sorted = inputs.clone();
                 sorted.sort_unstable();
@@ -1141,13 +1194,25 @@ pub fn hlsl(
     linkage: &[u8],
     cubes: &BTreeSet<u8>,
 ) -> Result<String> {
+    hlsl_with(header, code, elements, linkage, cubes, false)
+}
+
+/// [`hlsl`], with `whole` declaring every vertex element at four lanes, fetched or not.
+pub fn hlsl_with(
+    header: &Header,
+    code: &[u8],
+    elements: &[(u8, u8)],
+    linkage: &[u8],
+    cubes: &BTreeSet<u8>,
+    whole: bool,
+) -> Result<String> {
     let instructions = decode::program(code)?;
     let mut lift = Lift::new(header, cubes)?;
     lift.prologue(elements)?;
     for Instruction { at, op } in &instructions {
         lift.step(*at, op)?;
     }
-    let (parameters, outputs) = lift.parameters(elements, linkage)?;
+    let (parameters, outputs) = lift.parameters(elements, linkage, whole)?;
     let mut text = lift.declarations()?;
     writeln!(text, "void main({})\n{{", parameters.join(",\n    "))?;
     text.push_str("    bool exec = true, vcc = false, scc = false;\n");

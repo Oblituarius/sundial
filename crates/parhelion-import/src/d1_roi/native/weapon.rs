@@ -42,6 +42,7 @@ fn content_row(source: &Source, export: &Value) -> Result<Content> {
         16,
     )?;
     let entity = source.read(root)?;
+    let content = crate::d1_roi::platform::content;
     let mut selected = Vec::new();
     for r in entity.array(32, 12, Some(0x80800715))? {
         let owner = source.read(entity.u32(r)?)?;
@@ -50,12 +51,14 @@ fn content_row(source: &Source, export: &Value) -> Result<Content> {
             continue;
         }
         let matches = owner
-            .array(d + 0x1F0, 0x140, Some(0x80802312))?
+            .array(d + content(0x1F0), 0x140, Some(0x80802312))?
             .into_iter()
             .filter(|&r| owner.u32(r + 24).ok() == Some(key))
             .collect::<Vec<_>>();
         ensure!(matches.len() <= 1, "Source content key is ambiguous");
-        let (row, keyed) = matches.first().map_or((d + 0xB0, false), |&r| (r, true));
+        let (row, keyed) = matches
+            .first()
+            .map_or((d + content(0xB0), false), |&r| (r, true));
         selected.push((owner, row, keyed));
     }
     let Ok([(owner, row, keyed)]) = <[_; 1]>::try_from(selected) else {

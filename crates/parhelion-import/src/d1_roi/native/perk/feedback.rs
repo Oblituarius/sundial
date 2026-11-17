@@ -99,12 +99,7 @@ fn graph_record(
     if !modifier {
         return Ok(None);
     }
-    match modifier_record(source, native, p, at, tag) {
-        // PS4 imports predate this route and left every feedback modifier bank out. One with no
-        // stock counterpart stays left out there rather than refusing a talent that imported.
-        Err(_) if source.platform() == 7 => Ok(None),
-        record => record.map(Some),
-    }
+    modifier_record(source, native, p, at, tag).map(Some)
 }
 
 fn modifier_record(

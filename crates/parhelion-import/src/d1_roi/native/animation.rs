@@ -324,7 +324,7 @@ fn runtime_bank(source: &Source, runtime: &Value) -> Result<Vec<(u32, u32)>> {
         resource >= 4 && lookup.u32(resource - 4)? == SOURCE_LOOKUP,
         "Source animation lookup layout differs"
     );
-    let bank_tag = lookup.u32(resource + 0xA8)?;
+    let bank_tag = lookup.u32(resource + crate::d1_roi::platform::lookup(0xA8))?;
     ensure!(
         source.reference(bank_tag)? == SOURCE_BANK,
         "Source animation lookup names no clip bank"

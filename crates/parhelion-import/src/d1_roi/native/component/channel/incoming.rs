@@ -38,8 +38,12 @@ pub(super) fn read(source: &Payload, names: &[u32]) -> Result<Vec<Input>> {
     let instance = source.pointer(16)?;
     let schema = source.pointer(24)?;
     let inputs = source.array(instance + 0x30, 80, Some(0x80800895))?;
-    let definitions = source.array(schema + 0xC8, 40, Some(0x80800668))?;
-    let incoming = source.array(schema + 0x118, 12, Some(0x8080087B))?;
+    let definitions = source.array(
+        schema + crate::d1_roi::platform::bank(0xC8),
+        crate::d1_roi::platform::getter_stride(),
+        Some(0x80800668),
+    )?;
+    let incoming = source.array(schema + crate::d1_roi::platform::bank(0x118), 12, Some(0x8080087B))?;
     let cache = source.array(instance + 0x60, 16, Some(0x80800090))?;
     ensure!(
         inputs.len() == definitions.len() && inputs.len() == incoming.len(),
@@ -75,10 +79,10 @@ pub(super) fn read(source: &Payload, names: &[u32]) -> Result<Vec<Input>> {
                     && source.u64(input + 8)? == definition as u64
                     && source.u64(definition + 8)? == input as u64
                     && source.u64(input + 16)? == 0x80800668
-                    && source.u64(definition + 16)? == 0x80800895
-                    && source.pointer(input + 24)? == instance
-                    && source.u64(definition + 24)? == 0
-                    && source.u64(definition + 32)? == 0x80800539,
+                    && crate::d1_roi::platform::getter_classes(
+                        source, definition, 0x80800895, 0x80800539,
+                    )?
+                    && source.pointer(input + 24)? == instance,
                 "Source incoming getter envelope differs"
             );
             empty_state(source, input)?;
@@ -256,14 +260,14 @@ impl Assembly<'_> {
         let n = usize::try_from(p.u64(p.pointer(16)? + 8)?)?;
         ensure!(
             source.u32(s - 4)? == 0x808027FC
-                && offset == (s + 0x2B0) as u64
-                && source.pointer(s + 0x2B0)? == s
+                && offset == (s + crate::d1_roi::platform::optic(0x2B0)) as u64
+                && source.pointer(s + crate::d1_roi::platform::optic(0x2B0))? == s
                 && p.u32(n - 4)? == 0x8080393B
                 && p.pointer(n + 0x268)? == n
-                && source.u32(s + 0x2C8)? == p.u32(n + 0x280)?,
+                && source.u32(s + crate::d1_roi::platform::optic(0x2C8))? == p.u32(n + 0x280)?,
             "Incoming channel requires a translated optic output"
         );
-        let a = self.source.read(source.u32(s + 0x2B8)?)?;
+        let a = self.source.read(source.u32(s + crate::d1_roi::platform::optic(0x2B8))?)?;
         let b = self.native.tag(p.u32(n + 0x270)?, None)?;
         for (metadata, implementation, abstract_class, row_class, source_class, method) in [
             (&a, 0x8080053B, 0x80800539, 0x808005C0, 0x80802170, 3),
@@ -281,6 +285,43 @@ impl Assembly<'_> {
             );
         }
         Ok(n + 0x268)
+    }
+
+    /// Whether every incoming channel of source bank `tag` has one connection row in `entity`
+    /// whose provider is an optic, which a weapon body translates and [`Self::scalar_output`]
+    /// connects. A bank whose incoming channels are written by other components keeps them as
+    /// plain channels at zero, as effect sequences in a body stay untranslated.
+    pub(in super::super) fn incoming_fed(
+        &mut self,
+        entity: &Payload,
+        tag: u32,
+        bank: &Payload,
+    ) -> Result<bool> {
+        let schema = bank.pointer(24)?;
+        let definitions = bank.array(
+            schema + crate::d1_roi::platform::bank(0xC8),
+            crate::d1_roi::platform::getter_stride(),
+            None,
+        )?;
+        let rows = entity.array(0x30, 88, Some(0x8080054E))?;
+        for definition in definitions {
+            let matches = rows
+                .iter()
+                .filter(|at| {
+                    entity.u32(**at + 8).ok() == Some(tag)
+                        && entity.u64(**at + 16).ok() == Some(definition as u64)
+                })
+                .collect::<Vec<_>>();
+            let [at] = matches.as_slice() else {
+                return Ok(false);
+            };
+            let provider = self.source.read(entity.u32(**at + 48)?)?;
+            let class = provider.u32(provider.pointer(24)? - 4)?;
+            if class != 0x808027FC {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     pub(in super::super) fn channel_connections(

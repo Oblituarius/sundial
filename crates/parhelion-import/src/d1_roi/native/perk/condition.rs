@@ -4,6 +4,7 @@ use sundial::package_authoring::sandbox_perk::action::native::{Block, Graph, Nod
 mod ability_event;
 mod accumulator;
 mod damage_taken;
+mod derived_event;
 mod duration;
 mod event_filter;
 mod group;
@@ -106,6 +107,21 @@ pub(super) fn read(
         let mut bytes = p.bytes::<12>(at)?.to_vec();
         bytes[5] = 33;
         return Ok(Some(NativeNode { kind: 33, bytes }));
+    }
+    // A PS4 source's game event is heard under its Shadowkeep equivalent: the same event, or the
+    // Shadowkeep derived event with the same parent chain and predicate ([`derived_event`]), when
+    // every Shadowkeep event table defines it. Without one, the checked pairs below decide.
+    if (class, kind) == (0x808030D4, 12)
+        && source.platform() == 7
+        && (0.0..=1.0).contains(&p.f32(at)?)
+        && p.u8(at + 4)? == 0xFF
+        && p.u8(at + 6)? == 0
+        && let Some(native) = native.as_deref_mut()
+        && let Some(event) = derived_event::equivalent(source, native, p.u32(at + 8)?)?
+    {
+        let mut bytes = p.bytes::<16>(at)?.to_vec();
+        bytes[8..12].copy_from_slice(&event.to_le_bytes());
+        return Ok(Some(NativeNode { kind, bytes }));
     }
     if (class, kind) == (0x808030D4, 12) {
         ensure!(

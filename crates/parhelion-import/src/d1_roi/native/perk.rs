@@ -1,5 +1,6 @@
 //! Bounded source action lowering. An unsupported node rejects the entire choice.
 use super::*;
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
@@ -349,6 +350,27 @@ const STOCK_EQUIVALENTS: [(Host, u32, u32); 6] = [
     (Host::Armor, 0x1ABD_3D84, 0xCBAA_6F4A),
 ];
 
+/// PS4-only stock stand-ins for source perks that have no runtime action. Rise of Iron's
+/// Vanguard Champion (`DABA8187`) and Crucible Champion (`4AEC853A`) raise vendor progression
+/// server-side from the equipped perk alone, as Shadowkeep's Ghost perks Strike Experience Log
+/// (`838DB98B`, sandbox perk 633) and Crucible Experience Log (`13A813EB`, 298) do: neither build
+/// gives them a client action. Shadowkeep has no reputation-gain perk, so the stand-ins keep
+/// the same activity, with XP for reputation (user decision, 2026-11-16).
+const PS4_STOCK_EQUIVALENTS: [(Host, u32, u32); 2] = [
+    (Host::Armor, 0xDABA_8187, 0x838D_B98B),
+    (Host::Armor, 0x4AEC_853A, 0x13A8_13EB),
+];
+
+/// The stock stand-in rows for a build.
+fn stock_equivalent_rows(source: &Source) -> impl Iterator<Item = (Host, u32, u32)> {
+    let ps4: &[(Host, u32, u32)] = if source.platform() == 7 {
+        &PS4_STOCK_EQUIVALENTS
+    } else {
+        &[]
+    };
+    STOCK_EQUIVALENTS.into_iter().chain(ps4.iter().copied())
+}
+
 /// Keys stock actions write with a Named Property node on their own item: target 0, no ability
 /// mask, replacing, removal policy one. Air Control `12DAFD65` and Fast Enter `A2DCA8DC` are
 /// written this way by `80BBC81F` and `80BBC986`, with the source's value one, and read by stock
@@ -531,9 +553,7 @@ fn effect(
         // An owning-weapon fraction on PS4 keeps the authored refill that Bolts from the Blue
         // was verified with in game. Slot fractions, and the Xbox One build, take the native
         // node that keeps the source's combined rounding.
-        (0x8080221F, 14)
-            if source.platform() == 7 && data.bytes::<12>(at + 12)? == [0; 12] =>
-        {
+        (0x8080221F, 14) if source.platform() == 7 && data.bytes::<12>(at + 12)? == [0; 12] => {
             ensure!(
                 data.u8(at + 1)? == 0 && data.bytes::<2>(at + 6)? == [0; 2],
                 "Unknown ammunition flags"
@@ -1630,6 +1650,17 @@ fn lower_step(context: &mut StepContext<'_>, step: &Value, name: &str) -> Result
     let mut property_reports = Vec::new();
     for perk in perks {
         let Some(tag) = perk["action"].as_u64() else {
+            // On PS4 a perk without an action may still have a stock stand-in, which carries it.
+            if context.source.platform() == 7
+                && let Some((plug, indices)) = perk["hash"]
+                    .as_u64()
+                    .and_then(|hash| u32::try_from(hash).ok())
+                    .and_then(|hash| context.equivalents.get(&hash))
+            {
+                stock.extend(indices.iter().copied());
+                stock_plugs.push(format!("{plug:08X}"));
+                continue;
+            }
             // A grant-backed talent can have a display perk without its own action.
             // The complete grant array must lower successfully below.
             ensure!(
@@ -1772,7 +1803,7 @@ pub(super) fn translate(
         .unwrap_or(sockets);
     let (_, extra_layouts) = self::perk_sockets(template_sockets, host)?;
     let (template_hash, templates) = templates(assembly, template_sockets, needed)?;
-    let equivalents = stock_equivalents(&mut assembly.native, host)?;
+    let equivalents = stock_equivalents(assembly.source, &mut assembly.native, host)?;
     let (mut columns, mut mod_sockets) =
         clear_talent_sockets(sockets, intrinsic.as_ref(), &perk_sockets, host);
     let LoweredTalents {
@@ -1834,7 +1865,9 @@ pub(super) fn translate(
                 == Some(&1)
     };
     let named = |column: i64| {
-        let name = source["item"]["name"].as_str().map(|n| n.trim().to_lowercase());
+        let name = source["item"]["name"]
+            .as_str()
+            .map(|n| n.trim().to_lowercase());
         choices.iter().any(|choice| {
             choice.column == column
                 && name.as_deref() == Some(choice.name.trim().to_lowercase().as_str())
@@ -2007,6 +2040,55 @@ fn ability_gates(programs: &[Program]) -> Option<Value> {
     }))
 }
 
+/// A lowered step's complete output as JSON, written once to `folder/step-outputs/<digest>.json`,
+/// and its SHA-256 with a short digest of each part: programs (actions, native asset edits,
+/// profiles and imported groups, whose own digests cover their files), stat contributions, stock
+/// perks, grants and the remaining metadata. Imported group directories are written relative to
+/// `folder`, so census runs in different folders agree and compare step by step.
+fn step_output(lowered: &Lowered, folder: &Path) -> Result<Value> {
+    fn relative(value: &mut Value, prefixes: &[String]) {
+        match value {
+            Value::String(text) => {
+                if let Some(rest) = prefixes.iter().find_map(|p| text.strip_prefix(p.as_str())) {
+                    *text = format!("<census>{}", rest.replace('\\', "/"));
+                }
+            }
+            Value::Array(items) => items.iter_mut().for_each(|item| relative(item, prefixes)),
+            Value::Object(map) => map.values_mut().for_each(|item| relative(item, prefixes)),
+            _ => {}
+        }
+    }
+    let mut output = json!({
+        "programs": lowered.programs,
+        "stats": {"stats": lowered.stats, "adjustments": lowered.adjustments},
+        "stock": {"perks": lowered.stock, "plugs": lowered.stock_plugs},
+        "grants": lowered.grants,
+        "other": {"tags": lowered.tags, "auxiliary": lowered.auxiliary,
+            "audio_cues": lowered.audio_cues},
+    });
+    // Imported groups name their directory under the canonical folder (`\\?\` on Windows).
+    let mut prefixes = vec![folder.to_string_lossy().into_owned()];
+    if let Ok(canonical) = std::fs::canonicalize(folder) {
+        prefixes.push(canonical.to_string_lossy().into_owned());
+    }
+    relative(&mut output, &prefixes);
+    let digest = |value: &Value| -> Result<String> {
+        Ok(hex::encode(Sha256::digest(serde_json::to_vec(value)?)))
+    };
+    let whole = digest(&output)?;
+    let mut parts = serde_json::Map::new();
+    for (part, value) in output.as_object().context("Step output parts")? {
+        parts.insert(part.clone(), json!(digest(value)?[..16]));
+    }
+    let directory = folder.join("step-outputs");
+    let path = directory.join(format!("{whole}.json"));
+    if !path.exists() {
+        std::fs::create_dir_all(&directory)?;
+        std::fs::write(&path, serde_json::to_vec_pretty(&output)?)?;
+    }
+    Ok(json!({ "digest": whole, "parts": parts }))
+}
+
 pub(crate) fn census(source: &Source, native: &mut Reader, folder: &Path) -> Result<Value> {
     let definitions = crate::tiger::shadowkeep::stat_definitions(native)?;
     let mut equivalents = BTreeMap::new();
@@ -2019,11 +2101,17 @@ pub(crate) fn census(source: &Source, native: &mut Reader, folder: &Path) -> Res
         equivalents.insert(identity, (plug, perks));
     }
     let none = BTreeMap::new();
+    let armor_equivalents = if source.platform() == 7 {
+        stock_equivalents(source, native, Host::Armor)?
+    } else {
+        BTreeMap::new()
+    };
     let templates = vec![0u16; 64];
     let budgets = stat::budgets(source)?;
     let mut grant_catalog = None;
     let mut item_properties = None;
-    let mut results = BTreeMap::<String, Result<(), String>>::new();
+    // Each distinct step's output digest (see `step_output`), or its refusal reason.
+    let mut results = BTreeMap::<String, (Result<Value, String>, Vec<String>)>::new();
     let mut report = serde_json::Map::new();
     let items = [
         (
@@ -2032,7 +2120,7 @@ pub(crate) fn census(source: &Source, native: &mut Reader, folder: &Path) -> Res
             source
                 .weapons()?
                 .into_iter()
-                .map(|weapon| (weapon.definition, None))
+                .map(|weapon| (weapon.definition, None, weapon.name))
                 .collect::<Vec<_>>(),
         ),
         (
@@ -2041,7 +2129,7 @@ pub(crate) fn census(source: &Source, native: &mut Reader, folder: &Path) -> Res
             source
                 .armor()?
                 .into_iter()
-                .map(|armor| (armor.definition, Some(armor.slot)))
+                .map(|armor| (armor.definition, Some(armor.slot), armor.name))
                 .collect::<Vec<_>>(),
         ),
         // Exotic armor again on its own, since its signature perks carry each item.
@@ -2052,7 +2140,7 @@ pub(crate) fn census(source: &Source, native: &mut Reader, folder: &Path) -> Res
                 .armor()?
                 .into_iter()
                 .filter(|armor| u64::from(armor.rarity) == EXOTIC_RARITY)
-                .map(|armor| (armor.definition, Some(armor.slot)))
+                .map(|armor| (armor.definition, Some(armor.slot), armor.name))
                 .collect::<Vec<_>>(),
         ),
     ];
@@ -2067,7 +2155,9 @@ pub(crate) fn census(source: &Source, native: &mut Reader, folder: &Path) -> Res
         // each source ability adds when the build widens its programs.
         let mut gates = BTreeMap::<String, Value>::new();
         let mut grant_routes = BTreeMap::<String, Value>::new();
-        for (definition, slot) in definitions_of_items {
+        // Each distinct step by the digest of its key, so two census runs compare step by step.
+        let mut outputs = serde_json::Map::new();
+        for (definition, slot, item_name) in definitions_of_items {
             let Ok(talents) = source.item_talents(definition, &mut BTreeMap::new()) else {
                 continue;
             };
@@ -2100,9 +2190,10 @@ pub(crate) fn census(source: &Source, native: &mut Reader, folder: &Path) -> Res
                     } else {
                         format!("{host_name}|{name}|{}", step["variants"])
                     };
-                    let result = match results.get(&key) {
-                        Some(result) => result.clone(),
+                    let (result, misses) = match results.get(&key) {
+                        Some(entry) => entry.clone(),
                         None => {
+                            crate::d1_roi::platform::take_misses();
                             let result = lower_step(
                                 &mut StepContext {
                                     source,
@@ -2110,8 +2201,11 @@ pub(crate) fn census(source: &Source, native: &mut Reader, folder: &Path) -> Res
                                     folder,
                                     host,
                                     definitions: &definitions,
+                                    // PS4 armor takes its own stand-ins, as its imports do.
                                     equivalents: if host == Host::Weapon {
                                         &equivalents
+                                    } else if source.platform() == 7 {
+                                        &armor_equivalents
                                     } else {
                                         &none
                                     },
@@ -2147,10 +2241,17 @@ pub(crate) fn census(source: &Source, native: &mut Reader, folder: &Path) -> Res
                                 if !routes.is_empty() {
                                     grant_routes.insert(name.clone(), Value::Array(routes));
                                 }
+                                lowered
                             })
                             .map_err(|error| format!("{error:#}"));
-                            results.insert(key.clone(), result.clone());
-                            result
+                            let result = match result {
+                                Ok(lowered) => Ok(step_output(&lowered, folder)?),
+                                Err(reason) => Err(reason),
+                            };
+                            // PS4 lookups outside the measured layouts while lowering this step.
+                            let misses = crate::d1_roi::platform::take_misses();
+                            results.insert(key.clone(), (result.clone(), misses.clone()));
+                            (result, misses)
                         }
                     };
                     // Infuse, empty grid steps and appearance choices are not perks.
@@ -2172,6 +2273,30 @@ pub(crate) fn census(source: &Source, native: &mut Reader, folder: &Path) -> Res
                             .or_insert_with(|| step["variants"].clone());
                     }
                     steps.0 += usize::from(result.is_ok());
+                    let output = outputs
+                        .entry(hex::encode(&Sha256::digest(key.as_bytes())[..16]))
+                        .or_insert_with(|| {
+                            let mut output = match &result {
+                                Ok(output) => output.clone(),
+                                Err(reason) => json!({ "reason": reason }),
+                            };
+                            output["name"] = json!(name);
+                            if budgeted {
+                                output["slot"] = json!(slot);
+                            }
+                            if !misses.is_empty() {
+                                output["ps4_misses"] = json!(misses);
+                            }
+                            output["items"] = json!([]);
+                            output
+                        });
+                    // The items that carry the step, to locate it in the source catalog.
+                    let item = json!(item_name.trim());
+                    if let Some(items) = output["items"].as_array_mut()
+                        && !items.contains(&item)
+                    {
+                        items.push(item);
+                    }
                     distinct.insert(key, result.is_ok());
                     let entry = names
                         .entry(name)
@@ -2190,7 +2315,7 @@ pub(crate) fn census(source: &Source, native: &mut Reader, folder: &Path) -> Res
             json!({"items":counted,"steps":steps.1,"steps_translated":steps.0,
                 "distinct_steps":distinct.len(),"distinct_translated":distinct.values().filter(|ok| **ok).count(),
                 "talents":names.len(),"talents_translated":names.values().filter(|(ok, _)| *ok).count(),
-                "never_translated":never,"ability_gates":gates,"grant_routes":grant_routes,
+                "never_translated":never,"step_outputs":outputs,"ability_gates":gates,"grant_routes":grant_routes,
                 "refusals":reasons.iter().map(|(reason, (count, names, sample))| json!({"reason":reason,"steps":count,"talents":names,"sample":sample})).collect::<Vec<_>>()}),
         );
     }
@@ -2445,7 +2570,11 @@ fn emit_talent_columns(
             let count = members.len();
             (members, count, count)
         } else {
-            roll(choices, distinct(choices, members, unsupported)?, unsupported)
+            roll(
+                choices,
+                distinct(choices, members, unsupported)?,
+                unsupported,
+            )
         };
         // The runtime base supplies socket layouts, not a limit on source talent columns.
         // Additional columns use a normal perk layout and still receive private plug identities,
@@ -2697,11 +2826,13 @@ fn signature_slot(
 
 type StockEquivalents = BTreeMap<u32, (u32, Vec<u16>)>;
 
-fn stock_equivalents(native: &mut Reader, host: Host) -> Result<StockEquivalents> {
+fn stock_equivalents(
+    source_build: &Source,
+    native: &mut Reader,
+    host: Host,
+) -> Result<StockEquivalents> {
     let mut equivalents = BTreeMap::new();
-    for (_, source, plug) in STOCK_EQUIVALENTS
-        .into_iter()
-        .filter(|(kind, ..)| *kind == host)
+    for (_, source, plug) in stock_equivalent_rows(source_build).filter(|(kind, ..)| *kind == host)
     {
         let tag = crate::tiger::shadowkeep::item_tag(native, plug)
             .with_context(|| format!("Stock perk plug {plug:08X}"))?;

@@ -175,14 +175,17 @@ pub(super) fn light_samples(code: &[u8], slots: &[u32]) -> Result<Vec<u8>> {
 
 /// A mapped rigid vertex can change only the packed bone selector in POSITION0.w.
 /// Admit the checked integer recovery and refuse other uses of that lane or direct nonroot bones.
-pub(super) fn rigid_indices(code: &[u8]) -> Result<()> {
+/// A program lifted from a PS4 source (`ps4`) may declare POSITION0 with three lanes when its GCN
+/// fetch takes only the position's xyz, as the machine gun sight reticle programs do. It reads no
+/// selector at all, so the changed lane cannot reach it. Xbox One sources keep the four-lane rule.
+pub(super) fn rigid_indices(code: &[u8], ps4: bool) -> Result<()> {
     let signature = dxbc::signature(code, b"ISGN")?;
     ensure!(
         signature.iter().any(
             |(name, index, register, mask)| name.eq_ignore_ascii_case("POSITION")
                 && *index == 0
                 && *register == 0
-                && *mask == 15
+                && (*mask == 15 || ps4 && *mask == 7)
         ) && !signature
             .iter()
             .any(|(name, _, _, _)| name.eq_ignore_ascii_case("BLENDINDICES")
@@ -873,6 +876,31 @@ mod tests {
             }
         }
         (loads, declared, returned)
+    }
+
+    #[test]
+    fn rigid_vertex_programs_admit_a_position_without_its_selector_lane() {
+        let vertex = |inputs: &str, body: &str| {
+            let text = format!(
+                "cbuffer CB11 : register(b11) {{ float4 cb11[7]; }}
+                 float4 main({inputs}) : SV_Position {{ {body} }}"
+            );
+            crate::tiger::shader::compile(&text, true).unwrap().0
+        };
+        // A three-lane position reads no bone selector, so a palette change cannot reach it. Only
+        // a PS4 source's lifted program is admitted that way; Xbox One keeps the four-lane rule.
+        let xyz = vertex("float3 p : POSITION0", "return float4(p, 1.0f) * cb11[5];");
+        assert!(rigid_indices(&xyz, true).is_ok());
+        assert!(rigid_indices(&xyz, false).is_err());
+        // Blend inputs make a skinned program.
+        let skinned = vertex(
+            "float4 p : POSITION0, uint4 b : BLENDINDICES0",
+            "return p * cb11[b.x];",
+        );
+        assert!(rigid_indices(&skinned, true).is_err());
+        // The selector lane used as an ordinary value.
+        let lane = vertex("float4 p : POSITION0", "return p * p.w;");
+        assert!(rigid_indices(&lane, true).is_err());
     }
 
     #[test]

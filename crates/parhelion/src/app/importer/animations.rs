@@ -40,8 +40,11 @@ pub(super) fn lend(packages: &Path, recipe: &Path, candidates: &[u32]) -> Result
         return Ok(());
     };
     let reference = |item: u32| json!({"item_hash":format!("0x{item:08X}")});
+    // Imported character animations name the attachment row's profile themselves, which is
+    // the key a whole-profile donor would replace.
+    let character = graph["animation"]["character"]["binding"]["builtin"] == 3;
     let overrides = &mut prepared["overrides"];
-    if let Some(donor) = lent.donor {
+    if let Some(donor) = lent.donor.filter(|_| !character) {
         overrides["animation_donor"] = reference(donor);
     }
     if !lent.actions.is_empty() {
@@ -67,6 +70,18 @@ pub(super) fn lend(packages: &Path, recipe: &Path, candidates: &[u32]) -> Result
 /// A reimport takes the conversion's animation choices only when the saved entry made none, so
 /// a donor chosen in the workbench stays.
 pub(super) fn merge(prepared: &WeaponRecipe, updated: &mut WeaponRecipe) {
+    // Imported character animations name the attachment row's profile, so a saved whole-profile
+    // donor gives way to them.
+    let character = prepared
+        .overrides
+        .imported_graph
+        .as_ref()
+        .and_then(|graph| std::fs::read(graph.directory.join("asset-graph.json")).ok())
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .is_some_and(|graph| graph["animation"]["character"]["binding"]["builtin"] == 3);
+    if character {
+        updated.overrides.animation_donor = None;
+    }
     if updated.overrides.animation_donor.is_none() && updated.overrides.animation_actions.is_empty()
     {
         updated.overrides.animation_donor = prepared.overrides.animation_donor.clone();

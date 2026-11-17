@@ -9,6 +9,7 @@ pub(super) struct SourceSelection {
 }
 
 fn source_barrel(source: &Source, entity: &Payload) -> Result<u32> {
+    let barrel = crate::d1_roi::platform::barrel;
     let owners = entity
         .array(32, 12, Some(0x80800715))?
         .into_iter()
@@ -39,8 +40,8 @@ fn source_barrel(source: &Source, entity: &Payload) -> Result<u32> {
         slots.insert(
             (tag, definition),
             [
-                owner.u32(definition + 0x9B8)?,
-                owner.u32(definition + 0x9C8)?,
+                owner.u32(definition + barrel(0x9B8))?,
+                owner.u32(definition + barrel(0x9C8))?,
             ],
         );
     }

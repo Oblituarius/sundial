@@ -76,6 +76,10 @@ impl Selection {
                 "Source query bound has another method contract"
             );
         }
+        // The required component pair sits 0x18 earlier on PS4, measured on the 132 PS4
+        // condition volumes (`80AACC68`) that embed this helper; the fields before it, the
+        // geometry and the bound keep their Xbox One positions.
+        let required = helper + source.field(0x398, 0x380);
         let radius = p.f32(shape + 0xA8)?;
         let bound_scale = p.f32(bound + 0x80)?;
         let vertical_offset = p.f32(helper + 0x28)?;
@@ -87,8 +91,8 @@ impl Selection {
                 && vertical_offset.is_finite()
                 && p.u64(helper + 0x18)? == 0x811C9DC5
                 && p.u64(helper + 0xC0)? == 0xA1
-                && p.u32(helper + 0x398)? == 1
-                && p.u32(helper + 0x39C)? == 0x808020AE,
+                && p.u32(required)? == 1
+                && p.u32(required + 4)? == 0x808020AE,
             "Source query has unqualified geometry, locator, exclusions or required components"
         );
         let labels = label::destination(source, p, helper + 0xC8, registry)?

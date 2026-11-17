@@ -7,6 +7,10 @@ use sundial::package_authoring::entity::weapon_component_bindings;
 pub(in crate::item) struct Binding {
     pub(super) parent: u32,
     pub(super) private: u32,
+    /// The profile the weapon's own rows hold, when the import aliased another row's profile.
+    pub(super) replaces: u32,
+    /// The family key of the row whose profile was aliased, which the weapon's rows take.
+    family: Option<u32>,
 }
 
 pub(in crate::item) fn load(graph: &Inputs) -> AuthoringResult<Option<Binding>> {
@@ -24,9 +28,20 @@ pub(in crate::item) fn load(graph: &Inputs) -> AuthoringResult<Option<Binding>> 
             "Imported character profile disagrees with its clips",
         ));
     }
+    let parent = tag(binding, "parent")?;
     Ok(Some(Binding {
-        parent: tag(binding, "parent")?,
+        parent,
         private,
+        replaces: if binding["replaces"].is_null() {
+            parent
+        } else {
+            tag(binding, "replaces")?
+        },
+        family: if binding["family"].is_null() {
+            None
+        } else {
+            Some(tag(binding, "family")?)
+        },
     }))
 }
 
@@ -59,7 +74,7 @@ impl Binding {
             ensure!(!selected.is_empty(), "No selected character attachment");
             for &row in &selected {
                 ensure!(
-                    owner.u32(row + 0x6C)? == self.parent,
+                    owner.u32(row + 0x6C)? == self.replaces,
                     "Imported character profile does not fit this weapon's animation donor"
                 );
             }
@@ -75,20 +90,31 @@ impl Binding {
                 0xE8,
                 Some(0x80803E72),
             )?) {
-                if owner.u32(row + 0x6C)? == self.parent {
+                if owner.u32(row + 0x6C)? == self.replaces {
                     rows.insert(row);
                 }
             }
-            rows.into_iter()
-                .map(|row| {
-                    let offset = (row + 0x6C)
+            let mut fields = Vec::new();
+            for row in rows {
+                fields.push((row + 0x6C, self.private));
+                // A row aliased from another one plays as that row's family too.
+                if let Some(family) = self.family
+                    && owner.u32(row + 0x20)? != family
+                {
+                    fields.push((row + 0x20, family));
+                }
+            }
+            fields
+                .into_iter()
+                .map(|(field, value)| {
+                    let offset = field
                         .checked_sub(usize::try_from(binding.resource_offset)?)
                         .context("Character attachment offset underflow")?;
                     Ok(WeaponRuntimeResourcePatch {
                         binding_hash: binding.binding_hash,
                         resource_index: u16::try_from(binding.resource_index)?,
                         offset: u32::try_from(offset)?,
-                        bytes: self.private.to_le_bytes().to_vec(),
+                        bytes: value.to_le_bytes().to_vec(),
                         graph_values: Vec::new(),
                         graph_removals: Vec::new(),
                         graph_trajectories: None,

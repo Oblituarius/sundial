@@ -43,15 +43,11 @@ impl Assembly<'_> {
         let link = connections[0];
         // PS4 light schemas sit 0x38 bytes shorter before the skeleton field and the draw,
         // and 0x40 before the pose selection: measured over all 993 PS4 Rise of Iron lights,
-        // whose pose arrays sit at +0x138 (Xbox One +0x178). The PS4 pose selection holds its
-        // 8080052A marker in the second word, after a zero word.
+        // whose pose arrays sit at +0x138 (Xbox One +0x178). The pose selection is a connection
+        // input starting at the skeleton field (`platform::input_class`).
         let ps4 = self.source.platform() == 7;
         let field = move |xbox: usize, orbis: usize| s + if ps4 { orbis } else { xbox };
-        let marker = if ps4 {
-            source.u32(field(0x150, 0x110))? == 0 && source.u32(field(0x154, 0x114))? == 0x8080052A
-        } else {
-            source.u32(s + 0x150)? == 0x8080052A && source.u32(s + 0x154)? == 0
-        };
+        let marker = crate::d1_roi::platform::input_class(source, field(0x130, 0xF8))?;
         ensure!(
             source_entity.u64(link + 16)? == field(0x130, 0xF8) as u64
                 && source_entity.u32(link + 40)? == 0xAE7D0AED

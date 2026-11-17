@@ -212,6 +212,46 @@ impl Layouts {
         })
     }
 
+    /// Whether `layout` declares every input of a vertex program written for `stock`, by
+    /// semantic and index, in the format `stock` gives it. The input assembler binds a program's
+    /// inputs by semantic from whatever the layout declares, so the program draws from the
+    /// layout's buffers when it reads nothing the layout lacks, however many other elements
+    /// either side has; an equal format keeps each input the type the program was built for.
+    pub fn provides(&self, layout: u16, stock: u16, inputs: &[(String, u32, u32, u8)]) -> bool {
+        let (Some(elements), Some(stock)) = (self.elements(layout), self.elements(stock)) else {
+            return false;
+        };
+        inputs.iter().all(|(name, index, ..)| {
+            let code = match name.as_str() {
+                "POSITION" => 0,
+                "BLENDWEIGHT" => 1,
+                "BLENDINDICES" => 2,
+                "NORMAL" => 3,
+                "TEXCOORD" => 5,
+                "TANGENT" => 6,
+                "COLOR" => 8,
+                _ => return false,
+            };
+            let format = |set: &[(u8, u8, u8)]| {
+                set.iter()
+                    .find(|&&(semantic, i, _)| semantic == code && u32::from(i) == *index)
+                    .map(|&(.., format)| format)
+            };
+            format(&elements).is_some() && format(&elements) == format(&stock)
+        })
+    }
+
+    /// How many of `stock`'s elements `layout` does not declare, by semantic and index.
+    pub fn lacking(&self, layout: u16, stock: u16) -> usize {
+        let (Some(layout), Some(stock)) = (self.elements(layout), self.elements(stock)) else {
+            return usize::MAX;
+        };
+        stock
+            .iter()
+            .filter(|&&(s, i, _)| !layout.iter().any(|&(ls, li, _)| ls == s && li == i))
+            .count()
+    }
+
     /// Whether two native layouts declare the same elements in the same streams, so one
     /// vertex buffer set is byte-compatible with both.
     pub fn same_streams(&self, a: u16, b: u16) -> bool {

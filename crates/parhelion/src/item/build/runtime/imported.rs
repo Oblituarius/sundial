@@ -278,6 +278,13 @@ impl Runtime {
                 )?);
         }
         if let Some(character) = &self.character {
+            // The imported profile and an animation donor both name the attachment row's
+            // profile (+0x6C), and the imported clips are aliased to the profile they replace.
+            if groups.animations.is_some() {
+                return Err(invalid(
+                    "This weapon's imported character animations set its animation profile, so it cannot also take an animation donor. Clear the animation donor.",
+                ));
+            }
             character.apply(
                 manager,
                 entity,

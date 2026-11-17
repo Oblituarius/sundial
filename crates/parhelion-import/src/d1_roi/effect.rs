@@ -24,12 +24,14 @@ mod choice;
 mod component;
 mod emission;
 mod incoming;
+mod index;
 mod intake;
 mod owner;
 mod retained;
 mod shared;
 mod volume;
 mod wiring;
+pub use index::stock_graph_index;
 pub use shared::{OMITTED, Resources, Shared, merge, occurrences};
 
 /// Native graphs whose owners serve as templates. Each holds one owner of every family it

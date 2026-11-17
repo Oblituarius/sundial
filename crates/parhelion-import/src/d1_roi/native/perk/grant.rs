@@ -722,7 +722,11 @@ impl Catalog {
                     }
                 }
             }
-            if !matched && target != 255 && grant_count <= 16 {
+            // On PS4 a grant to every ability (255) is absent the same way when no ability of the
+            // whole source table defines its key: Inverse Shadow's `9E9C942E` and Infusion's
+            // `1ABD3D84` name no bank row in any PS4 package, only perk definitions and the global
+            // name registry `80AA27C2`, and their actions carry the described effects.
+            if !matched && (target != 255 || source.platform() == 7) && grant_count <= 16 {
                 // A grant to one named ability whose source bank has no row for the key applies
                 // nothing in the source either. It only takes one of the sixteen local key slots
                 // the producer fills before bank lookup, so with no more than sixteen grants its

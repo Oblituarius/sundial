@@ -292,8 +292,16 @@ pub(super) fn read(
         (0x2D0, 0x100FFFF00),
         (0x2D8, 0),
     ] {
+        let at = s + crate::d1_roi::platform::sequence(field);
+        // The PS4 root ends four bytes into its last field (clang reuses the tail padding), so
+        // the next word there is the following array's class marker.
+        let found = if field == 0x2D8 && source.platform() == 7 {
+            u64::from(p.u32(at)?)
+        } else {
+            p.u64(at)?
+        };
         ensure!(
-            p.u64(s + crate::d1_roi::platform::sequence(field))? == value,
+            found == value,
             "HUD sequence root state differs at {field:X}"
         );
     }

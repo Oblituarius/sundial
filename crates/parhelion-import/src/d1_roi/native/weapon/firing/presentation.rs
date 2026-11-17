@@ -24,6 +24,7 @@
 //! receives it there as an incoming value.
 //! Any other undeclared name refuses the slot, because an unbound flow input faults the client.
 use super::*;
+use crate::d1_roi::platform;
 use crate::d1_roi::{effect::Shared, sequence::owner::Owner};
 use crate::tiger::weapon::presentation::{
     DELAY_ENVELOPES, Targets, connections, live_inputs, slot_targets, unset,
@@ -137,9 +138,14 @@ fn source_inherited(source: &Source, entity: u32, sequence: u32) -> Result<BTree
     let s = source.read(sequence)?;
     let definition = s.pointer(24)?;
     let mut names = BTreeMap::new();
+    let (stride, name) = platform::input_row();
     for field in [0x1A0, 0x2A8] {
-        for row in s.array(definition + field, 48, Some(0x8080_0927))? {
-            names.insert(u64::try_from(row)?, s.u32(row + 0x28)?);
+        for row in s.array(
+            definition + platform::sequence(field),
+            stride,
+            Some(0x8080_0927),
+        )? {
+            names.insert(u64::try_from(row)?, s.u32(row + name)?);
         }
     }
     let mut inherited = BTreeSet::new();
@@ -156,7 +162,11 @@ fn source_inherited(source: &Source, entity: u32, sequence: u32) -> Result<BTree
             continue;
         }
         let channel = u32::try_from(e.u64(row + 80)?)?;
-        let declarations = bank.array(bank_definition + 0xD8, 112, Some(0x8080_0883))?;
+        let declarations = bank.array(
+            bank_definition + platform::bank(0xD8),
+            112,
+            Some(0x8080_0883),
+        )?;
         let Some(&declaration) = declarations.get(usize::try_from(channel)?) else {
             continue;
         };
@@ -164,7 +174,7 @@ fn source_inherited(source: &Source, entity: u32, sequence: u32) -> Result<BTree
             continue;
         }
         for field in [0x108, 0x118] {
-            for at in bank.array(bank_definition + field, 12, None)? {
+            for at in bank.array(bank_definition + platform::bank(field), 12, None)? {
                 if (bank.u32(at)?, bank.u32(at + 4)?, bank.u32(at + 8)?)
                     == (0x811c_9dc5, name, channel)
                 {

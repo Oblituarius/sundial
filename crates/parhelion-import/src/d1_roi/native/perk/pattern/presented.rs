@@ -79,9 +79,14 @@ pub(super) fn bank(source: &Source, graph: &Payload) -> Result<Option<Presented>
         "Source presented status has additional event connections"
     );
     for at in graph.array(0x30, 88, Some(0x8080054E))? {
+        // On PS4, an output bound to nothing (target owner and class `FFFFFFFF`) drives
+        // nothing: In Your Element's status exports its state that way (`80A8927E`).
+        let unbound = source.platform() == 7
+            && graph.u32(at + 48)? == u32::MAX
+            && graph.u32(at + 64)? == u32::MAX;
         ensure!(
             presentation.contains(&graph.u32(at + 8)?)
-                && presentation.contains(&graph.u32(at + 48)?),
+                && (unbound || presentation.contains(&graph.u32(at + 48)?)),
             "Source presented status connects outside its presentation"
         );
     }
@@ -140,6 +145,18 @@ pub(super) fn presentation_only(source: &Source, graph: &Payload) -> Result<Opti
         ) || replicator(source, runtime)?
             || schema_named(source, settings, b"c_player_status_icon_definition")?;
         if !presentation {
+            return Ok(None);
+        }
+        // On PS4 a sequence that switches named HUD flags changes what the player sees beyond
+        // effects: Third Eye, Sensor Pack and Air Traffic Control keep the radar while aiming
+        // through one (`80A746D8`, HUD key 132), as Shadowkeep's Upgraded Sensor Pack attaches
+        // `80BC57BD`, whose sequence sets the same named flag (`93B62194`). The closure
+        // translates the HUD event.
+        if source.platform() == 7
+            && settings == 0x80800610
+            && crate::d1_roi::sequence::Plan::read(source, &p)
+                .is_ok_and(|plan| !plan.overrides().is_empty())
+        {
             return Ok(None);
         }
     }

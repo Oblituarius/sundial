@@ -5,13 +5,19 @@
 //! An unnamed settings input keeps the source's selection instead.
 use super::*;
 use crate::d1_roi::native::component::Component;
+use crate::d1_roi::platform::{self, getter_stride};
 use crate::tiger::entity::{compiled, links::NativeRows};
 use sundial::package_authoring::{ability_damage, sandbox_perk::program::NativeAssetResourcePatch};
 
-fn names(owner: &graph::Owner) -> Result<Vec<u32>> {
+/// A bank's channel names in order; `old` for a source bank, whose rows sit by build.
+fn names(owner: &graph::Owner, old: bool) -> Result<Vec<u32>> {
     owner
         .payload
-        .array(owner.definition + 0xD8, 112, None)?
+        .array(
+            owner.definition + if old { platform::bank(0xD8) } else { 0xD8 },
+            112,
+            None,
+        )?
         .into_iter()
         .map(|at| owner.payload.u32(at))
         .collect()
@@ -54,10 +60,11 @@ fn validate(source: &graph::Owner, native: &graph::Owner) -> Result<()> {
         source.payload.u64(source.instance + 0x70)? == 0,
         "Private projectile bank requires callback history translation"
     );
-    for row in source
-        .payload
-        .array(source.definition + 0xD8, 112, Some(0x80800883))?
-    {
+    for row in source.payload.array(
+        source.definition + platform::bank(0xD8),
+        112,
+        Some(0x80800883),
+    )? {
         ensure!(
             source.payload.bytes::<2>(row + 104)? == [255, 254]
                 && source.payload.u64(row + 96)? == 0,
@@ -107,14 +114,16 @@ fn incoming(
         Some(name) => name,
         None => getter_name(native, offset)?,
     };
-    let source_names = names(source)?;
+    let source_names = names(source, true)?;
     let source_ordinal = source_names
         .iter()
         .position(|&value| value == name)
         .context("Native incoming getter has no source channel")?;
-    let source_inputs = source
-        .payload
-        .array(source.definition + 0xC8, 40, Some(0x80800668))?;
+    let source_inputs = source.payload.array(
+        source.definition + platform::bank(0xC8),
+        getter_stride(),
+        Some(0x80800668),
+    )?;
     let definition = *source_inputs
         .get(source_ordinal)
         .context("Source incoming getter has another ordinal")?;
@@ -558,8 +567,8 @@ pub(super) fn prepare(
         .into_iter()
         .flat_map(|(carrier, source)| [carrier, source])
         .collect::<BTreeSet<_>>();
-    let mut declared = names(source_bank)?;
-    declared.extend(names(native_bank)?);
+    let mut declared = names(source_bank, true)?;
+    declared.extend(names(native_bank, false)?);
     let release = release::plan(&mut assembly.native, native, &declared)?;
     let extra = release
         .iter()
@@ -612,7 +621,7 @@ pub(super) fn prepare(
         &mut movement,
         fills,
     )?);
-    let native_names = names(native_bank)?;
+    let native_names = names(native_bank, false)?;
     let settings = source.settings()?;
     ensure!(
         settings.keys().eq(native.settings()?.keys()),

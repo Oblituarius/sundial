@@ -51,7 +51,7 @@ pub(super) fn author(
             profile::apply(&mut original, &patch)
                 .map_err(|error| invalid(format!("Prepared animation profile: {error:#}")))?;
             if existing.is_none()
-                || patch.before != binding.parent
+                || patch.before != binding.replaces
                 || patch
                     .previous_category
                     .is_some_and(|category| category != patch.category)

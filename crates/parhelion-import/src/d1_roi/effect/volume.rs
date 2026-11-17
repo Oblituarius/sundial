@@ -78,7 +78,13 @@ pub(super) fn write(
         code == [0x34, 0, 0x3E, 0] && constants.len() == 1 && input.is_none(),
         "Source condition volume recipient program is not a constant"
     );
-    let (flag, timer) = pattern::timer(p, owner, live + 0x280, definition + 0x4B0)?;
+    // PS4 schema `80AACC68` puts the Timer at `+460`, after the shorter helper.
+    let (flag, timer) = pattern::timer(
+        p,
+        owner,
+        live + 0x280,
+        definition + source.field(0x4B0, 0x460),
+    )?;
     let render = p.bytes::<16>(definition + 0x60)?;
     ensure!(
         render[0] <= 1 && render[1..].iter().all(|&byte| byte == 0),

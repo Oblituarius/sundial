@@ -157,7 +157,10 @@ impl Source {
             source.0.len() >= 0x138 && source.u64(0)? == source.0.len() as u64,
             "Particle material definition extent differs"
         );
-        let mut material = self.particle_material(tag, native)?;
+        // The definition's appearance rows and whether it draws a model (geometry 1), which a
+        // PS4 vertex program lifts against.
+        let records = (source.u8(0x10A)?, source.u8(0x114)? == 1);
+        let mut material = self.particle_material(tag, records, native)?;
         ribbon::bind(&mut material, &source)?;
         material.definition = Some(definition);
         self.unchanged()?;
@@ -169,9 +172,17 @@ impl Source {
     /// `transparent_advanced` producers. Object inputs and additional shader stages require their
     /// own producer contracts. This does not allocate package entries or certify a complete
     /// particle draw.
-    pub fn particle_material(&self, tag: u32, native: &mut Reader) -> Result<Material> {
+    pub fn particle_material(
+        &self,
+        tag: u32,
+        records: (u8, bool),
+        native: &mut Reader,
+    ) -> Result<Material> {
+        // PS4 materials keep the Xbox One fields with GCN programs, which lift to SM5 here
+        // before the same checks and rewrites the Xbox One bytecode takes.
+        let ps4 = self.platform() == 7;
         ensure!(
-            self.reference(tag)? == 0x80801C32,
+            self.reference(tag)? == if ps4 { 0x80801AD7 } else { 0x80801C32 },
             "Source particle material class differs"
         );
         let source = self.read(tag)?;
@@ -179,6 +190,9 @@ impl Source {
             source.0.len() >= 0x348 && source.u64(0)? == source.0.len() as u64,
             "Source particle material extent differs"
         );
+        let lifted = ps4
+            .then(|| self.particle_lift(&source, records))
+            .transpose()?;
         let globals = expression::Globals::read(self, native)?;
         for from in [0xC8, 0x168, 0x208] {
             ensure!(
@@ -278,8 +292,11 @@ impl Source {
             );
             expression.initialize(&values)?;
             let shader_source = self.read(shader_tag)?;
-            let shader_range = shader_source.array_range(8, 1, Some(0x80800009))?;
-            let code = &shader_source.0[shader_range];
+            let code = match &lifted {
+                Some(lifted) if stage == Stage::Vertex => lifted.vertex.as_slice(),
+                Some(lifted) => lifted.pixel.as_slice(),
+                None => &shader_source.0[shader_source.array_range(8, 1, Some(0x80800009))?],
+            };
             scene_inputs(code, stage, values.len() / 16, transparent, advanced)?;
             let mut bytecode = shader::compact(code)?;
             if stage == Stage::Pixel {
@@ -319,6 +336,29 @@ impl Source {
             ribbon: false,
             definition: None,
         })
+    }
+}
+
+impl Source {
+    /// Lift a PS4 particle material's vertex and pixel programs. Its vertex program fetches the
+    /// particle's appearance records (`records`: rows, and whether a model's mesh streams follow
+    /// them), one Float4 per row, where the Xbox One program declares `TEXCOORD0` onward: fetch
+    /// element k is appearance row k.
+    fn particle_lift(
+        &self,
+        source: &Payload,
+        records: (u8, bool),
+    ) -> Result<crate::d1_roi::gcn::Lifted> {
+        let (vertex, pixel) = (source.u32(0x28)?, source.u32(0x2A8)?);
+        let mut cubes = std::collections::BTreeSet::new();
+        for row in source.array(0x2A8 + 0x10, 8, Some(0x80801B28))? {
+            let texture = source.u32(row + 4)?;
+            if !matches!(texture, 0 | u32::MAX) && self.is_cube_texture(texture)? {
+                cubes.insert(u8::try_from(source.u32(row)?)?);
+            }
+        }
+        crate::d1_roi::gcn::lift_records(self, vertex, pixel, records, &cubes)
+            .context("PS4 particle programs do not lift")
     }
 }
 

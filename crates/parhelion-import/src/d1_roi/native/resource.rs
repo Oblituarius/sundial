@@ -68,6 +68,32 @@ impl Shader {
     }
 }
 
+impl Source {
+    /// A source sampler's D3D11 description, with the Xbox One descriptor's trailing words: the
+    /// Xbox One descriptor tag's 60 bytes, or on PS4 the description of the 16-byte GNM sampler
+    /// its 24-byte header holds. Native samplers take the first 52 bytes.
+    pub(in crate::d1_roi) fn sampler_descriptor(&self, tag: u32) -> Result<Payload> {
+        let header = self.read(tag)?;
+        if self.platform() == 7 {
+            // PS4 keeps its 16-byte GNM sampler inside the 24-byte header.
+            ensure!(
+                header.0.len() == 24 && header.u64(0)? == 24 && self.reference(tag)? == 0x80801A42,
+                "Unknown PS4 source sampler storage"
+            );
+            Ok(Payload(
+                gnm_sampler(header.0[8..24].try_into().unwrap()).to_vec(),
+            ))
+        } else {
+            let descriptor = self.read(self.reference(tag)?)?;
+            ensure!(
+                header.0 == [0; 8] && descriptor.0.len() == 60 && descriptor.0[52..] == [255; 8],
+                "Unknown source sampler storage"
+            );
+            Ok(descriptor)
+        }
+    }
+}
+
 /// The D3D11 sampler description (`D3D11_SAMPLER_DESC`, 52 bytes) of a GNM sampler, by
 /// freegnm's `GnmSampler` (`include/gnm/sampler.h`) and its enums (`types.h`).
 fn gnm_sampler(gnm: [u8; 16]) -> [u8; 52] {
@@ -142,24 +168,7 @@ impl Assembly<'_> {
         if self.symbols.contains(&symbol) {
             return Ok(symbol);
         }
-        let header = self.source.read(tag)?;
-        let descriptor = if self.source.platform() == 7 {
-            // PS4 keeps its 16-byte GNM sampler inside the 24-byte header.
-            ensure!(
-                header.0.len() == 24
-                    && header.u64(0)? == 24
-                    && self.source.reference(tag)? == 0x80801A42,
-                "Unknown PS4 source sampler storage"
-            );
-            Payload(gnm_sampler(header.0[8..24].try_into().unwrap()).to_vec())
-        } else {
-            let descriptor = self.source.read(self.source.reference(tag)?)?;
-            ensure!(
-                header.0 == [0; 8] && descriptor.0.len() == 60 && descriptor.0[52..] == [255; 8],
-                "Unknown source sampler storage"
-            );
-            descriptor
-        };
+        let descriptor = self.source.sampler_descriptor(tag)?;
         let template = self.template(34, 1)?;
         let native_header = self.native.tag(template, None)?;
         let data_template = self.native.reference(template)?;
@@ -296,7 +305,7 @@ fn translate_shader(
     gbuffer: Option<Gbuffer>,
 ) -> Result<Vec<u8>> {
     if assembly.bone_map.is_some() && stage == Stage::Vertex {
-        super::super::shader::rigid_indices(raw)
+        super::super::shader::rigid_indices(raw, assembly.source.platform() == 7)
             .with_context(|| format!("Source mapped vertex program {tag:08X}"))?;
     }
     let code = if stage == Stage::Vertex {

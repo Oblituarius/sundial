@@ -119,7 +119,7 @@ fn entity_models(r: &mut Reader, entity_tag: u32, entity: &Payload) -> Result<Ve
 
 /// The definition tag of the installed item `hash`, from the investment globals' item table,
 /// without model, animation or weapon-pattern assumptions.
-pub(crate) fn item_tag(r: &mut Reader, hash: u32) -> Result<u32> {
+pub fn item_tag(r: &mut Reader, hash: u32) -> Result<u32> {
     let tag = r
         .manager
         .lookup

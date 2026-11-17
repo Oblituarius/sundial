@@ -8,7 +8,7 @@ pub(super) fn convert(
 ) -> Result<(Payload, BTreeSet<usize>)> {
     let mut nc = original.clone();
     let (sr, nr) = (sc.pointer(24)?, nc.pointer(24)?);
-    let sg = groups(sc, sr + 0x90, 0x80800380)?;
+    let sg = groups(sc, sr + crate::d1_roi::platform::controls(0x90), 0x80800380)?;
     let ng = groups(&nc, nr + 0x90, 0x8080907F)?;
     ensure!(
         sg.len() == ng.len()
@@ -22,7 +22,7 @@ pub(super) fn convert(
         .iter()
         .map(|g| g.1 as usize)
         .sum::<usize>();
-    let so = sc.array(sr + 0xA0, 48, Some(0x80800638))?;
+    let so = sc.array(sr + crate::d1_roi::platform::controls(0xA0), 48, Some(0x80800638))?;
     let no = nc.array(nr + 0xA0, 52, Some(0x80809076))?;
     ensure!(so.len() == no.len(), "Private control slot count differs");
     for (&a, &b) in so.iter().zip(&no) {
@@ -31,7 +31,7 @@ pub(super) fn convert(
             "Private control operations differ"
         );
     }
-    let forward = sc.array(sr + 0xD8, 2, Some(0x80800006))?;
+    let forward = sc.array(sr + crate::d1_roi::platform::controls(0xD8), 2, Some(0x80800006))?;
     let mut changed_slots = BTreeSet::new();
     for &bone in changed_bones {
         let slot = usize::from(sc.u16(*forward.get(bone).context("Private bone slot")?)?);
@@ -48,7 +48,7 @@ pub(super) fn convert(
         (0xD8, 2, 0x80800006, 0x80800006),
         (0xE8, 2, 0x80800006, 0x80800006),
     ] {
-        let a = sc.array_range(sr + field, stride, Some(sclass))?;
+        let a = sc.array_range(sr + crate::d1_roi::platform::controls(field), stride, Some(sclass))?;
         let b = nc.array_range(nr + field, stride, Some(nclass))?;
         ensure!(
             a.len() == b.len(),
@@ -78,7 +78,7 @@ pub(super) fn convert(
         .into_iter()
         .map(|a| Ok((nc.u32(a)?, nc.u32(a + 4)?)))
         .collect::<Result<BTreeMap<_, _>>>()?;
-    for a in sc.array(sr + 0x110, 8, Some(0x808006C8))? {
+    for a in sc.array(sr + crate::d1_roi::platform::controls(0x110), 8, Some(0x808006C8))? {
         ensure!(
             names.get(&sc.u32(a)?) == Some(&sc.u32(a + 4)?),
             "Source named control has no native binding"

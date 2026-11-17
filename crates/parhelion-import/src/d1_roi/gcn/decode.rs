@@ -72,8 +72,8 @@ pub enum Op {
 #[derive(Clone, Copy, Debug)]
 pub enum SmrdOffset {
     Dwords(u32),
-    /// A register offset, which the lift does not support.
-    Register,
+    /// A byte offset held in the scalar register this names.
+    Register(u8),
 }
 
 #[derive(Clone, Debug)]
@@ -413,18 +413,21 @@ fn instruction(code: &[u8], at: usize) -> Result<(Op, usize)> {
     if w >> 27 == 0x18 {
         let imm = (w >> 8) & 1 != 0;
         let offset = w & 0xFF;
+        // Sea Islands: offset 255 without the immediate bit takes a 32-bit literal dword
+        // offset from the next word.
+        let (offset, size) = match (imm, offset) {
+            (true, offset) => (SmrdOffset::Dwords(offset), 4),
+            (false, 255) => (SmrdOffset::Dwords(next(4)?), 8),
+            (false, register) => (SmrdOffset::Register(register as u8), 4),
+        };
         return Ok((
             Op::Smrd {
                 op: ((w >> 22) & 0x1F) as u8,
                 dst: ((w >> 15) & 0x7F) as u8,
                 base: (((w >> 9) & 0x3F) << 1) as u8,
-                offset: if imm {
-                    SmrdOffset::Dwords(offset)
-                } else {
-                    SmrdOffset::Register
-                },
+                offset,
             },
-            4,
+            size,
         ));
     }
     if w >> 28 == 0xB {
@@ -497,6 +500,35 @@ mod tests {
         };
         assert_eq!((op, dst, base), (2, 16, 2));
         assert!(matches!(offset, SmrdOffset::Dwords(24)));
+    }
+
+    #[test]
+    fn smrd_reads_a_literal_dword_offset_or_names_an_offset_register() {
+        // s_buffer_load_dword s4, s[8:11], literal 0x40: offset 255 without the immediate bit
+        // takes the next word, making an 8-byte instruction.
+        let mut code = 0xC20208FFu32.to_le_bytes().to_vec();
+        code.extend(0x40u32.to_le_bytes());
+        let (op, size) = instruction(&code, 0).unwrap();
+        assert_eq!(size, 8);
+        assert!(matches!(
+            op,
+            Op::Smrd {
+                op: 8,
+                dst: 4,
+                base: 8,
+                offset: SmrdOffset::Dwords(0x40)
+            }
+        ));
+        // s_buffer_load_dword s4, s[8:11], s6.
+        let (op, size) = instruction(&0xC2020806u32.to_le_bytes(), 0).unwrap();
+        assert_eq!(size, 4);
+        assert!(matches!(
+            op,
+            Op::Smrd {
+                offset: SmrdOffset::Register(6),
+                ..
+            }
+        ));
     }
 
     #[test]

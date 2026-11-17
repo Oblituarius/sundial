@@ -78,6 +78,16 @@ pub(crate) static RISE_OF_IRON: Dialect = Dialect {
     output_base: 0x1E00,
 };
 
+/// Rise of Iron's PS4 build. Every weapon translator definition derives from
+/// `c_weapon_translation_base_definition` (PS4 schema tag `80AA30F1`), whose reflection places
+/// `override_investment_stats` at `+218` and `groups` at `+228`, `0x60` before the Xbox One
+/// fields. The arrays before them and every row layout are those of the Xbox One build.
+pub(crate) static RISE_OF_IRON_PS4: Dialect = Dialect {
+    overrides: (0x218, 0x8080_2121),
+    keys: (0x228, 0x8080_20A3),
+    ..RISE_OF_IRON
+};
+
 /// Shadowkeep, the target.
 pub(crate) static SHADOWKEEP: Dialect = Dialect {
     groups: (0x48, 0x8080_3975),

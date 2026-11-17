@@ -111,15 +111,15 @@ impl Mapping {
             from.u32(sr - 4)? == 0x8080099B,
             "Source control resource differs"
         );
-        let source_groups = groups(&from, sr + 0x90, true)?;
+        let source_groups = groups(&from, sr + crate::d1_roi::platform::controls(0x90), true)?;
         let target_groups = groups(&to, nr + 0x90, false)?;
-        let sf = from.array(sr + 0xD8, 2, Some(0x80800006))?;
-        let si = from.array(sr + 0xE8, 2, Some(0x80800006))?;
+        let sf = from.array(sr + crate::d1_roi::platform::controls(0xD8), 2, Some(0x80800006))?;
+        let si = from.array(sr + crate::d1_roi::platform::controls(0xE8), 2, Some(0x80800006))?;
         let nf = to.array(nr + 0xD8, 2, Some(0x80800006))?;
         let ni = to.array(nr + 0xE8, 2, Some(0x80800006))?;
-        let so = from.array(sr + 0xA0, 48, Some(0x80800638))?;
+        let so = from.array(sr + crate::d1_roi::platform::controls(0xA0), 48, Some(0x80800638))?;
         let no = to.array(nr + 0xA0, 52, Some(0x80809076))?;
-        let sp = from.array(sr + 0xB0, 32, Some(0x808001B0))?;
+        let sp = from.array(sr + crate::d1_roi::platform::controls(0xB0), 32, Some(0x808001B0))?;
         let np = to.array(nr + 0xB0, 32, Some(0x80809F75))?;
         ensure!(
             sf.len() == sb.len()

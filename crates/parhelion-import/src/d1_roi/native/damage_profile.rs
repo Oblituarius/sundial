@@ -34,6 +34,7 @@
 //! by class, take the first and skip an absent one (`005E0220`, `00B8C890`), so a profile may
 //! hold any of them in any order, or none, as stock profiles do.
 use super::*;
+use crate::d1_roi::platform::impulse;
 use crate::{
     d1_roi::{
         audio as graph_audio,
@@ -156,12 +157,14 @@ pub fn translate(
     // from `+100` to `+B0` and this byte from `+F0` to `+A0`. Stock pairs agree, which is inferred.
     let indicator = p.u8(root + impulse(0xF0))?;
     ensure!(
-        indicator <= 1 && p.bytes::<15>(root + impulse(0xF1))? == [0; 15] && p.u32(root + impulse(0x104))? == 0,
+        indicator <= 1
+            && p.bytes::<15>(root + impulse(0xF1))? == [0; 15]
+            && p.u32(root + impulse(0x104))? == 0,
         "Source area profile victim response has other fields"
     );
     for (field, value) in [(0x50, 1.0f32.to_bits()), (0xDC, 1.0f32.to_bits())] {
         ensure!(
-            word(&p, root + if field < 0x78 { field } else { impulse(field) }, value)?,
+            word(&p, root + impulse(field), value)?,
             "Source area profile field {field:X} differs from the qualified family"
         );
     }
@@ -182,7 +185,11 @@ pub fn translate(
         .map(|row| {
             ensure!(
                 p.bytes::<12>(row + 4)? == [0; 12]
-                    && word(&p, row + 0x10, crate::d1_roi::platform::tag(SOURCE_DICTIONARY))?
+                    && word(
+                        &p,
+                        row + 0x10,
+                        crate::d1_roi::platform::tag(SOURCE_DICTIONARY)
+                    )?
                     && p.u32(row + 0x14)? == 0,
                 "Source area profile category row differs"
             );
@@ -336,13 +343,6 @@ pub fn translate(
         absent,
         silent,
     })
-}
-
-/// A damage impulse definition field from its description on, given by its Xbox One offset. PS4
-/// starts the description at `+78`, eight bytes before Xbox One's `+80`, as its class reflection
-/// in schema tag `80AACBA2` lists it, and keeps the same order after it.
-fn impulse(xbox: usize) -> usize {
-    crate::d1_roi::platform::field(xbox, xbox - 8)
 }
 
 struct AudioRows {

@@ -104,7 +104,7 @@ fn predicates(p: &Payload, labels: Option<&Labels>) -> Result<Value> {
     let r = p.pointer(24)?;
     let mut groups = Vec::new();
     for row in p.array(
-        r + if source { 0x98 } else { 0x80 },
+        r + if source { crate::d1_roi::platform::query(0x98) } else { 0x80 },
         24,
         Some(if source { 0x808030AA } else { 0x80803832 }),
     )? {
@@ -169,7 +169,7 @@ fn omitted(p: &Payload, labels: &Labels) -> Result<Vec<Value>> {
     let r = p.pointer(24)?;
     let mut result = Vec::new();
     for (group, row) in p
-        .array(r + 0x98, 24, Some(0x808030AA))?
+        .array(r + crate::d1_roi::platform::query(0x98), 24, Some(0x808030AA))?
         .into_iter()
         .enumerate()
     {
@@ -227,7 +227,7 @@ fn translate(
     let s = source.pointer(24)?;
     let n = target.pointer(24)?;
     let owner = target.u32(target.pointer(16)?)?;
-    let groups = source.array(s + 0x98, 24, Some(0x808030AA))?;
+    let groups = source.array(s + crate::d1_roi::platform::query(0x98), 24, Some(0x808030AA))?;
     array(
         &mut target.0,
         n + 0x80,
@@ -328,7 +328,7 @@ fn translate(
 /// relationship test, bit 0 only those that fail it, and zero admits both. Source initialization
 /// clears both bits when both are set, so that combination is not translated.
 fn search(source: &Payload, target: &mut Payload) -> Result<Value> {
-    let from = source.pointer(24)? + 0xD8;
+    let from = source.pointer(24)? + crate::d1_roi::platform::query(0xD8);
     let values = (0..4)
         .map(|i| source.f32(from + i * 4))
         .collect::<Result<Vec<_>>>()?;
@@ -355,7 +355,7 @@ fn parameters(p: &Payload, source: bool) -> Result<Value> {
         p.u32(r - 4)? == if source { 0x80803136 } else { 0x80803820 },
         "Query resource class differs"
     );
-    let at = r + if source { 0xA8 } else { 0x90 };
+    let at = r + if source { crate::d1_roi::platform::query(0xA8) } else { 0x90 };
     let mut outputs = Vec::new();
     let rows = p.array(at, 72, Some(if source { 0x8080302A } else { 0x80803830 }))?;
     ensure!(
@@ -393,7 +393,7 @@ fn parameters(p: &Payload, source: bool) -> Result<Value> {
             "scalar":p.bytes::<8>(row+64)?}));
     }
     Ok(
-        json!({"values":p.bytes::<8>(r+if source {0x90} else {0x78})?,
+        json!({"values":p.bytes::<8>(r+if source {crate::d1_roi::platform::query(0x90)} else {0x78})?,
         "outputs":outputs,"flags":p.bytes::<8>(at+16)?}),
     )
 }
@@ -432,7 +432,8 @@ impl Assembly<'_> {
         let mut component = self.component(owner, entity, name, index)?;
         let native = &component.template;
         ensure!(
-            source.bytes::<24>(source.pointer(24)? + 0x168)? == [0; 24],
+            source.bytes::<24>(source.pointer(24)? + crate::d1_roi::platform::query(0x168))?
+                == [0; 24],
             "Source query trailing outputs need another native adapter"
         );
         let search = search(source, &mut component.payload)?;
@@ -481,11 +482,11 @@ impl Assembly<'_> {
             ),
         ] {
             ensure!(
-                source.pointer(s + sf)? == s + if embedded { 0xC0 } else { 0 }
+                source.pointer(s + crate::d1_roi::platform::query(sf))? == s + if embedded { crate::d1_roi::platform::query(0xC0) } else { 0 }
                     && native.pointer(n + nf)? == n + if embedded { 0xA8 } else { 0 },
                 "Query provider points outside its definition"
             );
-            let a = self.source.read(source.u32(s + sf + 8)?)?;
+            let a = self.source.read(source.u32(s + crate::d1_roi::platform::query(sf) + 8)?)?;
             let b = self.native.tag(native.u32(n + nf + 8)?, None)?;
             for (p, interface, instance, implementation, method, row_class) in [
                 (
@@ -517,7 +518,8 @@ impl Assembly<'_> {
                 );
             }
             if sf >= 0x108 {
-                let output = source.u32(s + sf + 24)?;
+                // The declaration's name: +18 on Xbox One, +10 in PS4's packed declaration.
+                let output = source.u32(s + crate::d1_roi::platform::query(sf) + crate::d1_roi::platform::field(24, 16))?;
                 ensure!(
                     output == native.u32(n + nf + 24)?,
                     "Query output name differs"

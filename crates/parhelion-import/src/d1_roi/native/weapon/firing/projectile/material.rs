@@ -150,7 +150,12 @@ pub(super) fn pairs(
         owner
             .payload
             .array(
-                owner.definition + if old { 0x220 } else { 0x218 },
+                owner.definition
+                    + if old {
+                        crate::d1_roi::platform::movement(0x220)
+                    } else {
+                        0x218
+                    },
                 if old { 96 } else { 88 },
                 None,
             )?
@@ -187,9 +192,11 @@ pub(super) fn prepare(
     to: &graph::Owner,
     paired: &[Option<usize>],
 ) -> Result<Mapping> {
-    let source_groups = from
-        .payload
-        .array(from.definition + 0x220, 96, Some(0x8080239D))?;
+    let source_groups = from.payload.array(
+        from.definition + crate::d1_roi::platform::movement(0x220),
+        96,
+        Some(0x8080239D),
+    )?;
     let native_groups = to
         .payload
         .array(to.definition + 0x218, 88, Some(0x808037CD))?;

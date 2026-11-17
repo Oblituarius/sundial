@@ -1,5 +1,6 @@
 //! Pair source response groups with the carrier's by name, then by position between named anchors.
 use super::*;
+use crate::d1_roi::platform::movement;
 
 /// For each source group, its paired carrier group or none when only the source has it, and the
 /// carrier's own groups left out.
@@ -12,7 +13,7 @@ fn names(owner: &graph::Owner, old: bool) -> Result<Vec<u32>> {
     owner
         .payload
         .array(
-            owner.definition + if old { 0x220 } else { 0x218 },
+            owner.definition + if old { movement(0x220) } else { 0x218 },
             if old { 96 } else { 88 },
             Some(if old { 0x8080239D } else { 0x808037CD }),
         )?
@@ -25,7 +26,7 @@ fn names(owner: &graph::Owner, old: bool) -> Result<Vec<u32>> {
 fn nodes(owner: &graph::Owner, old: bool) -> Result<Vec<Vec<u32>>> {
     let p = &owner.payload;
     p.array(
-        owner.definition + if old { 0x220 } else { 0x218 },
+        owner.definition + if old { movement(0x220) } else { 0x218 },
         if old { 96 } else { 88 },
         None,
     )?

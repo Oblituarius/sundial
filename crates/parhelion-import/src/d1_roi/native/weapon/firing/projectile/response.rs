@@ -1,5 +1,6 @@
 //! Response destinations stay stable while object headers and local channel ordinals change.
 use super::*;
+use crate::d1_roi::platform::{input_row, movement, tag};
 use sundial::package_authoring::sandbox_perk::program::NativeAssetResourcePatch;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -48,13 +49,14 @@ fn expression(
     for (i, row) in p
         .array(
             at + header + 48,
-            if old { 48 } else { 40 },
+            if old { input_row().0 } else { 40 },
             Some(if old { 0x80800927 } else { 0x80809789 }),
         )?
         .into_iter()
         .enumerate()
     {
-        expr.names.push(p.u32(row + if old { 40 } else { 32 })?);
+        expr.names
+            .push(p.u32(row + if old { input_row().1 } else { 32 })?);
         ensure!(
             inputs.insert(row, format!("{path}/input/{i}")).is_none(),
             "Repeated expression input object"
@@ -81,7 +83,7 @@ impl Filter {
     /// 256-bit masks and one bypass byte per operation at `+D0`.
     pub(super) fn source(p: &Payload, at: usize) -> Result<Self> {
         ensure!(
-            p.u64(at + 0x40)? == 0 && p.u32(at + 0x48)? == 0x80AAC26E,
+            p.u64(at + 0x40)? == 0 && p.u32(at + 0x48)? == tag(0x80AAC26E),
             "Source response filter has another dictionary"
         );
         let mut active = [false; 4];
@@ -89,7 +91,7 @@ impl Filter {
             *flag = p.u8(at + 0xD0 + i)? == 0;
         }
         Ok(Self {
-            lists: Self::lists(p, at, 0x80800365, 0x80AAC26E)?,
+            lists: Self::lists(p, at, 0x80800365, tag(0x80AAC26E))?,
             active,
         })
     }
@@ -636,7 +638,7 @@ impl Responses {
         let signals = read_signals(owner, old, &mut inputs)?;
         let scalars = p
             .array(
-                d + if old { 0x230 } else { 0x228 },
+                d + if old { movement(0x230) } else { 0x228 },
                 if old { 88 } else { 80 },
                 Some(if old { 0x808005A0 } else { 0x808089F8 }),
             )?
@@ -645,7 +647,7 @@ impl Responses {
             .map(|(i, r)| expression(p, r, old, &format!("scalar/{i}"), &mut inputs))
             .collect::<Result<Vec<_>>>()?;
         let scalar_rows = p.array(
-            d + if old { 0x230 } else { 0x228 },
+            d + if old { movement(0x230) } else { 0x228 },
             if old { 88 } else { 80 },
             None,
         )?;
@@ -660,7 +662,7 @@ impl Responses {
         let mut groups = Vec::new();
         for (ordinal, g) in p
             .array(
-                d + if old { 0x220 } else { 0x218 },
+                d + if old { movement(0x220) } else { 0x218 },
                 if old { 96 } else { 88 },
                 Some(if old { 0x8080239D } else { 0x808037CD }),
             )?
@@ -684,10 +686,10 @@ impl Responses {
             scalars,
             scalar_constants,
             scalar_rows,
-            computed: p.u32(d + if old { 0x138 } else { 0x128 })?,
+            computed: p.u32(d + if old { movement(0x138) } else { 0x128 })?,
             limits: [
-                p.u8(d + if old { 0x8C } else { 0x78 })?,
-                p.u8(d + if old { 0x8D } else { 0x79 })?,
+                p.u8(d + if old { movement(0x8C) } else { 0x78 })?,
+                p.u8(d + if old { movement(0x8D) } else { 0x79 })?,
             ],
             signals,
             inputs,
@@ -1172,7 +1174,7 @@ fn read_signals(
     let d = owner.definition;
     let signals = p
         .array(
-            d + if old { 0x1A0 } else { 0x198 },
+            d + if old { movement(0x1A0) } else { 0x198 },
             if old { 136 } else { 120 },
             Some(if old { 0x808008F1 } else { 0x8080851C }),
         )?

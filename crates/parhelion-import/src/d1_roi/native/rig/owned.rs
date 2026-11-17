@@ -70,7 +70,9 @@ fn convert(
     let native_weapon = bone_signature(&skeleton(target, false)?["bones"])?;
     ensure!(
         (1..=72).contains(&source_weapon.len()) && source_weapon.len() == native_weapon.len(),
-        "Private rig needs equal bounded weapon palettes"
+        "Private rig needs equal bounded weapon palettes: source {} weapon bones, native {}",
+        source_weapon.len(),
+        native_weapon.len()
     );
     let source_full = bone_signature(&skeleton(source, true)?["bones"])?;
     let native_full = bone_signature(&skeleton(target, true)?["bones"])?;
