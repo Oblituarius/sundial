@@ -24,6 +24,7 @@ pub(crate) mod sequence;
 pub mod shader;
 pub mod shadowkeep;
 pub(crate) mod skinning;
+pub(crate) mod stock;
 pub mod texture;
 pub mod universal_ornament;
 pub mod vertex_input;

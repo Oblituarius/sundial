@@ -872,6 +872,13 @@ const DAMAGE_EFFECT: (u32, u8) = (0x8080_2AC6, 5);
 /// still has a frame row. It carries no stats or effects.
 const LEGACY_FRAME: &str = "Legacy Frame";
 const LEGACY_FRAME_DESCRIPTION: &str = "A relic of an older age, pulled through the timeline.";
+/// On PS4 a legendary's Legacy Frame opens its description with the Shadowkeep archetype its
+/// firing matches ([`super::weapon::frame`]) and carries this sentence.
+const LEGACY_FRAME_DESCRIPTION_PS4: &str = "A relic of an older age, pulled through time.";
+/// The source item rarity of a legendary.
+const LEGENDARY_RARITY: u64 = 4;
+/// Weapon manufacturers whose hidden talent, such as Häkke Sidearm, is a PS4 legendary's frame.
+const MANUFACTURERS: [&str; 4] = ["Häkke", "SUROS", "Omolon", "Tex Mechanica"];
 /// The Destiny logo, a stock 150-pixel Shadowkeep texture the build fits to a perk glyph. Its icon
 /// layer is `80B47ED7`, but a perk icon names the texture.
 const LEGACY_FRAME_ICON: &str = "0x80B47ED5";
@@ -1662,9 +1669,12 @@ fn lower_step(context: &mut StepContext<'_>, step: &Value, name: &str) -> Result
                 continue;
             }
             // A grant-backed talent can have a display perk without its own action.
-            // The complete grant array must lower successfully below.
+            // The complete grant array must lower successfully below. On PS4 a step whose
+            // stat rows are its whole effect, such as a firing mode set by Rate of Fire and
+            // Impact, keeps its display perk the same way and becomes a stats-only plug.
             ensure!(
-                !grants.is_empty() && perk["runtime_key"].as_u64() == Some(0x811C9DC5),
+                (!grants.is_empty() || (context.source.platform() == 7 && !stats.is_empty()))
+                    && perk["runtime_key"].as_u64() == Some(0x811C9DC5),
                 "Source perk has no resolved standalone action"
             );
             continue;
@@ -1897,6 +1907,32 @@ pub(super) fn translate(
     } else {
         None
     };
+    // On PS4 a legendary weapon's hidden, fixed manufacturer talent, such as Häkke Sidearm's muzzle
+    // velocity, works as its frame: it takes the intrinsic socket as a Legacy manufacturer Frame
+    // instead of a perk column. Other hidden talents, such as raid weapons', stay perk columns.
+    let mut manufacturer = None;
+    if assembly.source.platform() == 7
+        && host == Host::Weapon
+        && signature.is_none()
+        && intrinsic.is_some()
+        && source["item"]["rarity"].as_u64() == Some(LEGENDARY_RARITY)
+    {
+        for &column in source_columns.iter().filter(|&&column| column < 0) {
+            let Some(&first) = members(&choices, column).first() else {
+                continue;
+            };
+            let choice = &choices[first];
+            if let Some(maker) = MANUFACTURERS
+                .iter()
+                .find(|maker| choice.name.trim().starts_with(**maker))
+                .filter(|_| fixed(column))
+            {
+                signature = Some(column);
+                manufacturer = Some((*maker, choice.description.as_str().map(str::to_owned)));
+                break;
+            }
+        }
+    }
     // A translated armor signature takes the intrinsic socket a Year 1 exotic carries its perk in,
     // so the inspect screen shows it first, labeled Intrinsic, and the tooltip lists it. It takes
     // the donor's first socket when that socket is disabled or holds only intrinsic-category
@@ -1950,6 +1986,40 @@ pub(super) fn translate(
         stat_intrinsic,
         (&mut columns, &mut variants),
     )?;
+    // On PS4 a legendary weapon's frame names its Shadowkeep archetype, and a manufacturer frame
+    // its manufacturer, with the talent's own description after the Legacy sentence.
+    if assembly.source.platform() == 7
+        && host == Host::Weapon
+        && (legacy || manufacturer.is_some())
+        && source["item"]["rarity"].as_u64() == Some(LEGENDARY_RARITY)
+        && let Some(socket) = intrinsic.as_ref()
+    {
+        let archetype =
+            super::weapon::frame::archetype(assembly.source, &mut assembly.native, source)
+                .ok()
+                .flatten();
+        for variant in variants
+            .iter_mut()
+            .filter(|variant| variant["socket_index"] == json!(socket.index))
+        {
+            let mut text = archetype
+                .as_ref()
+                .map(|line| format!("{line} "))
+                .unwrap_or_default();
+            text.push_str(LEGACY_FRAME_DESCRIPTION_PS4);
+            if let Some((maker, description)) = &manufacturer {
+                variant["name"] = json!(format!("Legacy {maker} Frame"));
+                variant["icon"] = json!({"source":"texture","tag":LEGACY_FRAME_ICON});
+                if let Some(description) = description.as_deref().map(str::trim)
+                    && !description.is_empty()
+                {
+                    text.push(' ');
+                    text.push_str(description);
+                }
+            }
+            variant["description"] = json!(text);
+        }
+    }
     let intrinsic_socket = intrinsic
         .as_ref()
         .filter(|_| signature.is_some() || legacy)

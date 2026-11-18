@@ -619,6 +619,7 @@ impl Source {
             &output,
             native_packages.parent().context("native installation")?,
         )?;
+        let _stock = self.stock_scope(native_packages);
         let mut native = Reader::new(native_packages, &output.join("native-source"), false)?;
         let report = prepare(self, &mut native, &output, &cues.iter().copied().collect())?;
         let path = output.join("audio-graph.json");

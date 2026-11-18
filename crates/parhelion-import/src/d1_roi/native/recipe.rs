@@ -187,6 +187,7 @@ impl Source {
             &output,
             native.parent().context("Native installation root")?,
         )?;
+        let _stock = self.stock_scope(native);
         progress(format!("Reading investment tables for {item:08X}"));
         let armor = self
             .armor()?

@@ -238,11 +238,19 @@ fn size(data: &mut [u8]) -> Result<()> {
 }
 
 impl Source {
+    /// On PS4 the native readers an import opens inside this scope read the installation without
+    /// the packages Sundial built into it ([`crate::tiger::stock`]), in memory, so an import never
+    /// depends on the last build. An Xbox One import reads the folder as it is.
+    pub(crate) fn stock_scope(&self, native: &Path) -> Option<crate::tiger::stock::Scope> {
+        (self.platform() == 7).then(|| crate::tiger::stock::scope(native))
+    }
+
     /// Lower every distinct talent step of every source weapon and armor piece and report how
     /// many translate, by distinct step, across items and by talent name. `folder` receives the
     /// native reader's working files and any imported attachment groups.
     pub fn talent_census(&self, packages: &Path, folder: &Path) -> Result<Value> {
         fs::create_dir_all(folder)?;
+        let _stock = self.stock_scope(packages);
         let mut native = Reader::new(packages, &folder.join("native-source"), false)?;
         perk::census(self, &mut native, folder)
     }

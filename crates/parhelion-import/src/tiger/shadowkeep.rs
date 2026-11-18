@@ -468,12 +468,7 @@ pub fn extract(r: &mut Reader, item_hash: u32) -> Result<Value> {
 /// them also writes is left out, since a literal there would not be the value the weapon uses.
 /// An unlisted group uses table zero.
 pub(crate) fn translator_routes(r: &mut Reader, item: u32) -> Result<BTreeSet<(u32, u32)>> {
-    let manager = sundial::package_authoring::PackageManager::new(
-        &r.manager.package_dir,
-        r.manager.version,
-        Some(r.manager.platform),
-    )
-    .map_err(anyhow::Error::msg)?;
+    let manager = crate::tiger::stock::sundial_manager(r)?;
     let runtime =
         sundial::package_authoring::runtime::load_weapon_runtime_entity_for_item_with_manager(
             &manager, item,

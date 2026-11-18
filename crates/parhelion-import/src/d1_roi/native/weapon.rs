@@ -2,6 +2,7 @@
 use super::*;
 use crate::GraphReference;
 mod firing;
+pub(super) mod frame;
 mod hud;
 mod marker;
 mod ornament;
@@ -154,6 +155,7 @@ impl Source {
             &output,
             native.parent().context("Native installation root")?,
         )?;
+        let _stock = self.stock_scope(native);
         ensure!(
             !bases.is_empty(),
             "No native runtime of this weapon type is available"
@@ -238,6 +240,7 @@ impl Source {
             &output,
             native.parent().context("Native installation root")?,
         )?;
+        let _stock = self.stock_scope(native);
         let source_path = self.export_weapon(hash, &output.join("source"))?;
         let source: Value = serde_json::from_slice(&fs::read(source_path)?)?;
         self.prepare_exported_weapon(

@@ -556,6 +556,7 @@ impl Source {
             self.report.packages.parent().context("Source root")?,
         )?;
         crate::io::outside(&directory, native.parent().context("Native root")?)?;
+        let _stock = self.stock_scope(native);
         let path = directory.join("asset-graph.json");
         let mut graph: Value = serde_json::from_slice(&fs::read(&path)?)?;
         ensure!(

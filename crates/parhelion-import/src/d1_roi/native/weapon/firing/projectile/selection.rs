@@ -104,12 +104,7 @@ fn native_barrel(native: &mut Reader, entity: &[u8]) -> Result<(u32, Value, Valu
 }
 
 pub(super) fn native(native: &mut Reader, donor: u32, key: u32) -> Result<Native> {
-    let manager = sundial::package_authoring::PackageManager::new(
-        &native.manager.package_dir,
-        native.manager.version,
-        Some(native.manager.platform),
-    )
-    .map_err(anyhow::Error::msg)?;
+    let manager = crate::tiger::stock::sundial_manager(native)?;
     let runtime = runtime::load_weapon_runtime_entity_for_item_with_manager(&manager, donor)
         .map_err(anyhow::Error::msg)?;
     let bindings =

@@ -16,7 +16,8 @@ pub use stamp::{package_files_stamp, package_stamp};
 
 /// Package indexes open in this process, by folder and era, with the package stamp each was
 /// built from.
-type Indexes = BTreeMap<(PathBuf, bool), (String, Weak<PackageManager>)>;
+/// Keyed by folder, whether it is the modern game, and whether it reads stock-only.
+type Indexes = BTreeMap<(PathBuf, bool, bool), (String, Weak<PackageManager>)>;
 
 /// Every record of one class with its payload, in [`Reader::classes`] order.
 pub(crate) type Survey = Arc<Vec<(u32, Arc<Payload>)>>;
@@ -26,11 +27,13 @@ pub(crate) type Survey = Arc<Vec<(u32, Arc<Payload>)>>;
 /// each stage, so readers of an unchanged folder share the index instead. The cache holds no
 /// index itself: once the last reader drops, the memory is released. A changed package stamp,
 /// such as after an install, builds a new index.
+/// Inside a [`super::stock::scope`] a Shadowkeep folder reads stock-only.
 pub(crate) fn package_index(packages: &Path, modern: bool) -> Result<Arc<PackageManager>> {
     crate::cancellation::check()?;
     static INDEXES: OnceLock<Mutex<Indexes>> = OnceLock::new();
     let stamp = package_stamp(packages)?;
-    let key = (packages.to_owned(), modern);
+    let stock = !modern && super::stock::wanted(packages);
+    let key = (packages.to_owned(), modern, stock);
     let mut indexes = crate::cancellation::mutex(INDEXES.get_or_init(Mutex::default))?;
     if let Some((built, index)) = indexes.get(&key)
         && *built == stamp
@@ -45,11 +48,11 @@ pub(crate) fn package_index(packages: &Path, modern: bool) -> Result<Arc<Package
     };
     let packages = packages.to_owned();
     let index = crate::cancellation::compute(move || {
-        Ok(Arc::new(PackageManager::new(
-            &packages,
-            GameVersion::Destiny(version),
-            None,
-        )?))
+        let mut manager = PackageManager::new(&packages, GameVersion::Destiny(version), None)?;
+        if stock {
+            super::stock::filter(&mut manager)?;
+        }
+        Ok(Arc::new(manager))
     })?;
     crate::cancellation::check()?;
     indexes.retain(|_, (_, index)| index.strong_count() > 0);
@@ -65,6 +68,8 @@ pub struct Reader {
     packages: PathBuf,
     version: String,
     record_reads: bool,
+    /// Reads without the packages Sundial built into the folder ([`super::stock`]).
+    stock: bool,
 }
 impl Reader {
     pub(crate) fn packages(&self) -> &Path {
@@ -73,6 +78,10 @@ impl Reader {
 
     pub(crate) fn is_native(&self) -> bool {
         self.version == "shadowkeep"
+    }
+
+    pub(crate) fn is_stock(&self) -> bool {
+        self.stock
     }
 
     pub fn marathon(packages: &Path, output: &Path) -> Result<Self> {
@@ -92,6 +101,7 @@ impl Reader {
             packages,
             version: "marathon".into(),
             record_reads: true,
+            stock: false,
         })
     }
     /// A Marathon reader for browsing, which keeps reads in memory only.
@@ -104,6 +114,7 @@ impl Reader {
         let packages = packages.canonicalize()?;
         let output = outside(output, packages.parent().unwrap_or(&packages))?;
         let manager = package_index(&packages, modern)?;
+        let stock = !modern && super::stock::wanted(&packages);
         fs::create_dir_all(output.join("raw"))?;
         Ok(Self {
             manager,
@@ -113,6 +124,7 @@ impl Reader {
             packages,
             version: if modern { "modern" } else { "shadowkeep" }.into(),
             record_reads: true,
+            stock,
         })
     }
     /// Browsing needs cached reads, but not thousands of raw model-export files.
@@ -133,6 +145,7 @@ impl Reader {
             packages: self.packages.clone(),
             version: self.version.clone(),
             record_reads: true,
+            stock: self.stock,
         })
     }
     /// A reader on the same package index that keeps its reads in memory only, for surveys
@@ -146,6 +159,7 @@ impl Reader {
             packages: self.packages.clone(),
             version: self.version.clone(),
             record_reads: false,
+            stock: self.stock,
         }
     }
     pub(crate) fn clear_cached_tags(&mut self) {
