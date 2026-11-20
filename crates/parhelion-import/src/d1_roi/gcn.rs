@@ -20,6 +20,7 @@
 use super::*;
 
 mod decode;
+pub(super) mod eval;
 mod lift;
 
 pub(super) struct Slot {
@@ -102,6 +103,12 @@ fn parse(d: &Payload, code: &[u8], vertex: bool) -> Result<(Header, Vec<u8>)> {
     };
     ensure!(size <= code.len(), "Source program code is truncated");
     Ok((Header { slots, interface }, code[..size].to_vec()))
+}
+
+/// A source pixel program decoded to run on the CPU ([`eval`]).
+pub(super) fn pixel_program(source: &Source, tag: u32) -> Result<eval::Program> {
+    let (header, code) = program(source, tag, false)?;
+    eval::Program::new(header, &code).with_context(|| format!("Source pixel program {tag:08X}"))
 }
 
 /// Compiled SM5 programs for one material's vertex and pixel stages, and their HLSL.

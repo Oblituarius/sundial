@@ -60,8 +60,13 @@ pub enum Op {
         attr: u8,
         channel: u8,
     },
+    /// LDS/GDS: `offset` is OFFSET1:OFFSET0, `addr` the address (or swizzled source) VGPR.
     Ds {
         op: u8,
+        offset: u16,
+        gds: bool,
+        addr: u8,
+        vdst: u8,
     },
     Mtbuf(Buffer),
     Mubuf(Buffer),
@@ -339,9 +344,14 @@ fn instruction(code: &[u8], at: usize) -> Result<(Op, usize)> {
             ));
         }
         0x36 => {
+            let hi = next(4)?;
             return Ok((
                 Op::Ds {
                     op: ((w >> 18) & 0xFF) as u8,
+                    offset: (w & 0xFFFF) as u16,
+                    gds: (w >> 17) & 1 != 0,
+                    addr: (hi & 0xFF) as u8,
+                    vdst: (hi >> 24) as u8,
                 },
                 8,
             ));
@@ -544,5 +554,24 @@ mod tests {
         );
         assert_eq!(source(131, &mut literal, Ok(0)).unwrap(), Src::Const(3));
         assert!(literal.is_none());
+    }
+
+    #[test]
+    fn ds_reads_offset_address_and_destination() {
+        // ds_swizzle_b32 v7, v13 offset:0x80aa from program 80A3D289.
+        let mut code = 0xD8D4_80AAu32.to_le_bytes().to_vec();
+        code.extend(0x0700_000Du32.to_le_bytes());
+        let (op, size) = instruction(&code, 0).unwrap();
+        assert_eq!(size, 8);
+        assert!(matches!(
+            op,
+            Op::Ds {
+                op: 53,
+                offset: 0x80AA,
+                gds: false,
+                addr: 13,
+                vdst: 7
+            }
+        ));
     }
 }

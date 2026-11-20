@@ -1,5 +1,14 @@
 use super::*;
 
+/// Mirror the icon PNG at `path` left to right in place.
+pub(super) fn mirror(path: &Path) -> Result<()> {
+    let image = image::open(path)
+        .with_context(|| format!("Reading icon {}", path.display()))?
+        .to_rgba8();
+    image::imageops::flip_horizontal(&image).save_with_format(path, image::ImageFormat::Png)?;
+    Ok(())
+}
+
 impl Assembly<'_> {
     pub(super) fn icon(&mut self, item: &Armor) -> Result<Option<String>> {
         self.item_icon(item.strings)

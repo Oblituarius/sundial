@@ -294,6 +294,7 @@ impl Source {
             definition.u8(0xB8)? <= 2 && definition.u8(0xBB)? == 1,
             "Selected native donor is not an instanced weapon"
         );
+        let donor_bucket = definition.u8(0xB8)?;
         let selectors = definition.array(definition.pointer(0x88)?, 4, Some(0x808077B5))?;
         let template =
             definition.u16(selectors.first().context("Native weapon art selector")? + 2)?;
@@ -449,6 +450,17 @@ impl Source {
         if let Some(effect) = firing_effect {
             graph["firing_effect"] = effect;
         }
+        // Shadowkeep's Kinetic slot icons face the other way from Rise of Iron's, so the icon of
+        // a weapon assigned that slot is mirrored. A slot the source leaves open is the donor's
+        // (equipment bucket 0 is Kinetic). The graph reference below fingerprints the icon, so
+        // the mirror comes first.
+        let (inventory, ammo) = slot_and_ammo(weapon.slot, damage)?;
+        if crate::d1_roi::platform::ps4()
+            && inventory.map_or(donor_bucket == 0, |slot| slot == "kinetic")
+            && let Some(file) = &icon
+        {
+            super::icon::mirror(&directory.join(file))?;
+        }
         progress("Saving the weapon recipe…".into());
         crate::io::write_json(&directory.join("asset-graph.json"), &graph)?;
         crate::graph::check_particle_bindings(&directory)?;
@@ -481,7 +493,6 @@ impl Source {
                 .collect();
             recipe["overrides"]["skip_behavior_perks"] = json!(true);
         }
-        let (inventory, ammo) = slot_and_ammo(weapon.slot, damage)?;
         if let Some(inventory) = inventory {
             recipe["overrides"]["inventory_slot"] = json!(inventory);
         }

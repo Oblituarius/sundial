@@ -419,6 +419,17 @@ impl Program {
     /// operation. Arithmetic follows the native interpreter (as `src/expression.rs` in the
     /// application crate): operands in push order, `right` the most recent.
     pub(super) fn constant_outputs(&self, values: &[u8]) -> Option<Vec<[f32; 4]>> {
+        self.outputs(values, false)
+    }
+
+    /// [`Self::constant_outputs`] for a program that also binds textures and samplers, which
+    /// leave the vector outputs alone: a texture or sampler load (3F, 4C) pushes a placeholder
+    /// that its binding (47, 49) pops.
+    pub(super) fn bound_outputs(&self, values: &[u8]) -> Option<Vec<[f32; 4]>> {
+        self.outputs(values, true)
+    }
+
+    fn outputs(&self, values: &[u8], bindings: bool) -> Option<Vec<[f32; 4]>> {
         let vector = |bytes: &[u8]| -> [f32; 4] {
             std::array::from_fn(|i| f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()))
         };
@@ -475,6 +486,18 @@ impl Program {
                         0x21 => [v[0]; 4],
                         _ => lanes(&|x| x.clamp(0.0, 1.0), v),
                     });
+                }
+                0x3F if bindings => {
+                    at += 2;
+                    stack.push([0.0; 4]);
+                }
+                0x4C if bindings => {
+                    at += 1;
+                    stack.push([0.0; 4]);
+                }
+                0x47 | 0x49 if bindings => {
+                    at += 1;
+                    stack.pop()?;
                 }
                 _ => return None,
             }

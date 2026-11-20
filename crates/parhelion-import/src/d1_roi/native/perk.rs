@@ -29,6 +29,7 @@ mod orb;
 pub(crate) mod pattern;
 mod policy;
 mod scalar;
+mod sight;
 mod stat;
 pub(crate) mod subclass;
 mod super_gate;
@@ -998,10 +999,15 @@ fn only_sets_damage(lowered: &Lowered) -> bool {
 
 /// Whether `program` acts for as long as its item is equipped: an Always program with no other
 /// activation, ending, chance, duration or complete native form. Rise of Iron programs lower to
-/// Always or to a native event trigger.
-fn unconditional(program: &Program) -> bool {
-    program.trigger == Trigger::Always
-        && program.native_trigger.is_none()
+/// Always or to a native event trigger. PS4 programs also lower to a native unconditional check
+/// (kind 0) that always passes, which acts the same (`native_always`).
+fn unconditional(program: &Program, native_always: bool) -> bool {
+    let always = match (&program.trigger, &program.native_trigger) {
+        (Trigger::Always, None) => true,
+        (Trigger::Native, Some(node)) => native_always && always_condition(node),
+        _ => false,
+    };
+    always
         && program.alternative_triggers.is_empty()
         && program.native_removal.is_none()
         && program.alternative_removals.is_empty()
@@ -1011,11 +1017,16 @@ fn unconditional(program: &Program) -> bool {
         && program.duration_ms == 0
 }
 
+/// Native condition kind 0, the unconditional check, with probability one: it always passes.
+fn always_condition(node: &NativeNode) -> bool {
+    node.kind == 0 && node.bytes.get(..4) == Some(&1f32.to_le_bytes()[..])
+}
+
 /// Remove the element changes from `lowered`'s unconditional programs, since the weapon's damage
 /// type stands in for them, and return whether any was removed. Later actions' indices shift down.
 /// A program left with no action goes with its finished perk. An element change an event starts
 /// stays in its program.
-fn strip_elements(lowered: &mut Lowered) -> Result<bool> {
+fn strip_elements(lowered: &mut Lowered, native_always: bool) -> Result<bool> {
     let mut stripped = false;
     let mut index = 0;
     while index < lowered.raw.len() {
@@ -1029,7 +1040,7 @@ fn strip_elements(lowered: &mut Lowered) -> Result<bool> {
             })
             .map(|(at, _)| at)
             .collect::<Vec<_>>();
-        if removed.is_empty() || !unconditional(program) {
+        if removed.is_empty() || !unconditional(program, native_always) {
             index += 1;
             continue;
         }
@@ -1329,6 +1340,171 @@ const REUSABLE_CHOICES: usize = 4;
 /// The most choices a column rolls from: the rows one 64-bit ownership mask covers, also the
 /// largest stock randomized set.
 const ROLL_POOL: usize = 64;
+
+/// The talent column Rise of Iron never shows: its steps are always on.
+const HIDDEN_COLUMN: i64 = -1;
+/// The column a hidden step joined to the intrinsic plug leaves for, so no socket takes it.
+const FOLDED_COLUMN: i64 = i64::MIN + 1;
+/// The talent icons of Rise of Iron's damage nodes: Kinetic, Void, Solar and Arc Damage. Measured
+/// on PS4 over every weapon's talent grid (2026-11-19): the 1835 damage steps show one of them,
+/// and no other step does, including No Land Beyond's Year 1 Kinetic Damage that sets no element.
+const DAMAGE_NODE_ICONS: [u32; 4] = [0x80A5_DC91, 0x80A5_DC92, 0x80A5_DC93, 0x80A5_DC94];
+
+/// The steps that join the intrinsic plug (`enabled`: a PS4 weapon with an intrinsic socket
+/// plug). Rise of Iron applied a fixed hidden step (its node has one step) whenever the item was
+/// equipped and never showed it, such as No Land Beyond's Taken King ammo perk
+/// (`york_ammo_intrinsic`) beside its element. A fixed damage node showed only its element, which
+/// the weapon's damage type takes, and hid the rest: Thorn's and Truth's ammo perks, Black
+/// Spindle's zoom. Such a node left its column while lowering ([`lower_talents`]), so it is never
+/// the signature. Each one with effects takes no perk socket; [`fold_hidden`] adds its effects to
+/// the intrinsic plug. The signature or manufacturer column keeps its own place. A step with
+/// ability grants or a bundled projectile keeps its column, and so does every step when the
+/// intrinsic socket gets no plug: a signature column none of whose steps translate.
+fn hidden_folds(
+    enabled: bool,
+    signature: Option<i64>,
+    steps: &BTreeMap<u64, usize>,
+    choices: &mut [Choice],
+    source_columns: &mut Vec<i64>,
+) -> Vec<usize> {
+    // Without a signature the intrinsic takes Legacy Frame, see [`finish_intrinsic`].
+    let joins = enabled && signature.is_none_or(|column| !members(choices, column).is_empty());
+    let mut folded = Vec::new();
+    for index in 0..choices.len() {
+        let choice = &choices[index];
+        let lowered = &choice.lowered;
+        let fixed = choice.report["node"]
+            .as_u64()
+            .and_then(|node| steps.get(&node))
+            == Some(&1);
+        let candidate = match choice.column {
+            FOLDED_COLUMN => true,
+            HIDDEN_COLUMN => fixed && signature != Some(HIDDEN_COLUMN),
+            _ => false,
+        };
+        if !candidate {
+            continue;
+        }
+        let foldable = lowered.grants.is_empty()
+            && !(lowered.programs.is_empty()
+                && lowered.stats.is_empty()
+                && lowered.stock.is_empty())
+            && !lowered
+                .raw
+                .iter()
+                .any(|program| program.projectile_dependency().is_some());
+        if joins && foldable {
+            choices[index].column = FOLDED_COLUMN;
+            folded.push(index);
+        } else if choice.column == FOLDED_COLUMN {
+            // A damage node that cannot join returns to its source column.
+            let column = choice.report["column"].as_i64().unwrap_or(HIDDEN_COLUMN);
+            choices[index].column = column;
+            if !source_columns.contains(&column) {
+                source_columns.push(column);
+                source_columns.sort_unstable();
+            }
+        }
+    }
+    source_columns.retain(|&column| !members(choices, column).is_empty());
+    folded
+}
+
+/// The source columns whose nodes set different elements, as Murmur's Solar and Arc Damage
+/// talents do: the player chose the weapon's element there, so its choices keep their element
+/// changes. Steps of one node are damage alternatives instead, which no column offers.
+fn element_switches(source: &Source, nodes: &[Value]) -> Result<BTreeSet<i64>> {
+    let mut columns = BTreeMap::new();
+    for node in nodes {
+        let index = node["index"].as_u64().context("Source talent node index")?;
+        let column = node["column"].as_i64().context("Source talent column")?;
+        columns.insert(index, column);
+    }
+    let mut elements = BTreeMap::<i64, BTreeMap<&'static str, BTreeSet<u64>>>::new();
+    for (node, _, kind) in source_damage(source, nodes)? {
+        if let (Some(kind), Some(&column)) = (kind, columns.get(&node)) {
+            elements
+                .entry(column)
+                .or_default()
+                .entry(kind)
+                .or_default()
+                .insert(node);
+        }
+    }
+    Ok(elements
+        .into_iter()
+        .filter(|(_, kinds)| {
+            kinds.len() > 1 && kinds.values().flatten().collect::<BTreeSet<_>>().len() > 1
+        })
+        .map(|(column, _)| column)
+        .collect())
+}
+
+/// Add each folded hidden step's programs, stock perks and stats to the intrinsic plug's
+/// variants, and report where it went.
+fn fold_hidden(
+    choices: &[Choice],
+    hidden: &[usize],
+    intrinsic: Option<&PerkSocket<'_>>,
+    variants: &mut [Value],
+    translated: &mut Vec<Value>,
+) -> Result<()> {
+    let Some(socket) = intrinsic.filter(|_| !hidden.is_empty()) else {
+        return Ok(());
+    };
+    let mut targets = variants
+        .iter_mut()
+        .filter(|variant| variant["socket_index"] == json!(socket.index))
+        .peekable();
+    ensure!(
+        targets.peek().is_some(),
+        "Hidden talents have no intrinsic plug to join"
+    );
+    for variant in targets {
+        // The step's own name describes its node (No Land Beyond's is Kinetic Damage), so its
+        // programs are named as the intrinsic's hidden talent.
+        let name = format!(
+            "{} (hidden talent)",
+            variant["name"].as_str().unwrap_or("Intrinsic")
+        );
+        for &index in hidden {
+            let lowered = &choices[index].lowered;
+            let mut programs = lowered.programs.clone();
+            for perk in &mut programs {
+                if perk["program"].is_object() {
+                    perk["program"]["name"] = json!(name);
+                }
+            }
+            for (key, values) in [
+                ("sandbox_perks", programs),
+                ("investment_stats", lowered.stats.clone()),
+                (
+                    "additional_sandbox_perks",
+                    lowered.stock.iter().map(|&perk| json!(perk)).collect(),
+                ),
+            ] {
+                if values.is_empty() {
+                    continue;
+                }
+                let list = variant
+                    .as_object_mut()
+                    .context("Intrinsic variant")?
+                    .entry(key)
+                    .or_insert_with(|| json!([]));
+                list.as_array_mut()
+                    .context("Intrinsic variant list")?
+                    .extend(values);
+            }
+        }
+    }
+    for &index in hidden {
+        let mut report = choices[index].report.clone();
+        report["socket"] = json!(socket.index);
+        report["folded_into_intrinsic"] = json!(true);
+        translated.push(report);
+    }
+    Ok(())
+}
 
 /// Source choices in row and node order, retaining step order within each node.
 fn members(choices: &[Choice], column: i64) -> Vec<usize> {
@@ -1833,7 +2009,7 @@ pub(super) fn translate(
     let mut source_columns = choices
         .iter()
         .map(|choice| choice.column)
-        .filter(|&column| column != i64::MIN)
+        .filter(|&column| column != i64::MIN && column != FOLDED_COLUMN)
         .collect::<Vec<_>>();
     source_columns.sort_unstable();
     source_columns.dedup();
@@ -1907,9 +2083,10 @@ pub(super) fn translate(
     } else {
         None
     };
-    // On PS4 a legendary weapon's hidden, fixed manufacturer talent, such as Häkke Sidearm's muzzle
+    // On PS4 a legendary weapon's fixed manufacturer talent, such as Häkke Sidearm's muzzle
     // velocity, works as its frame: it takes the intrinsic socket as a Legacy manufacturer Frame
-    // instead of a perk column. Other hidden talents, such as raid weapons', stay perk columns.
+    // instead of a perk column. Most sidearms keep it hidden (column -1), Conviction II shows it
+    // in column 0. Other hidden talents with effects join the intrinsic plug, see [`hidden_folds`].
     let mut manufacturer = None;
     if assembly.source.platform() == 7
         && host == Host::Weapon
@@ -1917,7 +2094,7 @@ pub(super) fn translate(
         && intrinsic.is_some()
         && source["item"]["rarity"].as_u64() == Some(LEGENDARY_RARITY)
     {
-        for &column in source_columns.iter().filter(|&&column| column < 0) {
+        for &column in &source_columns {
             let Some(&first) = members(&choices, column).first() else {
                 continue;
             };
@@ -1967,6 +2144,25 @@ pub(super) fn translate(
             plugs: vec![layout.plug],
         });
     }
+    let hidden = hidden_folds(
+        assembly.source.platform() == 7
+            && host == Host::Weapon
+            && intrinsic
+                .as_ref()
+                .is_some_and(|socket| !socket.plugs.is_empty()),
+        signature,
+        &steps,
+        &mut choices,
+        &mut source_columns,
+    );
+    // On PS4 a sight column takes a stock sight plug of the weapon type, see [`sight`].
+    let sight = sight_layout(assembly, host, donor, &choices, &source_columns)?;
+    let sight_type = sight.map_or(Value::Null, |(socket_type, _)| json!(socket_type));
+    let sight = sight.map(|(_, plug)| PerkSocket {
+        index: 0,
+        socket_type: &sight_type,
+        plugs: vec![plug],
+    });
     let mut merged = Vec::new();
     emit_talent_columns(
         &assembly.projectile_names,
@@ -1974,7 +2170,13 @@ pub(super) fn translate(
         (&choices, &source_columns, &mut unsupported),
         &mut merged,
         (signature, intrinsic.as_ref()),
-        (&perk_sockets, &extra_layouts),
+        (
+            &perk_sockets,
+            &extra_layouts,
+            sight.as_ref(),
+            (assembly.source.platform() == 7 && host == Host::Weapon)
+                .then_some(sight::SIGHT_SOCKET_TYPE),
+        ),
         &mut mod_sockets,
         (&mut columns, &mut variants, &mut translated),
     )?;
@@ -2020,6 +2222,14 @@ pub(super) fn translate(
             variant["description"] = json!(text);
         }
     }
+    // After the frame takes its final name, which names the hidden talent's programs.
+    fold_hidden(
+        &choices,
+        &hidden,
+        intrinsic.as_ref(),
+        &mut variants,
+        &mut translated,
+    )?;
     let intrinsic_socket = intrinsic
         .as_ref()
         .filter(|_| signature.is_some() || legacy)
@@ -2606,6 +2816,25 @@ fn assign_damage_choices(choices: &mut Vec<Choice>, unsupported: &mut Vec<Value>
     Ok(())
 }
 
+/// The sight socket type and plug a PS4 weapon's sight column takes, when it has one.
+fn sight_layout(
+    assembly: &mut Assembly<'_>,
+    host: Host,
+    donor: u32,
+    choices: &[Choice],
+    columns: &[i64],
+) -> Result<Option<(u16, u32)>> {
+    if assembly.source.platform() != 7
+        || host != Host::Weapon
+        || !columns
+            .iter()
+            .any(|&column| sight::column(choices, &members(choices, column)))
+    {
+        return Ok(None);
+    }
+    sight::layout(&mut assembly.native, donor)
+}
+
 type TalentChoices<'a> = (&'a [Choice], &'a [i64], &'a mut Vec<Value>);
 type TalentOutput<'a> = (&'a mut Vec<Value>, &'a mut Vec<Value>, &'a mut Vec<Value>);
 
@@ -2616,13 +2845,27 @@ fn emit_talent_columns(
     (choices, source_columns, unsupported): TalentChoices<'_>,
     merged: &mut Vec<Value>,
     (signature, intrinsic): (Option<i64>, Option<&PerkSocket<'_>>),
-    (perk_sockets, extra_layouts): (&[PerkSocket<'_>], &[PerkSocket<'_>]),
+    (perk_sockets, extra_layouts, sight, sight_type): (
+        &[PerkSocket<'_>],
+        &[PerkSocket<'_>],
+        Option<&PerkSocket<'_>>,
+        Option<u16>,
+    ),
     mod_sockets: &mut std::collections::VecDeque<usize>,
     (columns, variants, translated): TalentOutput<'_>,
 ) -> Result<()> {
-    let mut ordinal = 0;
+    let mut used = vec![false; perk_sockets.len()];
     for &column in source_columns {
         let members = members(choices, column);
+        let sights = sight::column(choices, &members);
+        let sight = sight.filter(|_| sights);
+        // With `sight_type` (PS4 weapons), a column that is not a sight column passes over the
+        // base's sight sockets, so it is not labeled Scope or Sight, and leaves them for a sight
+        // column; a skipped sight socket stays the base's untouched row. Otherwise columns take
+        // the base's perk sockets in order.
+        let fits = |socket: &PerkSocket<'_>| {
+            sights || sight_type.is_none_or(|kind| socket.socket_type != &json!(kind))
+        };
         // Armor offers every distinct step of each talent, as an owned piece can take any plug of
         // its column's pool. Damage alternatives are steps of one node, which a roll would cut to
         // its first step, so every one stays selectable instead.
@@ -2654,9 +2897,11 @@ fn emit_talent_columns(
             && let Some(socket) = intrinsic
         {
             socket
-        } else if let Some(socket) = perk_sockets.get(ordinal) {
-            ordinal += 1;
-            socket
+        } else if let Some(at) =
+            (0..perk_sockets.len()).find(|&at| !used[at] && fits(&perk_sockets[at]))
+        {
+            used[at] = true;
+            &perk_sockets[at]
         } else {
             let layout = perk_sockets
                 .last()
@@ -2672,6 +2917,19 @@ fn emit_talent_columns(
                 plugs: layout.plugs.clone(),
             };
             &extra
+        };
+        // A sight column keeps its socket and takes the sight type and plug layout.
+        let scoped;
+        let socket = match sight {
+            Some(layout) if signature != Some(column) => {
+                scoped = PerkSocket {
+                    index: socket.index,
+                    socket_type: layout.socket_type,
+                    plugs: layout.plugs.clone(),
+                };
+                &scoped
+            }
+            _ => socket,
         };
         let mut plugs = Vec::new();
         for (choice_index, index) in members.into_iter().enumerate() {
@@ -2768,6 +3026,12 @@ fn lower_talents(
             .as_u64()
             .context("Source item hash")?
     );
+    let ps4_weapon = assembly.source.platform() == 7 && host == Host::Weapon;
+    let switches = if ps4_weapon {
+        element_switches(assembly.source, nodes)?
+    } else {
+        BTreeSet::new()
+    };
     for node in nodes {
         let column = node["column"].as_i64().context("Source talent column")?;
         let row = node["row"].as_i64().context("Source talent row")?;
@@ -2817,10 +3081,13 @@ fn lower_talents(
             let element = damage_type(&lowered.raw);
             let column = if element.is_none() {
                 column
+            } else if switches.contains(&column) {
+                report["element_choice"] = json!(element);
+                column
             } else if only_sets_damage(&lowered) {
                 i64::MIN
             } else {
-                let stripped = strip_elements(&mut lowered)?;
+                let stripped = strip_elements(&mut lowered, assembly.source.platform() == 7)?;
                 report["element_assigned_to_damage_type"] = json!(element);
                 report["element_action_removed"] = json!(stripped);
                 if lowered.programs.is_empty()
@@ -2832,6 +3099,19 @@ fn lower_talents(
                 } else {
                     column
                 }
+            };
+            // On PS4 a fixed damage node's other effects join the intrinsic plug, see
+            // [`hidden_folds`], which returns the node to `report["column"]` when they cannot.
+            let column = if ps4_weapon
+                && column != i64::MIN
+                && !switches.contains(&column)
+                && DAMAGE_NODE_ICONS.contains(&container)
+                && node["steps"].as_array().map_or(0, Vec::len) == 1
+            {
+                report["damage_node"] = json!(true);
+                FOLDED_COLUMN
+            } else {
+                column
             };
             choices.push(Choice {
                 column,
@@ -3066,9 +3346,15 @@ fn primary_damage(
     found: &[SourceDamage],
     host: Host,
 ) -> (Option<&'static str>, Option<&'static str>) {
-    // The first element a choice sets, in source order, gives the weapon its damage type. Without
-    // one, the source effects decide it.
-    let chosen = choices.iter().find_map(|c| c.element);
+    // The first element a choice sets, in source order, gives the weapon its damage type. In a
+    // column whose choices switch the element (Murmur), the column's first choice, its default
+    // plug, does. Without one, the source effects decide it.
+    let chosen = choices
+        .iter()
+        .filter(|c| c.report["element_choice"].is_string())
+        .min_by_key(|c| (c.column, c.row, c.node))
+        .and_then(|c| c.element)
+        .or_else(|| choices.iter().find_map(|c| c.element));
     let damage = chosen.or_else(|| {
         (host == Host::Weapon)
             .then(|| effect_damage(found))

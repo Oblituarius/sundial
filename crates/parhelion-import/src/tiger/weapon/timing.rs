@@ -616,7 +616,7 @@ fn matched(
     cells: &mut BTreeMap<usize, [u8; 4]>,
 ) -> Result<Vec<Value>> {
     let channels = correspondence(from, to, scope)?;
-    let sharing = Sharing::read(from, to, scope, &channels);
+    let sharing = Sharing::read(from, to, scope, &channels, follows(from.dialect));
     let mut curves = Vec::new();
     for (n, s) in channels {
         let (sr, sc) = from.curve(s)?;
@@ -708,12 +708,26 @@ fn stat_overrides_of(rows: &[[u8; 8]], stat: u32) -> Vec<[u8; 8]> {
         .collect()
 }
 
+/// Whether native inputs outside the scope follow the source curve of a scope output they read,
+/// whatever the source drives them from. Rise of Iron's PS4 build only.
+///
+/// A literal holds the scope's destinations at the source value of the carried stat, so a talent
+/// or mode that moves the stat, such as Khvostov 7G-0X's 900 RPM (Rate of Fire +80), no longer
+/// moves the firing rate. The scope output and its source counterpart drive the same firing
+/// destinations through the same operations, so they are the same quantity. A native input that
+/// reads it, as Shadowkeep's auto rifles scale component 2 input 64 by the rate, then keeps its
+/// own native formula on the rate the weapon fires at. Shared sample storage and other tables
+/// still take the literal.
+fn follows(dialect: &Dialect) -> bool {
+    std::ptr::eq(dialect, &RISE_OF_IRON_PS4)
+}
+
 /// Native outputs of the scope that also drive inputs outside it.
 ///
 /// Such an output can take the source curve only when the source drives that input from the
 /// corresponding output too. The change then gives that input the source's value as well, as the
 /// source table does. Otherwise the scope's routes read the source value as a literal and the
-/// shared output stays.
+/// shared output stays, unless the native input [`follows`] the source curve.
 struct Sharing {
     /// Outputs the source drives the same way, with the inputs they also drive.
     shared: BTreeMap<u32, Vec<Value>>,
@@ -722,7 +736,13 @@ struct Sharing {
 }
 
 impl Sharing {
-    fn read(from: &Table, to: &Table, scope: Scope, channels: &BTreeMap<u32, u32>) -> Self {
+    fn read(
+        from: &Table,
+        to: &Table,
+        scope: Scope,
+        channels: &BTreeMap<u32, u32>,
+        follow: bool,
+    ) -> Self {
         let mut shared = BTreeMap::<u32, Vec<Value>>::new();
         let mut conflicts = BTreeMap::<u32, String>::new();
         for (dest, read) in &to.others {
@@ -730,11 +750,13 @@ impl Sharing {
                 let Some(&source_channel) = channels.get(native_channel) else {
                     continue;
                 };
-                if from.others.get(dest).and_then(|r| r.get(position)) == Some(&source_channel) {
+                let same =
+                    from.others.get(dest).and_then(|r| r.get(position)) == Some(&source_channel);
+                if same || follow {
                     shared
                         .entry(*native_channel)
                         .or_default()
-                        .push(json!({"component":dest.0,"input":dest.1}));
+                        .push(json!({"component":dest.0,"input":dest.1,"native_formula":!same}));
                 } else {
                     conflicts.entry(*native_channel).or_insert_with(|| {
                         format!(

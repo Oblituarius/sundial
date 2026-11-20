@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Desc {
+pub(super) enum Desc {
     /// Extended user data: user registers 16 and up, read through this pointer.
     Extended,
     /// A table of 8-dword image descriptors starting at an API texture slot.
@@ -68,13 +68,46 @@ struct Lift<'a> {
     position: bool,
 }
 
+/// The descriptors the Gnm input usage slots place in user registers before the program
+/// starts: registers below 16, and extended user data (16 and up).
+pub(super) type Descriptors = (HashMap<u8, Desc>, HashMap<u32, Desc>);
+
+pub(super) fn descriptors(header: &Header) -> Result<Descriptors> {
+    let (mut sgpr, mut extended) = (HashMap::new(), HashMap::new());
+    for slot in &header.slots {
+        let (count, desc): (u8, Box<dyn Fn(u8) -> Desc>) = match slot.kind {
+            0 => (
+                if slot.flags & 1 != 0 { 8 } else { 4 },
+                Box::new(|k| Desc::Resource(slot.api, k)),
+            ),
+            1 => (4, Box::new(|k| Desc::Sampler(slot.api, k))),
+            2 => (4, Box::new(|k| Desc::Buffer(slot.api, k))),
+            0x12 => (2, Box::new(|_| Desc::FetchShader)),
+            0x13 => (2, Box::new(|_| Desc::Resources(slot.api))),
+            0x17 => (2, Box::new(|_| Desc::VertexTable)),
+            0x1B => (2, Box::new(|_| Desc::Extended)),
+            other => bail!("Unsupported Gnm input usage {other:#x}"),
+        };
+        for k in 0..count {
+            let register = u32::from(slot.register) + u32::from(k);
+            if register < 16 {
+                sgpr.insert(register as u8, desc(k));
+            } else {
+                extended.insert(register, desc(k));
+            }
+        }
+    }
+    Ok((sgpr, extended))
+}
+
 impl<'a> Lift<'a> {
     fn new(header: &'a Header, cubes: &'a BTreeSet<u8>) -> Result<Self> {
-        let mut lift = Self {
+        let (sgpr, extended) = descriptors(header)?;
+        Ok(Self {
             header,
             body: String::new(),
-            sgpr: HashMap::new(),
-            extended: HashMap::new(),
+            sgpr,
+            extended,
             sgprs: BTreeSet::new(),
             vgprs: BTreeSet::new(),
             masks: BTreeSet::new(),
@@ -87,31 +120,7 @@ impl<'a> Lift<'a> {
             temps: 0,
             targets: BTreeSet::new(),
             position: false,
-        };
-        for slot in &header.slots {
-            let (count, desc): (u8, Box<dyn Fn(u8) -> Desc>) = match slot.kind {
-                0 => (
-                    if slot.flags & 1 != 0 { 8 } else { 4 },
-                    Box::new(|k| Desc::Resource(slot.api, k)),
-                ),
-                1 => (4, Box::new(|k| Desc::Sampler(slot.api, k))),
-                2 => (4, Box::new(|k| Desc::Buffer(slot.api, k))),
-                0x12 => (2, Box::new(|_| Desc::FetchShader)),
-                0x13 => (2, Box::new(|_| Desc::Resources(slot.api))),
-                0x17 => (2, Box::new(|_| Desc::VertexTable)),
-                0x1B => (2, Box::new(|_| Desc::Extended)),
-                other => bail!("Unsupported Gnm input usage {other:#x}"),
-            };
-            for k in 0..count {
-                let register = u32::from(slot.register) + u32::from(k);
-                if register < 16 {
-                    lift.sgpr.insert(register as u8, desc(k));
-                } else {
-                    lift.extended.insert(register, desc(k));
-                }
-            }
-        }
-        Ok(lift)
+        })
     }
 
     fn line(&mut self, text: impl AsRef<str>) {
@@ -242,10 +251,70 @@ impl<'a> Lift<'a> {
         format!("asuint({value})")
     }
 
+    /// The high word of a 64-bit source: the next register of a pair, or an inline constant's
+    /// sign extension (negative inline integers are sign extended, other constants zero
+    /// extended).
+    fn src_high(&mut self, src: Src) -> Result<String> {
+        Ok(match src {
+            Src::Sgpr(r) => self.s(r + 1),
+            Src::Vgpr(r) => self.v(r + 1),
+            Src::Const(bits) if bits >= 0xFFFF_FFF0 => format!("{}u", u32::MAX),
+            Src::Const(_) => "0u".to_owned(),
+            other => bail!("Unsupported GCN 64-bit operand {other:?}"),
+        })
+    }
+
+    /// v_lshl_b64, v_lshr_b64 and v_ashr_i64: a 64-bit register pair shifted by the low six
+    /// bits of src1. The high word is written first, from temporaries, so a destination pair
+    /// that overlaps the source still reads the source.
+    fn shift64(&mut self, valu: &Valu) -> Result<()> {
+        ensure!(
+            valu.sdst.is_none() && !valu.clamp && valu.omod == 0,
+            "Unsupported GCN 64-bit shift modifiers"
+        );
+        let (lo, hi) = (self.src(valu.src[0])?, self.src_high(valu.src[0])?);
+        let amount = self.src(valu.src[1])?;
+        let n = format!("r{}", self.temps);
+        self.temps += 1;
+        self.line(format!("uint {n} = {amount} & 63u;"));
+        let (low, high) = match valu.op {
+            353 => (
+                format!("({n} >= 32u ? 0u : {lo} << {n})"),
+                format!(
+                    "({n} >= 32u ? {lo} << ({n} - 32u) : {n} == 0u ? {hi} : ({hi} << {n}) | ({lo} >> (32u - {n})))"
+                ),
+            ),
+            354 => (
+                format!(
+                    "({n} >= 32u ? {hi} >> ({n} - 32u) : {n} == 0u ? {lo} : ({lo} >> {n}) | ({hi} << (32u - {n})))"
+                ),
+                format!("({n} >= 32u ? 0u : {hi} >> {n})"),
+            ),
+            355 => (
+                format!(
+                    "({n} >= 32u ? asuint(asint({hi}) >> ({n} - 32u)) : {n} == 0u ? {lo} : ({lo} >> {n}) | ({hi} << (32u - {n})))"
+                ),
+                format!("({n} >= 32u ? asuint(asint({hi}) >> 31) : asuint(asint({hi}) >> {n}))"),
+            ),
+            other => bail!("Unsupported GCN 64-bit shift {other}"),
+        };
+        let (t_low, t_high) = (format!("r{}", self.temps), format!("r{}", self.temps + 1));
+        self.temps += 2;
+        self.line(format!("uint {t_low} = {low};"));
+        self.line(format!("uint {t_high} = {high};"));
+        let (d_low, d_high) = (self.v(valu.dst), self.v(valu.dst + 1));
+        self.assign(d_high, t_high, true);
+        self.assign(d_low, t_low, true);
+        Ok(())
+    }
+
     fn valu(&mut self, valu: &Valu) -> Result<()> {
         let op = valu.op;
         if op < 256 {
             return self.compare(valu);
+        }
+        if (353..=355).contains(&op) {
+            return self.shift64(valu);
         }
         let dst = self.v(valu.dst);
         let f = |lift: &mut Self, i: usize| lift.float(valu, i);
@@ -566,9 +635,10 @@ impl<'a> Lift<'a> {
             "Unsupported GCN array image addressing (op {})",
             image.op
         );
-        // Texel loads address in integers whatever the unnormalized bit says.
+        // Texel loads address in integers whatever the unnormalized bit says, and a size
+        // query (14) addresses nothing.
         ensure!(
-            !image.unorm || image.op <= 1,
+            !image.unorm || image.op <= 1 || image.op == 14,
             "Unsupported GCN unnormalized image addressing (op {})",
             image.op
         );
@@ -586,6 +656,24 @@ impl<'a> Lift<'a> {
             return self.cube_image(image, texture);
         }
         let call = match image.op {
+            // image_get_resinfo: width, height, depth (1 for a 2D texture) and mip count of
+            // the mip level in vaddr, as integers. The float4 carries their bits.
+            14 => {
+                let mip = self.v(image.vaddr);
+                let names = (0..3)
+                    .map(|k| format!("r{}", self.temps + k))
+                    .collect::<Vec<_>>();
+                self.temps += 3;
+                self.line(format!("uint {}, {}, {};", names[0], names[1], names[2]));
+                self.line(format!(
+                    "tex{texture}.GetDimensions({mip}, {}, {}, {});",
+                    names[0], names[1], names[2]
+                ));
+                format!(
+                    "asfloat(uint4({}, {}, 1u, {}))",
+                    names[0], names[1], names[2]
+                )
+            }
             1 => {
                 let x = self.v(image.vaddr);
                 let y = self.v(image.vaddr + 1);
@@ -748,11 +836,12 @@ impl<'a> Lift<'a> {
                 let Interface::Vertex { exports, .. } = &self.header.interface else {
                     unreachable!()
                 };
-                ensure!(
-                    exports.iter().any(|(_, p)| *p == param),
-                    "GCN vertex export {param} has no semantic"
-                );
-                format!("o{param}")
+                // A parameter the header gives no semantic links to no pixel input.
+                if exports.iter().any(|(_, p)| *p == param) {
+                    format!("o{param}")
+                } else {
+                    String::new()
+                }
             }
             (_, other) => bail!("Unsupported GCN export target {other}"),
         };
@@ -798,6 +887,40 @@ impl<'a> Lift<'a> {
 }
 
 impl Lift<'_> {
+    /// `ds_swizzle_b32` in quad-permute mode (offset bit 15): lane `l` of each 2x2 pixel quad
+    /// reads the source of quad lane `offset >> 2l & 3`, lanes being (x, y) = (l & 1, l >> 1)
+    /// and quads starting at even pixels. Shader model 5 cannot read another lane, so the value
+    /// is extrapolated from the lane's own with fine screen derivatives: exact for values linear
+    /// across the quad, which is what D1 programs swizzle (every D1 use broadcasts quad lane
+    /// 0, 1 or 2 and subtracts, the compiler's coarse `ddx`/`ddy`). A lane reading itself keeps
+    /// its bits.
+    fn quad_swizzle(&mut self, offset: u16, addr: u8, vdst: u8) -> Result<()> {
+        ensure!(
+            matches!(self.header.interface, Interface::Pixel { .. }),
+            "GCN vertex program swizzles quad lanes"
+        );
+        let source = self.v(addr);
+        let n = self.temps;
+        self.temps += 1;
+        self.line(format!("float qv{n} = asfloat({source});"));
+        self.line(format!("uint2 ql{n} = uint2(position.xy) & 1u;"));
+        self.line(format!(
+            "uint qk{n} = ({}u >> ((ql{n}.x | ql{n}.y << 1) * 2u)) & 3u;",
+            offset & 0xFF
+        ));
+        self.line(format!(
+            "float2 qd{n} = float2(int2(qk{n} & 1u, qk{n} >> 1) - int2(ql{n}));"
+        ));
+        let value = format!(
+            "(all(qd{n} == 0.0f) ? {source} : asuint(qv{n} \
+             + (qd{n}.x != 0.0f ? qd{n}.x * ddx_fine(qv{n}) : 0.0f) \
+             + (qd{n}.y != 0.0f ? qd{n}.y * ddy_fine(qv{n}) : 0.0f)))"
+        );
+        let target = self.v(vdst);
+        self.assign(target, value, true);
+        Ok(())
+    }
+
     /// Write the VGPRs the hardware fills before the first instruction.
     fn prologue(&mut self, elements: &[(u8, u8)]) -> Result<()> {
         let mut values = Vec::new();
@@ -1013,7 +1136,14 @@ impl Lift<'_> {
                 self.assign(target, value, true);
                 Ok(())
             }
-            Op::Ds { op } => bail!("GCN program uses local data share opcode {op}"),
+            Op::Ds {
+                op: 53,
+                offset,
+                gds: false,
+                addr,
+                vdst,
+            } if offset & 0x8000 != 0 => self.quad_swizzle(*offset, *addr, *vdst),
+            Op::Ds { op, .. } => bail!("GCN program uses local data share opcode {op}"),
             Op::Mtbuf(buffer) => self.typed_load(buffer),
             Op::Mubuf(buffer) => bail!("Unsupported GCN buffer opcode {}", buffer.op),
             Op::Mimg(image) => self.image(image),
@@ -1152,14 +1282,9 @@ impl Lift<'_> {
 }
 
 /// A pixel program's interpolants, declared as the full vertex export list so every
-/// interpolant keeps the register the vertex program writes it to.
+/// interpolant keeps the register the vertex program writes it to. Inputs the vertex program
+/// does not export are constants, see [`unlinked_inputs`].
 fn interpolants(inputs: &[u16], linkage: &[u8]) -> Result<Vec<String>> {
-    for (attribute, input) in inputs.iter().enumerate() {
-        ensure!(
-            linkage.contains(&((*input & 0xFF) as u8)),
-            "Pixel input {attribute} has no vertex export"
-        );
-    }
     linkage
         .iter()
         .map(|semantic| {
@@ -1180,6 +1305,29 @@ fn interpolants(inputs: &[u16], linkage: &[u8]) -> Result<Vec<String>> {
                 ""
             };
             Ok(format!("in {mode}float4 a{attribute} : TEXCOORD{semantic}"))
+        })
+        .collect()
+}
+
+/// Pixel inputs whose semantic no vertex export carries, as local constants: the hardware
+/// then fills the input with the default value of its GnmPixelInputSemantic (bits 8-9,
+/// SPI_PS_INPUT_CNTL DEFAULT_VAL: 0000, 0001, 1110 or 1111).
+fn unlinked_inputs(inputs: &[u16], linkage: &[u8]) -> Vec<String> {
+    const DEFAULTS: [&str; 4] = [
+        "float4(0.0f, 0.0f, 0.0f, 0.0f)",
+        "float4(0.0f, 0.0f, 0.0f, 1.0f)",
+        "float4(1.0f, 1.0f, 1.0f, 0.0f)",
+        "float4(1.0f, 1.0f, 1.0f, 1.0f)",
+    ];
+    inputs
+        .iter()
+        .enumerate()
+        .filter(|(_, input)| !linkage.contains(&((**input & 0xFF) as u8)))
+        .map(|(attribute, input)| {
+            format!(
+                "float4 a{attribute} = {};",
+                DEFAULTS[usize::from(*input >> 8 & 3)]
+            )
         })
         .collect()
 }
@@ -1218,6 +1366,11 @@ pub fn hlsl_with(
     text.push_str("    bool exec = true, vcc = false, scc = false;\n");
     for name in outputs {
         writeln!(text, "    {name} = 0;")?;
+    }
+    if let Interface::Pixel { inputs, .. } = &lift.header.interface {
+        for line in unlinked_inputs(inputs, linkage) {
+            writeln!(text, "    {line}")?;
+        }
     }
     for r in &lift.masks {
         writeln!(text, "    bool km{r} = false;")?;

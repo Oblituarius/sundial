@@ -188,6 +188,10 @@ impl Assembly<'_> {
             );
         }
         self.evidence.push(json!({"plate":tag,"symbol":symbol,"equipment_class":if self.weapon {"weapon"} else {"player"},"canvas":canvas,"edge":edge,"placements":placements,"format":format,"mips":5,"composition":"source_runtime_bc_block_copy","source_executable_build":"56578.17.04.12.1251.evil"}));
+        if kind != 1 && self.source.platform() == 7 {
+            self.plate_blocks
+                .insert(symbol.clone(), (bytes.clone(), edge));
+        }
         if kind == 2 && self.source.platform() == 7 {
             // PS4 draws borrow stock gear programs, which read the gearstack differently.
             self.texture_bytes(

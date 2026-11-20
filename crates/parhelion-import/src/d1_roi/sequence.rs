@@ -344,7 +344,7 @@ impl Tree<'_> {
             "Source sequence is cyclic, shared or has a different parent"
         );
         let class = self.source.u32(at - 4)?;
-        let timing = native::Timing {
+        let mut timing = native::Timing {
             delay: [self.source.f32(at + 12)?, self.source.f32(at + 16)?],
             duration: [self.source.f32(at + 20)?, self.source.f32(at + 24)?],
             flags: self.source.u32(at + 8)?,
@@ -425,6 +425,19 @@ impl Tree<'_> {
                         (input as usize) < self.topology.inputs && bounds[0] <= bounds[1],
                         "Source sequence range or input differs"
                     );
+                    // An untimed source gate holds while its input stays in range: 4,056 of the
+                    // 4,124 PS4 range controls have no duration and no flags. Native activation
+                    // (Shadowkeep 0058753E) leaves a node untimed only under flag 8 or 0x10 and
+                    // otherwise ends it when its rolled duration elapses, so a gate copied with
+                    // flags 0 retires early and stops the sound it plays (Murmur's shot tail).
+                    // Every stock gate carries 0x10 (`techdump seqflags`), as do the native gates
+                    // this importer authors itself (`firing/projectile/release.rs`).
+                    if crate::d1_roi::platform::ps4()
+                        && timing.duration == [0.; 2]
+                        && timing.flags & 0x18 == 0
+                    {
+                        timing.flags |= 0x10;
+                    }
                     native::Kind::Range {
                         input,
                         bounds,

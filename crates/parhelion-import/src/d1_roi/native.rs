@@ -14,6 +14,7 @@ mod material;
 pub(crate) mod perk;
 mod plate;
 mod recipe;
+mod reflection;
 mod resource;
 mod rig;
 mod runtime_marker;
@@ -76,6 +77,9 @@ struct Assembly<'a> {
     bone_map: Option<Vec<u16>>,
     weapon: bool,
     weapon_runtime: Option<u32>,
+    /// PS4 albedo and gearstack plate blocks by symbol, with their edge, which the environment
+    /// reflection bake ([`reflection`]) reads.
+    plate_blocks: BTreeMap<String, (Vec<u8>, usize)>,
 }
 
 impl<'a> Assembly<'a> {
@@ -133,6 +137,7 @@ impl<'a> Assembly<'a> {
                     .map_err(anyhow::Error::from)
                 })
                 .transpose()?,
+            plate_blocks: BTreeMap::new(),
         })
     }
 

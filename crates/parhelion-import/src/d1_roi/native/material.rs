@@ -375,6 +375,16 @@ const BORROWED_TECHNIQUES: [(usize, u16, u32); 28] = [
 /// Shadowkeep gear plates and dyes.
 const LIFTED_STAGES: [usize; 5] = [6, 7, 8, 9, 11];
 
+/// The rigid_model render scope (`techdump scopes sk`: bit 2, cb11), which static world
+/// meshes read for their transform. Gear draws, the imported item's among them, get the
+/// skinning scope (bit 7) instead: every investment-package technique sampled at stages 0
+/// and 7 reads skinning and none rigid_model (`stagehdr`, 2026-11-19). The layout-123 rows
+/// of [`BORROWED_TECHNIQUES`] read rigid_model and never drew: Gjallarhorn's and LDR 5001's
+/// scope eyepieces (D1 lens program `80A3D10C`, 16 of the 24 stage-0 layout-123 materials in
+/// the weapon census) were holes in game. A draw whose borrowed technique reads it lifts its
+/// GCN programs first, through the deferred or decal adapter of its stage.
+const RIGID_MODEL_SCOPE: u32 = 1 << 2;
+
 /// The sight reticle stage. Its programs carry the reticle projection, the sight depth row and
 /// the reticle mask load the Xbox One path rewrites, and no stock gear technique draws it, so a
 /// PS4 reticle draw always lifts its GCN programs and has no borrowed fallback.
@@ -390,16 +400,12 @@ pub(super) const LENS_STAGE: usize = 14;
 /// The stock gear lens material borrowed for stage 14 on layout 139 (`BORROWED_TECHNIQUES`):
 /// no pixel outputs beyond the stencil, no textures and no expression.
 const LENS_MATERIAL: u32 = 0x80EF5148;
-/// Stock sight materials `80BA7DA2` and `80EF364B`, whose reticle quads match the D1
-/// quad's dimensions, subtract this from the quad's z before the reticle projection. PS4 sights
-/// and ported reticles draw at it; Xbox One sights keep their source depth (`sight_depth`).
-const NATIVE_SIGHT_DEPTH: f32 = 2.5;
-/// A stock sight reticle material (also the source of [`NATIVE_SIGHT_DEPTH`]).
+/// A stock sight reticle material, whose render state PS4 reticles take.
 const RETICLE_MATERIAL: u32 = 0x80BA7DA2;
 
-/// Rise of Iron sight reticles that Shadowkeep ported: the source reticle's pixel program and
-/// slot-0 dot texture, the stock technique drawing the port, and the input channel names of the
-/// stock model component that technique was authored for (object input `n` reads name `n`).
+/// Rise of Iron sight reticles that Shadowkeep ported: the source reticle material, the stock
+/// technique drawing the port, and the input channel names of the stock model component that
+/// technique was authored for (object input `n` reads name `n`).
 ///
 /// The First Curse's reticle (`80A734AE`: pixel program `80A3D246`, dot `80A3D241`, flare
 /// `80A743B4`) is The Last Word's (`815287EC`, component `815287EF`, models `815287EE` and
@@ -407,10 +413,14 @@ const RETICLE_MATERIAL: u32 = 0x80BA7DA2;
 /// two object inputs (`0E36F79F` power glow, `79FD498A` visibility) and Shadowkeep's HDR output
 /// reads (extern `5C`, which only reticle techniques read, always with extern `49`), and it binds
 /// the same dot and flare pair redrawn (`80BC5C5C`, `815287EB`, plain 2D textures).
-/// The lifted D1 programs never drew the dot in game; the stock port draws it as Shadowkeep does.
-const PORTED_RETICLES: [(u32, u32, u32, &[u32]); 1] = [(
-    0x80A3D246,
-    0x80A3D241,
+///
+/// A reticle ports only when its pixel stage (program, textures, constants and initial values)
+/// equals the ported source's. The same program and dot draw 36 Rise of Iron reticles in 13
+/// colourings (`techdump matbyps 80A3D246`: Gjallarhorn's red dot, green and blue dots…); the
+/// port's redrawn white core and orange glow belong to The First Curse alone, so the others
+/// keep their own lifted programs and colours.
+const PORTED_RETICLES: [(u32, u32, &[u32]); 1] = [(
+    0x80A734AE,
     0x815287EC,
     &[0x0E36F79F, 0x32CC5402, 0x79FD498A, 0x9F7F13A9, 0xF061CA4E],
 )];
@@ -591,13 +601,22 @@ struct StageInputs {
     constants: Vec<u8>,
 }
 
+/// The stages whose stock techniques set bit 31 of the provided scopes (`+0x1C`). `stagehdr`
+/// over every stock model part: stages 0, 1, 2, 3, 6, 10 and 12 set it (a few dozen exceptions);
+/// stages 7, 8, 9, 13, 14, 16 and 17 never do (about 68,000 parts).
+const BIT31_STAGES: [usize; 7] = [0, 1, 2, 3, 6, 10, 12];
+
 fn scope_masks(
     source: &Payload,
     globals: &expression::Globals,
     simulated: bool,
     pass: usize,
+    ps4: bool,
     out: &mut [u8],
 ) -> Result<[u32; 2]> {
+    // PS4 glass and effect draws on stages 7 to 9 took the bit no stock draw of those stages
+    // has.
+    let bit31 = !ps4 || BIT31_STAGES.contains(&pass);
     let mut masks = [0u32; 2];
     for (index, at) in [0x18, 0x1C].into_iter().enumerate() {
         let mut mask = globals.scope_mask(source.u32(at)?)?;
@@ -618,7 +637,7 @@ fn scope_masks(
         put(
             out,
             at,
-            &(mask | if index == 1 { 0x80000000 } else { 0 }).to_le_bytes(),
+            &(mask | if index == 1 && bit31 { 0x80000000 } else { 0 }).to_le_bytes(),
         )?;
     }
     Ok(masks)
@@ -681,6 +700,91 @@ impl Assembly<'_> {
             code,
             constants,
         })
+    }
+
+    /// What a source material's pixel program reads when it runs on the CPU
+    /// ([`super::reflection`]): its constant rows after one evaluation of its expression with the
+    /// draw's dye, and what each texture slot holds. Nothing is added to the graph.
+    pub(super) fn pixel_reads(
+        &mut self,
+        source: &Payload,
+        draw: &Draw,
+        equipment: &Equipment,
+    ) -> Result<(Vec<[f32; 4]>, BTreeMap<u32, super::reflection::Slot>)> {
+        use super::reflection::Slot;
+        const FROM: usize = 0x2A8;
+        let selected = equipment.dyes.contains_key(&(draw.dye / 2));
+        let (dye_tag, secondary) = equipment.dye_source(draw.dye, draw.retained);
+        let dye = dye_tag.map(|tag| self.source.read(tag)).transpose()?;
+        // Detail textures take placeholder names, mapped back to their source tags below.
+        let mut detail = [String::new(), String::new()];
+        let mut details = BTreeMap::new();
+        if let Some(data) = &dye {
+            for (index, name) in detail.iter_mut().enumerate() {
+                let tag = data.u32(0x60 + index * 4)?;
+                if !matches!(tag, 0 | u32::MAX) {
+                    *name = format!("source-detail-{tag:08X}");
+                    details.insert(name.clone(), tag);
+                }
+            }
+        }
+        let external = source.u32(FROM + 0x84)?;
+        let values = if matches!(external, 0 | u32::MAX) {
+            vectors(source, FROM + 0x58)?
+        } else {
+            self.source.constant_buffer(external)?.1
+        };
+        let code = source
+            .array(FROM + 0x28, 1, Some(0x80800009))?
+            .into_iter()
+            .map(|at| source.u8(at))
+            .collect::<Result<Vec<_>>>()?;
+        let mut program = expression::translate(
+            &code,
+            vectors(source, FROM + 0x38)?,
+            &expression::Inputs {
+                globals: &self.globals,
+                dye: dye_input(selected, draw.retained, dye.as_ref(), secondary),
+                plates: &equipment.plates,
+                detail: &detail,
+                objects: source.u32(FROM + 0x78)? as usize,
+                object_channels: &self.object_channels,
+                outputs: values.len() / 16,
+                samplers: source.array(FROM + 0x48, 16, Some(0x80801ACC))?.len(),
+                stage: shader_slot(4).1,
+                reticle: false,
+                light: false,
+            },
+        )?;
+        program.initialize(&values)?;
+        let rows = program
+            .bound_outputs(&values)
+            .context("Source pixel expression reads more than constants and the dye")?;
+        let mut slots = BTreeMap::new();
+        for row in source.array(FROM + 0x10, 8, Some(0x80801B28))? {
+            let tag = source.u32(row + 4)?;
+            if !matches!(tag, 0 | u32::MAX) {
+                let slot = if self.source.is_cube_texture(tag)? {
+                    Slot::Cube(tag)
+                } else {
+                    Slot::Texture(tag)
+                };
+                slots.insert(source.u32(row)?, slot);
+            }
+        }
+        for (slot, symbol) in &program.textures {
+            let held = if let Some(plate) = equipment.plates.iter().position(|p| p == symbol) {
+                Slot::Plate(plate)
+            } else {
+                Slot::Texture(
+                    *details
+                        .get(symbol)
+                        .context("Source pixel expression binds an unknown texture")?,
+                )
+            };
+            slots.insert(*slot, held);
+        }
+        Ok((rows, slots))
     }
 
     /// A single-level 4x4 texture of one colour.
@@ -1101,6 +1205,34 @@ impl Assembly<'_> {
         Ok(best.map(|(_, technique)| technique))
     }
 
+    /// The stock technique a PS4 draw at stage `pass` on `layout` borrows: the listed one with
+    /// the same vertex elements, else one the layout feeds, else the covering technique.
+    fn borrowed_choice(&mut self, pass: usize, layout: u16) -> Result<u32> {
+        let borrowed = |fits: &dyn Fn(u16) -> bool| {
+            BORROWED_TECHNIQUES
+                .iter()
+                .find(|(stage, stock, _)| *stage == pass && fits(*stock))
+                .map(|(.., technique)| *technique)
+        };
+        match borrowed(&|stock| self.layouts.same_elements(layout, stock))
+            .or_else(|| borrowed(&|stock| self.layouts.feeds(layout, stock)))
+        {
+            Some(technique) => Ok(technique),
+            None => self.covering_technique(pass, layout)?.with_context(|| {
+                format!(
+                    "No stock technique draws stage {pass} with the elements of layout {layout}"
+                )
+            }),
+        }
+    }
+
+    /// Whether the technique a PS4 draw would borrow reads the rigid_model scope, which the
+    /// imported item's draws never get ([`RIGID_MODEL_SCOPE`]).
+    fn borrows_rigid_model(&mut self, draw: &Draw) -> Result<bool> {
+        let technique = self.borrowed_choice(draw.stage, draw.layout)?;
+        Ok(self.native.tag(technique, Some(0x808071E8))?.u32(0x18)? & RIGID_MODEL_SCOPE != 0)
+    }
+
     /// Copy the stock technique that draws this stage with the same vertex elements, and bind
     /// the gear resources its programs read to the converted plates and the draw's dye.
     fn borrowed_technique(
@@ -1111,23 +1243,25 @@ impl Assembly<'_> {
         equipment: &Equipment,
     ) -> Result<String> {
         let (pass, layout) = (draw.stage, draw.layout);
-        let borrowed = |fits: &dyn Fn(u16) -> bool| {
-            BORROWED_TECHNIQUES
-                .iter()
-                .find(|(stage, stock, _)| *stage == pass && fits(*stock))
-                .map(|(.., technique)| *technique)
-        };
-        let technique = match borrowed(&|stock| self.layouts.same_elements(layout, stock))
-            .or_else(|| borrowed(&|stock| self.layouts.feeds(layout, stock)))
-        {
-            Some(technique) => technique,
-            None => self.covering_technique(pass, layout)?.with_context(|| {
-                format!(
-                    "No stock technique draws stage {pass} with the elements of layout {layout}"
-                )
-            })?,
-        };
+        let technique = self.borrowed_choice(pass, layout)?;
         let stock = self.native.tag(technique, Some(0x808071E8))?;
+        // A surface draw binds the albedo plate with its source reflection baked in.
+        let reflected;
+        let equipment = match self.reflection_plate(tag, draw, equipment)? {
+            Some(plate) => {
+                reflected = Equipment {
+                    plates: [
+                        plate,
+                        equipment.plates[1].clone(),
+                        equipment.plates[2].clone(),
+                    ],
+                    gear_stack: equipment.gear_stack.clone(),
+                    dyes: equipment.dyes.clone(),
+                };
+                &reflected
+            }
+            None => equipment,
+        };
         let dye_tag = equipment.dyes.get(&(draw.dye / 2)).copied();
         let dye = dye_tag.map(|tag| self.source.read(tag)).transpose()?;
         let mut out = zero_gear_extern(&stock)?;
@@ -1201,24 +1335,30 @@ impl Assembly<'_> {
     /// The stock technique of a PS4 reticle that Shadowkeep ported ([`PORTED_RETICLES`]), copied
     /// whole: its programs, render state, scopes, textures and expressions. Its object inputs
     /// are re-indexed by channel name into this component's inputs, and its sight depth row
-    /// carries the plane of the source quad. `None` when the reticle has no port.
+    /// keeps the stock plane. `None` when the reticle has no port.
     fn ported_reticle(&mut self, tag: u32, symbol: &str) -> Result<Option<String>> {
         if self.source.platform() != 7 {
             return Ok(None);
         }
-        let source = self.source.read(tag)?;
-        let pixel = source.u32(0x2A8)?;
-        let mut dot = None;
-        for row in source.array(0x2A8 + 0x10, 8, Some(0x80801B28))? {
-            if source.u32(row)? == 0 {
-                dot = Some(source.u32(row + 4)?);
+        // The pixel stage's program, texture rows, constants and initial values.
+        let look = |tag: u32| -> Result<Vec<Vec<u8>>> {
+            let source = self.source.read(tag)?;
+            let mut parts = vec![source.u32(0x2A8)?.to_le_bytes().to_vec()];
+            for (field, stride) in [(0x10, 8), (0x38, 16), (0x58, 16)] {
+                let range = source.array_range(0x2A8 + field, stride, None)?;
+                parts.push(source.0[range].to_vec());
+            }
+            Ok(parts)
+        };
+        let own = look(tag)?;
+        let mut port = None;
+        for (ported, technique, inputs) in PORTED_RETICLES {
+            if look(ported)? == own {
+                port = Some((technique, inputs));
+                break;
             }
         }
-        let Some((technique, inputs)) = PORTED_RETICLES
-            .iter()
-            .find(|(program, texture, ..)| *program == pixel && Some(*texture) == dot)
-            .map(|(.., technique, inputs)| (*technique, *inputs))
-        else {
+        let Some((technique, inputs)) = port else {
             return Ok(None);
         };
         let stock = self.native.tag(technique, Some(0x808071E8))?;
@@ -1233,8 +1373,9 @@ impl Assembly<'_> {
             "Ported reticle technique {technique:08X} differs from its contract"
         );
         let mut out = stock.0.clone();
-        // The stock quad's plane (2.25 for The Last Word) belongs to the stock quad; the source
-        // quad's dimensions are those of the stock sights drawn at `NATIVE_SIGHT_DEPTH`.
+        // The stock quad has the source quad's dimensions (The Last Word's `815287EE` and The
+        // First Curse's are both 1.745 by 1.765 cm), so the port keeps the stock plane (2.25):
+        // the redrawn dot was authored for it.
         let vertex = stock.u32(VERTEX)?;
         let bytecode = self.native.tag(self.native.reference(vertex)?, None)?;
         let row = usize::from(super::super::shader::sight_depth_row(&bytecode.0)?);
@@ -1244,7 +1385,7 @@ impl Assembly<'_> {
             at + 16 <= values.end,
             "Ported reticle sight depth row exceeds its initial vectors"
         );
-        put(&mut out, at, &NATIVE_SIGHT_DEPTH.to_le_bytes())?;
+        let depth = stock.f32(at)?;
         // Object input `n` reads this component's input `n`: re-index each read by name.
         let code = stock.array_range(PIXEL + 0x20, 1, Some(0x80800009))?;
         let mut remapped = Vec::new();
@@ -1289,7 +1430,7 @@ impl Assembly<'_> {
         self.evidence
             .push(json!({"material":tag,"symbol":symbol,"pass":RETICLE_STAGE,
             "ported_reticle":format!("{technique:08X}"),"sight_depth_row":row,
-            "native_sight_depth":NATIVE_SIGHT_DEPTH,"object_inputs":remapped}));
+            "sight_depth":depth,"object_inputs":remapped}));
         let template = self.class_template(0x808071E8)?;
         self.node(symbol, template, &out, None, &[]).map(Some)
     }
@@ -1437,7 +1578,9 @@ impl Assembly<'_> {
             {
                 return Ok(symbol);
             }
-            if (LIFTED_STAGES.contains(&draw.stage) || draw.stage == RETICLE_STAGE)
+            if (LIFTED_STAGES.contains(&draw.stage)
+                || draw.stage == RETICLE_STAGE
+                || self.borrows_rigid_model(&draw)?)
                 && let Some(symbol) = self.lifted_material(tag, symbol, &draw, equipment)?
             {
                 return Ok(symbol);
@@ -1584,7 +1727,8 @@ impl Assembly<'_> {
             _ => None,
         };
         put(&mut out, 0x28, &u32::MAX.to_le_bytes())?;
-        let masks = scope_masks(&source, &self.globals, simulated, pass, &mut out)?;
+        let ps4 = self.source.platform() == 7;
+        let masks = scope_masks(&source, &self.globals, simulated, pass, ps4, &mut out)?;
         self.native_reticle_state(pass, &mut out)?;
         let depth = (source.u32(0x1C)? & (1 << self.globals.depth.index) != 0)
             .then_some(self.globals.depth);
@@ -1606,16 +1750,16 @@ impl Assembly<'_> {
             let StageInputs {
                 mut textures,
                 samplers,
-                mut values,
+                values,
                 code,
                 constants,
             } = self.material_inputs(&source, from)?;
             if pass == RETICLE_STAGE && index == 0 && self.source.platform() == 7 {
-                // The sight quad's z is offset by this row before reticle matrix six. Stock
-                // sights carry a per-weapon constant (2.5 on the two stock sights whose quad
-                // has this quad's dimensions, 1.2 to 25 across all 18), and the game builds
-                // the matrix for that plane. The PS4 sights were verified in game at the stock
-                // depth, so they keep it; the Xbox One path keeps the source depth below.
+                // The sight quad's z is offset by this row before reticle matrix six, so the
+                // row sets the reticle's size: the source value is kept, as on Xbox One. Stock
+                // Khvostov 7G-02 (`8152C446`) draws the source quad's exact dimensions at 1.1
+                // where Rise of Iron's Khvostov uses 1.0, and both games show the dot at the
+                // same screen size; a fixed 2.5 drew it 2.5 times smaller.
                 // A lifted PS4 sight reads the row from its lifted vertex program.
                 let row = usize::from(match lifted {
                     Some((programs, _)) => super::super::shader::sight_depth_row(&programs.vertex)?,
@@ -1630,9 +1774,12 @@ impl Assembly<'_> {
                     values.len() >= at + 16,
                     "Source sight depth row exceeds the initial vectors"
                 );
-                values[at..at + 4].copy_from_slice(&NATIVE_SIGHT_DEPTH.to_le_bytes());
-                evidence.push(json!({"stage":"vertex","sight_depth_row":row,
-                    "native_sight_depth":NATIVE_SIGHT_DEPTH,"approximation":"stock_sight_with_matching_quad"}));
+                let depth = f32::from_le_bytes(values[at..at + 4].try_into()?);
+                ensure!(
+                    depth.is_finite() && depth > 0.0,
+                    "Source sight depth is not positive"
+                );
+                evidence.push(json!({"stage":"vertex","sight_depth_row":row,"sight_depth":depth}));
             } else if pass == RETICLE_STAGE && index == 0 {
                 evidence.push(self.sight_depth(shader, &values)?);
             }
